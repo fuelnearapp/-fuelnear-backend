@@ -1,6 +1,7 @@
 import csv
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib.request import urlopen
 import ssl
 import shutil
@@ -15,6 +16,7 @@ DB_USER = os.getenv("DB_USER", "matteo")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -32,6 +34,16 @@ PREZZI_URL = os.getenv(
 
 
 def get_connection():
+    if DATABASE_URL:
+        parsed = urlparse(DATABASE_URL)
+        return psycopg2.connect(
+            dbname=parsed.path.lstrip("/"),
+            user=parsed.username,
+            password=parsed.password,
+            host=parsed.hostname,
+            port=parsed.port,
+        )
+
     connection_kwargs = {
         "dbname": DB_NAME,
         "user": DB_USER,
@@ -43,6 +55,63 @@ def get_connection():
         connection_kwargs["password"] = DB_PASSWORD
 
     return psycopg2.connect(**connection_kwargs)
+
+
+def ensure_core_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stations (
+                id BIGSERIAL PRIMARY KEY,
+                mimit_id BIGINT NOT NULL UNIQUE,
+                name TEXT,
+                brand TEXT,
+                operator TEXT,
+                address TEXT NOT NULL,
+                city TEXT NOT NULL,
+                province TEXT NOT NULL,
+                latitude DOUBLE PRECISION NOT NULL,
+                longitude DOUBLE PRECISION NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fuel_prices (
+                id BIGSERIAL PRIMARY KEY,
+                station_id BIGINT NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+                fuel_type TEXT NOT NULL,
+                price DOUBLE PRECISION NOT NULL,
+                is_self_service BOOLEAN NOT NULL,
+                reported_at TIMESTAMPTZ NOT NULL,
+                source TEXT NOT NULL DEFAULT 'mimit',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stations_mimit_id ON stations(mimit_id);
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fuel_prices_station_id ON fuel_prices(station_id);
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fuel_prices_fuel_type_reported_at
+            ON fuel_prices(fuel_type, reported_at DESC);
+            """
+        )
 
 
 def normalize_fuel_type(raw_fuel: str) -> str:
@@ -309,6 +378,9 @@ def import_local_mimit_files() -> dict[str, int]:
     conn = get_connection()
 
     try:
+        print("Verifica/creazione schema database...")
+        ensure_core_schema(conn)
+
         print("Caricamento anagrafica...")
         df_stations = load_stations_dataframe()
         if df_stations.empty:
