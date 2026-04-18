@@ -5,6 +5,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 import re
+from urllib.parse import urlparse
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -27,6 +28,7 @@ DB_USER = os.getenv("DB_USER", "matteo")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
@@ -507,6 +509,16 @@ def run_mimit_update(download: bool = True) -> dict[str, object] | None:
 
 
 def get_connection():
+    if DATABASE_URL:
+        parsed = urlparse(DATABASE_URL)
+        return psycopg2.connect(
+            dbname=parsed.path.lstrip("/"),
+            user=parsed.username,
+            password=parsed.password,
+            host=parsed.hostname,
+            port=parsed.port,
+        )
+
     connection_kwargs = {
         "dbname": DB_NAME,
         "user": DB_USER,
