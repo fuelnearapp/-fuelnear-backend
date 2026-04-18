@@ -532,6 +532,97 @@ def get_connection():
     return psycopg2.connect(**connection_kwargs)
 
 
+def ensure_auth_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT,
+                display_name TEXT NOT NULL,
+                referral_code TEXT NOT NULL UNIQUE,
+                referred_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                is_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referrals (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                referred_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                referral_code_used TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                validated_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (referred_user_id)
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rewards (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reward_type TEXT NOT NULL,
+                reward_value TEXT NOT NULL,
+                status TEXT NOT NULL,
+                granted_at TIMESTAMPTZ NULL,
+                expires_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                access_token_hash TEXT NOT NULL UNIQUE,
+                refresh_token_hash TEXT NOT NULL UNIQUE,
+                device_info TEXT NULL,
+                ip_address TEXT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                revoked_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                starts_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                original_transaction_id TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer_user_id ON referrals(referrer_user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
+
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
 
@@ -547,6 +638,13 @@ def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) ->
 
 @app.on_event("startup")
 def on_startup() -> None:
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_auth_schema(conn)
+    finally:
+        conn.close()
+
     start_mimit_scheduler()
 
 @app.get("/")
