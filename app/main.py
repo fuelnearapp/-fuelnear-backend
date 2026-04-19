@@ -467,34 +467,8 @@ def revoke_current_session(authorization: str | None) -> dict[str, Any]:
         conn.close()
 
 
-def mimit_update_worker() -> None:
-    print("[MIMIT] Scheduler thread started.")
-
-    while True:
-        try:
-            print("[MIMIT] Automatic update started.")
-            result = run_mimit_update(download=True)
-            if result is None:
-                print("[MIMIT] Automatic update skipped because another update is already running.")
-            else:
-                print(f"[MIMIT] Automatic update completed: {result}")
-        except Exception as exc:
-            print(f"[MIMIT] Automatic update failed: {exc}")
-
-        time.sleep(MIMIT_UPDATE_INTERVAL_SECONDS)
 
 
-def start_mimit_scheduler() -> None:
-    global _scheduler_started
-
-    with _scheduler_lock:
-        if _scheduler_started:
-            return
-
-        thread = threading.Thread(target=mimit_update_worker, daemon=True)
-        thread.start()
-        _scheduler_started = True
-        print("[MIMIT] Scheduler initialized.")
 
 
 def run_mimit_update(download: bool = True) -> dict[str, object] | None:
@@ -645,7 +619,6 @@ def on_startup() -> None:
     finally:
         conn.close()
 
-    start_mimit_scheduler()
 
 @app.get("/")
 def read_root() -> dict[str, str]:
