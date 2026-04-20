@@ -117,20 +117,13 @@ def ensure_core_schema(conn) -> None:
 def normalize_fuel_type(raw_fuel: str) -> str:
     value = raw_fuel.strip().lower()
 
+    # Normalizzazione diretta (match esatti)
     mapping = {
         "benzina": "benzina",
         "super": "benzina",
         "super senza piombo": "benzina",
-        "benzina speciale": "benzina_premium",
-        "benzina premium": "benzina_premium",
-        "blue super": "benzina_premium",
         "gasolio": "diesel",
         "diesel": "diesel",
-        "gasolio speciale": "diesel_premium",
-        "gasolio premium": "diesel_premium",
-        "blue diesel": "diesel_premium",
-        "diesel+": "diesel_premium",
-        "diesel speciale": "diesel_premium",
         "gpl": "gpl",
         "lpg": "gpl",
         "metano": "metano",
@@ -141,7 +134,64 @@ def normalize_fuel_type(raw_fuel: str) -> str:
         "gnl": "metano",
     }
 
-    return mapping.get(value, value)
+    if value in mapping:
+        return mapping[value]
+
+    # HVO (diesel sintetico)
+    if "hvo" in value:
+        return "hvo"
+
+    # --- Catch carburanti commerciali senza keyword standard ---
+    if "v-power" in value or "verde speciale" in value:
+        return "benzina_premium"
+
+    if "hiq" in value or "perform" in value:
+        return "diesel_premium"
+
+    if "f101" in value or "f-101" in value:
+        return "benzina_premium"
+
+    # Benzina e varianti commerciali
+    if "benzina" in value or "super" in value:
+        if (
+            "100" in value
+            or "98" in value
+            or "ottani" in value
+            or "premium" in value
+            or "v-power" in value
+            or "plus" in value
+            or "verde speciale" in value
+            or "f101" in value
+            or "f-101" in value
+        ):
+            return "benzina_premium"
+        return "benzina"
+
+    # Diesel / gasolio e varianti commerciali
+    if "diesel" in value or "gasolio" in value:
+        if (
+            "premium" in value
+            or "speciale" in value
+            or "+" in value
+            or "plus" in value
+            or "v-power" in value
+            or "excellium" in value
+            or "hiq" in value
+            or "perform" in value
+        ):
+            return "diesel_premium"
+        return "diesel"
+
+    # GPL
+    if "gpl" in value or "lpg" in value:
+        return "gpl"
+
+    # Metano
+    if any(x in value for x in ["metano", "gnc", "cng", "lng", "gnl"]):
+        return "metano"
+
+    # Fallback finale: restituisci il valore raw normalizzato, così possiamo intercettare eventuali nuovi casi
+    return value
 
 
 def download_file(url: str, destination: Path) -> None:
