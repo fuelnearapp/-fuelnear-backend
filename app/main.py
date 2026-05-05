@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
@@ -30,6 +30,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
+ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
@@ -482,6 +483,105 @@ def run_mimit_update(download: bool = True) -> dict[str, object] | None:
         _mimit_update_lock.release()
 
 
+def require_admin_update_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    if not ADMIN_UPDATE_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_UPDATE_TOKEN is not configured")
+
+    if not x_admin_token or x_admin_token != ADMIN_UPDATE_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+
+def ensure_mimit_import_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mimit_import_runs (
+                id BIGSERIAL PRIMARY KEY,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ NULL,
+                status TEXT NOT NULL,
+                stations_imported INTEGER NULL,
+                prices_imported INTEGER NULL,
+                error_message TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mimit_import_runs_completed_at
+            ON mimit_import_runs(completed_at DESC);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mimit_import_runs_status
+            ON mimit_import_runs(status);
+            """
+        )
+
+
+def create_mimit_import_run(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO mimit_import_runs (status, started_at, created_at)
+            VALUES ('running', NOW(), NOW())
+            RETURNING id;
+            """
+        )
+        row = cur.fetchone()
+
+    return int(row[0])
+
+
+def safe_int_from_import_result(result: dict[str, Any], keys: list[str]) -> int | None:
+    for key in keys:
+        value = result.get(key)
+        if value is None:
+            continue
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+def finish_mimit_import_run(conn, run_id: int, result: dict[str, Any]) -> None:
+    stations_imported = safe_int_from_import_result(result, ["stations_imported", "stations_count", "stations"])
+    prices_imported = safe_int_from_import_result(result, ["prices_imported", "prices_count", "prices"])
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE mimit_import_runs
+            SET status = 'success',
+                completed_at = NOW(),
+                stations_imported = %s,
+                prices_imported = %s,
+                error_message = NULL
+            WHERE id = %s;
+            """,
+            (stations_imported, prices_imported, run_id),
+        )
+
+
+def fail_mimit_import_run(conn, run_id: int, error_message: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE mimit_import_runs
+            SET status = 'failed',
+                completed_at = NOW(),
+                error_message = %s
+            WHERE id = %s;
+            """,
+            (error_message[:2000], run_id),
+        )
+
+
 def get_connection():
     if DATABASE_URL:
         parsed = urlparse(DATABASE_URL)
@@ -596,6 +696,7 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
+        ensure_mimit_import_schema(conn)
 
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
@@ -631,22 +732,110 @@ def health_check() -> dict[str, str]:
 
 
 @app.get("/admin/update-mimit")
-def admin_update_mimit() -> dict[str, Any]:
+def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+    conn = get_connection()
+    run_id: int | None = None
+
     try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            run_id = create_mimit_import_run(conn)
+
+        print(f"[MIMIT] Update started. run_id={run_id}")
         result = run_mimit_update(download=True)
+
         if result is None:
+            with conn:
+                fail_mimit_import_run(conn, run_id, "MIMIT update already in progress")
             return {
                 "status": "busy",
                 "message": "MIMIT update already in progress",
+                "run_id": run_id,
             }
 
+        with conn:
+            finish_mimit_import_run(conn, run_id, result)
+
+        print(f"[MIMIT] Update completed. run_id={run_id} result={result}")
         return {
             "status": "ok",
             "message": "MIMIT update completed",
+            "run_id": run_id,
             "result": result,
         }
+    except HTTPException:
+        raise
     except Exception as exc:
+        error_message = str(exc)
+        print(f"[MIMIT] Update failed. run_id={run_id} error={error_message}")
+
+        if run_id is not None:
+            try:
+                with conn:
+                    fail_mimit_import_run(conn, run_id, error_message)
+            except Exception as persist_error:
+                print(f"[MIMIT] Failed to persist import failure. error={persist_error}")
+
         raise HTTPException(status_code=500, detail=f"MIMIT update failed: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/mimit/status")
+def get_mimit_status() -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        started_at,
+                        completed_at,
+                        status,
+                        stations_imported,
+                        prices_imported,
+                        error_message
+                    FROM mimit_import_runs
+                    ORDER BY started_at DESC
+                    LIMIT 1;
+                    """
+                )
+                last_run = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        started_at,
+                        completed_at,
+                        status,
+                        stations_imported,
+                        prices_imported,
+                        error_message
+                    FROM mimit_import_runs
+                    WHERE status = 'success'
+                    ORDER BY completed_at DESC
+                    LIMIT 1;
+                    """
+                )
+                last_success = cur.fetchone()
+
+        return {
+            "status": "ok",
+            "last_status": last_run["status"] if last_run else None,
+            "last_run": serialize_datetime_fields([dict(last_run)], ["started_at", "completed_at"])[0] if last_run else None,
+            "last_successful_update_at": last_success["completed_at"].isoformat() if last_success and last_success["completed_at"] else None,
+            "stations_imported": last_success["stations_imported"] if last_success else None,
+            "prices_imported": last_success["prices_imported"] if last_success else None,
+            "last_error": last_run["error_message"] if last_run and last_run["status"] == "failed" else None,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MIMIT status failed: {exc}")
+    finally:
+        conn.close()
 
 
 # === ADMIN REFERRAL PROCESSING ENDPOINT ===
