@@ -1,4 +1,5 @@
 from typing import Any
+from email.utils import parsedate_to_datetime
 import os
 from math import cos, radians
 import threading
@@ -507,6 +508,9 @@ def ensure_mimit_import_schema(conn) -> None:
             );
             """
         )
+        cur.execute("ALTER TABLE mimit_import_runs ADD COLUMN IF NOT EXISTS stations_csv INTEGER NULL;")
+        cur.execute("ALTER TABLE mimit_import_runs ADD COLUMN IF NOT EXISTS prices_csv INTEGER NULL;")
+        cur.execute("ALTER TABLE mimit_import_runs ADD COLUMN IF NOT EXISTS source_file_timestamp TIMESTAMPTZ NULL;")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_mimit_import_runs_completed_at
@@ -549,9 +553,43 @@ def safe_int_from_import_result(result: dict[str, Any], keys: list[str]) -> int 
     return None
 
 
+def get_mimit_import_payload(result: dict[str, Any]) -> dict[str, Any]:
+    import_payload = result.get("import")
+    if isinstance(import_payload, dict):
+        return import_payload
+
+    return result
+
+
+def get_mimit_source_file_timestamp(result: dict[str, Any]) -> datetime | None:
+    download_payload = result.get("download")
+    if not isinstance(download_payload, dict):
+        return None
+
+    prices_payload = download_payload.get("prezzi")
+    if not isinstance(prices_payload, dict):
+        return None
+
+    last_modified = prices_payload.get("last_modified")
+    if not isinstance(last_modified, str) or not last_modified:
+        return None
+
+    try:
+        return datetime.fromisoformat(last_modified)
+    except ValueError:
+        try:
+            return parsedate_to_datetime(last_modified)
+        except (TypeError, ValueError):
+            return None
+
+
 def finish_mimit_import_run(conn, run_id: int, result: dict[str, Any]) -> None:
-    stations_imported = safe_int_from_import_result(result, ["stations_imported", "stations_count", "stations"])
-    prices_imported = safe_int_from_import_result(result, ["prices_imported", "prices_count", "prices"])
+    import_payload = get_mimit_import_payload(result)
+    stations_imported = safe_int_from_import_result(import_payload, ["stations_imported", "stations_count", "stations"])
+    prices_imported = safe_int_from_import_result(import_payload, ["prices_imported", "prices_count", "prices"])
+    stations_csv = safe_int_from_import_result(import_payload, ["stations_csv"])
+    prices_csv = safe_int_from_import_result(import_payload, ["prices_csv"])
+    source_file_timestamp = get_mimit_source_file_timestamp(result)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -561,10 +599,20 @@ def finish_mimit_import_run(conn, run_id: int, result: dict[str, Any]) -> None:
                 completed_at = NOW(),
                 stations_imported = %s,
                 prices_imported = %s,
+                stations_csv = %s,
+                prices_csv = %s,
+                source_file_timestamp = %s,
                 error_message = NULL
             WHERE id = %s;
             """,
-            (stations_imported, prices_imported, run_id),
+            (
+                stations_imported,
+                prices_imported,
+                stations_csv,
+                prices_csv,
+                source_file_timestamp,
+                run_id,
+            ),
         )
 
 
@@ -797,6 +845,9 @@ def get_mimit_status() -> dict[str, Any]:
                         status,
                         stations_imported,
                         prices_imported,
+                        stations_csv,
+                        prices_csv,
+                        source_file_timestamp,
                         error_message
                     FROM mimit_import_runs
                     ORDER BY started_at DESC
@@ -814,6 +865,9 @@ def get_mimit_status() -> dict[str, Any]:
                         status,
                         stations_imported,
                         prices_imported,
+                        stations_csv,
+                        prices_csv,
+                        source_file_timestamp,
                         error_message
                     FROM mimit_import_runs
                     WHERE status = 'success'
@@ -826,14 +880,267 @@ def get_mimit_status() -> dict[str, Any]:
         return {
             "status": "ok",
             "last_status": last_run["status"] if last_run else None,
-            "last_run": serialize_datetime_fields([dict(last_run)], ["started_at", "completed_at"])[0] if last_run else None,
+            "last_run": serialize_datetime_fields([dict(last_run)], ["started_at", "completed_at", "source_file_timestamp"])[0] if last_run else None,
             "last_successful_update_at": last_success["completed_at"].isoformat() if last_success and last_success["completed_at"] else None,
             "stations_imported": last_success["stations_imported"] if last_success else None,
             "prices_imported": last_success["prices_imported"] if last_success else None,
+            "stations_csv": last_success["stations_csv"] if last_success else None,
+            "prices_csv": last_success["prices_csv"] if last_success else None,
+            "source_file_timestamp": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
             "last_error": last_run["error_message"] if last_run and last_run["status"] == "failed" else None,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"MIMIT status failed: {exc}")
+    finally:
+        conn.close()
+
+
+@app.get("/admin/mimit-diagnostics")
+def admin_mimit_diagnostics(
+    _: None = Depends(require_admin_update_token),
+    lat: float = Query(default=41.4477, description="Default: Anzio latitude"),
+    lng: float = Query(default=12.6297, description="Default: Anzio longitude"),
+    radius_km: float = Query(default=10.0, gt=0, le=100),
+    fuel_type: str | None = Query(default=None, description="Optional normalized fuel type"),
+    is_self_service: bool | None = Query(default=None),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, Any]:
+    normalized_fuel_type = fuel_type.strip().lower() if fuel_type else None
+    endpoint_fuel_type = normalized_fuel_type or "benzina"
+    lat_delta = radius_km / 111.32
+    lng_divisor = 111.32 * max(cos(radians(lat)), 0.01)
+    lng_delta = radius_km / lng_divisor
+
+    nearby_prices_sql = """
+        WITH candidate_stations AS (
+            SELECT
+                s.id,
+                s.mimit_id,
+                s.name,
+                s.brand,
+                s.operator,
+                s.address,
+                s.city,
+                s.province,
+                s.latitude,
+                s.longitude,
+                (
+                    6371 * acos(
+                        least(
+                            1,
+                            cos(radians(%s)) * cos(radians(s.latitude)) *
+                            cos(radians(s.longitude) - radians(%s)) +
+                            sin(radians(%s)) * sin(radians(s.latitude))
+                        )
+                    )
+                ) AS distance_km
+            FROM stations s
+            WHERE s.latitude BETWEEN %s AND %s
+              AND s.longitude BETWEEN %s AND %s
+        )
+        SELECT
+            cs.id,
+            cs.mimit_id,
+            cs.name,
+            cs.brand,
+            cs.operator,
+            cs.address,
+            cs.city,
+            cs.province,
+            cs.latitude,
+            cs.longitude,
+            round(cs.distance_km::numeric, 3)::double precision AS distance_km,
+            fp.fuel_type,
+            fp.price,
+            fp.is_self_service,
+            fp.reported_at,
+            fp.created_at AS imported_at_proxy
+        FROM candidate_stations cs
+        JOIN fuel_prices fp ON fp.station_id = cs.id
+        WHERE cs.distance_km <= %s
+          AND (%s IS NULL OR fp.fuel_type = %s)
+          AND (%s IS NULL OR fp.is_self_service = %s)
+    """
+    nearby_params = (
+        lat,
+        lng,
+        lat,
+        lat - lat_delta,
+        lat + lat_delta,
+        lng - lng_delta,
+        lng + lng_delta,
+        radius_km,
+        normalized_fuel_type,
+        normalized_fuel_type,
+        is_self_service,
+        is_self_service,
+    )
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_prices,
+                        MIN(reported_at) AS min_reported_at,
+                        MAX(reported_at) AS max_reported_at,
+                        MAX(created_at) AS last_imported_at_proxy,
+                        COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) AS prices_imported_today_proxy
+                    FROM fuel_prices;
+                    """
+                )
+                summary = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'fuel_prices'
+                          AND column_name = 'imported_at'
+                    ) AS has_imported_at;
+                    """
+                )
+                imported_at_info = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT reported_at::date::text AS reported_date, COUNT(*) AS prices_count
+                    FROM fuel_prices
+                    GROUP BY reported_at::date
+                    ORDER BY reported_at::date DESC
+                    LIMIT 30;
+                    """
+                )
+                reported_at_counts = cur.fetchall()
+
+                cur.execute(
+                    nearby_prices_sql + " ORDER BY fp.reported_at DESC, fp.created_at DESC LIMIT %s;",
+                    nearby_params + (limit,),
+                )
+                newest_nearby = cur.fetchall()
+
+                cur.execute(
+                    nearby_prices_sql + " ORDER BY fp.reported_at ASC, fp.created_at DESC LIMIT %s;",
+                    nearby_params + (limit,),
+                )
+                oldest_nearby = cur.fetchall()
+
+                cur.execute(
+                    """
+                    WITH candidate_stations AS (
+                        SELECT
+                            s.id,
+                            s.mimit_id,
+                            s.name,
+                            s.brand,
+                            s.operator,
+                            s.address,
+                            s.city,
+                            s.province,
+                            s.latitude,
+                            s.longitude,
+                            (
+                                6371 * acos(
+                                    least(
+                                        1,
+                                        cos(radians(%s)) * cos(radians(s.latitude)) *
+                                        cos(radians(s.longitude) - radians(%s)) +
+                                        sin(radians(%s)) * sin(radians(s.latitude))
+                                    )
+                                )
+                            ) AS distance_km
+                        FROM stations s
+                        WHERE s.latitude BETWEEN %s AND %s
+                          AND s.longitude BETWEEN %s AND %s
+                    ),
+                    ranked_prices AS (
+                        SELECT DISTINCT ON (cs.id)
+                            cs.id,
+                            cs.mimit_id,
+                            cs.name,
+                            cs.brand,
+                            cs.operator,
+                            cs.address,
+                            cs.city,
+                            cs.province,
+                            cs.latitude,
+                            cs.longitude,
+                            cs.distance_km,
+                            fp.fuel_type,
+                            fp.price,
+                            fp.is_self_service,
+                            fp.reported_at,
+                            fp.created_at AS imported_at_proxy
+                        FROM candidate_stations cs
+                        JOIN fuel_prices fp ON fp.station_id = cs.id
+                        WHERE cs.distance_km <= %s
+                          AND fp.fuel_type = %s
+                          AND (%s IS NULL OR fp.is_self_service = %s)
+                        ORDER BY cs.id, fp.price ASC, fp.is_self_service DESC, fp.reported_at DESC
+                    )
+                    SELECT
+                        id,
+                        mimit_id,
+                        name,
+                        brand,
+                        operator,
+                        address,
+                        city,
+                        province,
+                        latitude,
+                        longitude,
+                        round(distance_km::numeric, 3)::double precision AS distance_km,
+                        fuel_type,
+                        price,
+                        is_self_service,
+                        reported_at,
+                        imported_at_proxy
+                    FROM ranked_prices
+                    ORDER BY price ASC, distance_km ASC
+                    LIMIT %s;
+                    """,
+                    (
+                        lat,
+                        lng,
+                        lat,
+                        lat - lat_delta,
+                        lat + lat_delta,
+                        lng - lng_delta,
+                        lng + lng_delta,
+                        radius_km,
+                        endpoint_fuel_type,
+                        is_self_service,
+                        is_self_service,
+                        limit,
+                    ),
+                )
+                nearby_endpoint_equivalent = cur.fetchall()
+
+        datetime_fields = ["min_reported_at", "max_reported_at", "last_imported_at_proxy"]
+        price_datetime_fields = ["reported_at", "imported_at_proxy"]
+
+        return {
+            "status": "ok",
+            "filters": {
+                "lat": lat,
+                "lng": lng,
+                "radius_km": radius_km,
+                "fuel_type": normalized_fuel_type,
+                "nearby_endpoint_equivalent_fuel_type": endpoint_fuel_type,
+                "is_self_service": is_self_service,
+            },
+            "summary": serialize_datetime_fields([dict(summary)], datetime_fields)[0] if summary else None,
+            "has_imported_at": imported_at_info["has_imported_at"] if imported_at_info else False,
+            "reported_at_counts": [dict(row) for row in reported_at_counts],
+            "newest_nearby_prices": serialize_datetime_fields([dict(row) for row in newest_nearby], price_datetime_fields),
+            "oldest_nearby_prices": serialize_datetime_fields([dict(row) for row in oldest_nearby], price_datetime_fields),
+            "nearby_endpoint_equivalent": serialize_datetime_fields([dict(row) for row in nearby_endpoint_equivalent], price_datetime_fields),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"MIMIT diagnostics failed: {exc}")
     finally:
         conn.close()
 

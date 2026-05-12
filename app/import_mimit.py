@@ -1,5 +1,6 @@
 import csv
 import os
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -194,11 +195,12 @@ def normalize_fuel_type(raw_fuel: str) -> str:
     return value
 
 
-def download_file(url: str, destination: Path) -> None:
+def download_file(url: str, destination: Path) -> dict[str, object]:
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     temporary_destination = destination.with_suffix(destination.suffix + ".tmp")
 
     with urlopen(url, context=ssl_context) as response, open(temporary_destination, "wb") as output_file:
+        last_modified = response.headers.get("Last-Modified")
         shutil.copyfileobj(response, output_file)
 
     if not temporary_destination.exists() or temporary_destination.stat().st_size == 0:
@@ -206,13 +208,27 @@ def download_file(url: str, destination: Path) -> None:
 
     temporary_destination.replace(destination)
 
+    parsed_last_modified = None
+    if last_modified:
+        try:
+            parsed_last_modified = parsedate_to_datetime(last_modified).isoformat()
+        except (TypeError, ValueError):
+            parsed_last_modified = last_modified
 
-def download_latest_mimit_files() -> dict[str, str]:
+    return {
+        "url": url,
+        "path": str(destination),
+        "size_bytes": destination.stat().st_size,
+        "last_modified": parsed_last_modified,
+    }
+
+
+def download_latest_mimit_files() -> dict[str, object]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        download_file(ANAGRAFICA_URL, ANAGRAFICA_PATH)
-        download_file(PREZZI_URL, PREZZI_PATH)
+        anagrafica = download_file(ANAGRAFICA_URL, ANAGRAFICA_PATH)
+        prezzi = download_file(PREZZI_URL, PREZZI_PATH)
     except Exception:
         anagrafica_tmp = ANAGRAFICA_PATH.with_suffix(ANAGRAFICA_PATH.suffix + ".tmp")
         prezzi_tmp = PREZZI_PATH.with_suffix(PREZZI_PATH.suffix + ".tmp")
@@ -227,6 +243,8 @@ def download_latest_mimit_files() -> dict[str, str]:
     return {
         "anagrafica_path": str(ANAGRAFICA_PATH),
         "prezzi_path": str(PREZZI_PATH),
+        "anagrafica": anagrafica,
+        "prezzi": prezzi,
     }
 
 
