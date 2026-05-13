@@ -75,6 +75,11 @@ def sanitize_display_name(value: str | None) -> str | None:
     return cleaned or None
 
 
+def default_display_name_from_email(email: str) -> str:
+    local_part = email.split("@", 1)[0].strip()
+    return local_part or "FuelNear User"
+
+
 def generate_unique_referral_code(conn) -> str:
     for _ in range(20):
         candidate = generate_referral_code()
@@ -296,9 +301,10 @@ def create_user_session(conn, user_id: int, device_info: str | None = None, ip_a
                 refresh_token_hash,
                 device_info,
                 ip_address,
+                access_expires_at,
                 expires_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id;
             """,
             (
@@ -307,6 +313,7 @@ def create_user_session(conn, user_id: int, device_info: str | None = None, ip_a
                 refresh_token_hash,
                 device_info,
                 ip_address,
+                access_expires_at,
                 refresh_expires_at,
             ),
         )
@@ -359,6 +366,7 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
             UPDATE user_sessions
             SET access_token_hash = %s,
                 refresh_token_hash = %s,
+                access_expires_at = %s,
                 expires_at = %s,
                 revoked_at = NULL
             WHERE id = %s;
@@ -366,6 +374,7 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
             (
                 new_access_token_hash,
                 new_refresh_token_hash,
+                access_expires_at,
                 refresh_expires_at,
                 session["id"],
             ),
@@ -414,13 +423,15 @@ def get_current_user_from_token(authorization: str | None) -> dict[str, Any]:
                         u.created_at,
                         u.updated_at,
                         s.id AS session_id,
+                        s.access_expires_at,
                         s.expires_at,
                         s.revoked_at
                     FROM user_sessions s
                     JOIN users u ON u.id = s.user_id
                     WHERE s.access_token_hash = %s
                       AND s.revoked_at IS NULL
-                      AND s.expires_at > NOW()
+                      AND s.access_expires_at IS NOT NULL
+                      AND s.access_expires_at > NOW()
                     LIMIT 1;
                     """,
                     (access_token_hash,),
@@ -465,6 +476,38 @@ def revoke_current_session(authorization: str | None) -> dict[str, Any]:
             "status": "ok",
             "message": "Session revoked successfully",
         }
+    finally:
+        conn.close()
+
+
+def delete_current_account(authorization: str | None) -> dict[str, str]:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM user_sessions WHERE user_id = %s;", (user_id,))
+                cur.execute(
+                    """
+                    DELETE FROM users
+                    WHERE id = %s
+                    RETURNING id;
+                    """,
+                    (user_id,),
+                )
+                deleted_user = cur.fetchone()
+
+                if deleted_user is None:
+                    raise HTTPException(status_code=404, detail="User not found")
+
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[AUTH] Account deletion failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Account deletion failed")
     finally:
         conn.close()
 
@@ -670,6 +713,12 @@ def ensure_auth_schema(conn) -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE user_sessions
+            ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ NULL;
             """
         )
 
@@ -1148,7 +1197,7 @@ def admin_mimit_diagnostics(
 # === ADMIN REFERRAL PROCESSING ENDPOINT ===
 
 @app.post("/admin/process-referrals")
-def admin_process_referrals() -> dict[str, Any]:
+def admin_process_referrals(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
     conn = get_connection()
     try:
         with conn:
@@ -1172,7 +1221,7 @@ def admin_process_referrals() -> dict[str, Any]:
 @app.post("/auth/register")
 def register_user(payload: RegisterRequest) -> dict[str, Any]:
     email = normalize_email(str(payload.email))
-    display_name = sanitize_display_name(payload.display_name)
+    display_name = sanitize_display_name(payload.display_name) or default_display_name_from_email(email)
     referral_code_input = payload.referral_code.strip().upper() if payload.referral_code else None
 
     conn = get_connection()
@@ -1257,8 +1306,15 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
         raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except psycopg2.errors.UniqueViolation as exc:
+        constraint_name = getattr(exc.diag, "constraint_name", None)
+        print(f"[AUTH] Registration unique violation. constraint={constraint_name}")
+        if constraint_name and "email" in constraint_name:
+            raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=500, detail="Registration failed")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Registration failed: {exc}")
+        print(f"[AUTH] Registration failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Registration failed")
     finally:
         conn.close()
 
@@ -1309,7 +1365,8 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Login failed: {exc}")
+        print(f"[AUTH] Login failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Login failed")
     finally:
         conn.close()
 
@@ -1350,6 +1407,11 @@ def get_current_user_profile(authorization: str | None = Header(default=None, al
         "status": "ok",
         "user": user_payload,
     }
+
+
+@app.delete("/account")
+def delete_account(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, str]:
+    return delete_current_account(authorization)
 
 
 # === USER REFERRALS, REWARDS, SUBSCRIPTION ENDPOINTS ===
