@@ -1,7 +1,7 @@
 from typing import Any
 from email.utils import parsedate_to_datetime
 import os
-from math import cos, radians
+from math import cos, isfinite, radians
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -63,6 +63,30 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class CommunityPriceReportRequest(BaseModel):
+    fuel_type: str
+    price: float
+    is_self_service: bool
+
+
+SUPPORTED_COMMUNITY_FUEL_TYPES = {
+    "benzina",
+    "benzina_premium",
+    "diesel",
+    "diesel_premium",
+    "gpl",
+    "hvo",
+    "metano",
+}
+
+COMMUNITY_FUEL_TYPE_ALIASES = {
+    "gasolio": "diesel",
+    "lpg": "gpl",
+    "gnc": "metano",
+    "cng": "metano",
+}
+
+
 def normalize_email(value: str) -> str:
     return value.strip().lower()
 
@@ -78,6 +102,23 @@ def sanitize_display_name(value: str | None) -> str | None:
 def default_display_name_from_email(email: str) -> str:
     local_part = email.split("@", 1)[0].strip()
     return local_part or "FuelNear User"
+
+
+def normalize_community_fuel_type(raw_fuel_type: str) -> str:
+    fuel_type = raw_fuel_type.strip().lower()
+    return COMMUNITY_FUEL_TYPE_ALIASES.get(fuel_type, fuel_type)
+
+
+def validate_community_price_report(payload: CommunityPriceReportRequest) -> tuple[str, float]:
+    fuel_type = normalize_community_fuel_type(payload.fuel_type)
+    if fuel_type not in SUPPORTED_COMMUNITY_FUEL_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported fuel type")
+
+    price = float(payload.price)
+    if not isfinite(price) or price < 0.5 or price > 5.0:
+        raise HTTPException(status_code=400, detail="Invalid price")
+
+    return fuel_type, round(price, 3)
 
 
 def generate_unique_referral_code(conn) -> str:
@@ -697,6 +738,34 @@ def get_connection():
     return psycopg2.connect(**connection_kwargs)
 
 
+def ensure_community_price_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.stations');")
+        if cur.fetchone()[0] is None:
+            return
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_price_reports (
+                id BIGSERIAL PRIMARY KEY,
+                station_id BIGINT NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+                user_id BIGINT NULL REFERENCES users(id) ON DELETE SET NULL,
+                fuel_type TEXT NOT NULL,
+                price DOUBLE PRECISION NOT NULL CHECK (price > 0),
+                is_self_service BOOLEAN NOT NULL,
+                reported_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'accepted', 'rejected', 'superseded')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_price_reports_station_status ON user_price_reports(station_id, status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_price_reports_user_recent ON user_price_reports(user_id, station_id, fuel_type, is_self_service, created_at DESC);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_price_reports_latest ON user_price_reports(station_id, fuel_type, is_self_service, reported_at DESC);")
+
+
 def ensure_auth_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -793,6 +862,7 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
+        ensure_community_price_schema(conn)
         ensure_mimit_import_schema(conn)
 
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
@@ -1757,6 +1827,140 @@ def get_nearby_stations(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.get("/stations/{station_id}/community-prices")
+def get_station_community_prices(station_id: int) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_community_price_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id FROM stations WHERE id = %s LIMIT 1;", (station_id,))
+                if cur.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Station not found")
+
+                cur.execute(
+                    """
+                    WITH valid_reports AS (
+                        SELECT
+                            fuel_type,
+                            price,
+                            is_self_service,
+                            reported_at,
+                            created_at,
+                            COUNT(*) OVER (
+                                PARTITION BY fuel_type, is_self_service
+                            ) AS reports_count,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY fuel_type, is_self_service
+                                ORDER BY reported_at DESC, created_at DESC, id DESC
+                            ) AS row_number
+                        FROM user_price_reports
+                        WHERE station_id = %s
+                          AND status IN ('pending', 'accepted')
+                    )
+                    SELECT
+                        fuel_type,
+                        price,
+                        is_self_service,
+                        reported_at,
+                        'community' AS source,
+                        reports_count
+                    FROM valid_reports
+                    WHERE row_number = 1
+                    ORDER BY fuel_type ASC, is_self_service DESC;
+                    """,
+                    (station_id,),
+                )
+                reports = cur.fetchall()
+
+        return {
+            "station_id": station_id,
+            "items": serialize_datetime_fields([dict(row) for row in reports], ["reported_at"]),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[COMMUNITY_PRICES] Read failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Community prices read failed")
+    finally:
+        conn.close()
+
+
+@app.post("/stations/{station_id}/community-prices", status_code=201)
+def submit_station_community_price(
+    station_id: int,
+    payload: CommunityPriceReportRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+    fuel_type, price = validate_community_price_report(payload)
+    reported_at = datetime.now(timezone.utc)
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_community_price_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id FROM stations WHERE id = %s LIMIT 1;", (station_id,))
+                if cur.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Station not found")
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM user_price_reports
+                    WHERE user_id = %s
+                      AND station_id = %s
+                      AND fuel_type = %s
+                      AND is_self_service = %s
+                      AND ABS(price - %s) < 0.0001
+                      AND status IN ('pending', 'accepted')
+                      AND created_at >= NOW() - INTERVAL '10 minutes'
+                    LIMIT 1;
+                    """,
+                    (user_id, station_id, fuel_type, payload.is_self_service, price),
+                )
+                if cur.fetchone() is not None:
+                    raise HTTPException(status_code=429, detail="Duplicate report submitted recently")
+
+                cur.execute(
+                    """
+                    INSERT INTO user_price_reports (
+                        station_id,
+                        user_id,
+                        fuel_type,
+                        price,
+                        is_self_service,
+                        reported_at,
+                        status,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', NOW(), NOW())
+                    RETURNING id, fuel_type, price, is_self_service, reported_at, status;
+                    """,
+                    (station_id, user_id, fuel_type, price, payload.is_self_service, reported_at),
+                )
+                report = cur.fetchone()
+
+        report_payload = serialize_datetime_fields([dict(report)], ["reported_at"])[0]
+        report_payload["source"] = "community"
+
+        return {
+            "status": "ok",
+            "station_id": station_id,
+            "report": report_payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[COMMUNITY_PRICES] Submit failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Community price submission failed")
+    finally:
+        conn.close()
 
 
 # Best station endpoint
