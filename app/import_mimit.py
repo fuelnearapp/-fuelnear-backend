@@ -320,6 +320,20 @@ def load_prices_dataframe() -> pd.DataFrame:
     return df
 
 
+def get_prices_csv_max_reported_at(df_prices: pd.DataFrame):
+    parsed_dates = pd.to_datetime(
+        df_prices["dtComu"].astype(str).str.strip(),
+        format="%d/%m/%Y %H:%M:%S",
+        errors="coerce",
+    )
+    max_reported_at = parsed_dates.max()
+
+    if pd.isna(max_reported_at):
+        return None
+
+    return max_reported_at.to_pydatetime()
+
+
 def import_stations(conn, df_stations: pd.DataFrame) -> dict[int, int]:
     station_id_map: dict[int, int] = {}
     skipped_missing_coords = 0
@@ -442,7 +456,7 @@ def import_prices(conn, df_prices: pd.DataFrame, station_id_map: dict[int, int])
     return inserted_count
 
 
-def import_local_mimit_files() -> dict[str, int]:
+def import_local_mimit_files() -> dict[str, object]:
     conn = get_connection()
 
     try:
@@ -460,6 +474,8 @@ def import_local_mimit_files() -> dict[str, int]:
         if df_prices.empty:
             raise RuntimeError("Prezzi CSV vuoto o non valido")
         print(f"Prezzi letti dal CSV: {len(df_prices)}")
+        max_reported_at_csv = get_prices_csv_max_reported_at(df_prices)
+        print(f"Max dtComu nel CSV prezzi: {max_reported_at_csv.isoformat() if max_reported_at_csv else None}")
 
         print("Import stazioni nel database...")
         station_id_map = import_stations(conn, df_stations)
@@ -476,6 +492,14 @@ def import_local_mimit_files() -> dict[str, int]:
             raise RuntimeError("Nessun prezzo importato: import interrotto")
         print(f"Prezzi importati: {imported_prices}")
 
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(reported_at) FROM fuel_prices;")
+            max_reported_at_imported = cur.fetchone()[0]
+        print(
+            "Max reported_at importato in fuel_prices: "
+            f"{max_reported_at_imported.isoformat() if max_reported_at_imported else None}"
+        )
+
         conn.commit()
         print("Import completato con successo.")
 
@@ -484,6 +508,8 @@ def import_local_mimit_files() -> dict[str, int]:
             "prices_csv": len(df_prices),
             "stations_imported": len(station_id_map),
             "prices_imported": imported_prices,
+            "max_reported_at_csv": max_reported_at_csv.isoformat() if max_reported_at_csv else None,
+            "max_reported_at_imported": max_reported_at_imported.isoformat() if max_reported_at_imported else None,
         }
     except Exception:
         conn.rollback()
@@ -498,6 +524,14 @@ def update_mimit_data(download: bool = True) -> dict[str, object]:
     if download:
         print("Download dei file MIMIT in corso...")
         result["download"] = download_latest_mimit_files()
+        prezzi_download = result["download"].get("prezzi") if isinstance(result["download"], dict) else None
+        if isinstance(prezzi_download, dict):
+            print(
+                "[MIMIT] Dataset prezzi scaricato: "
+                f"last_modified={prezzi_download.get('last_modified')} "
+                f"size_bytes={prezzi_download.get('size_bytes')} "
+                f"path={prezzi_download.get('path')}"
+            )
         print("Download completato.")
 
     result["import"] = import_local_mimit_files()

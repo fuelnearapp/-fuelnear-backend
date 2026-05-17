@@ -1014,6 +1014,76 @@ def get_mimit_status() -> dict[str, Any]:
         conn.close()
 
 
+@app.get("/debug/mimit-status")
+def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        started_at,
+                        completed_at,
+                        status,
+                        stations_imported,
+                        prices_imported,
+                        stations_csv,
+                        prices_csv,
+                        source_file_timestamp,
+                        error_message
+                    FROM mimit_import_runs
+                    ORDER BY started_at DESC
+                    LIMIT 1;
+                    """
+                )
+                last_run = cur.fetchone()
+
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        started_at,
+                        completed_at,
+                        status,
+                        stations_imported,
+                        prices_imported,
+                        stations_csv,
+                        prices_csv,
+                        source_file_timestamp
+                    FROM mimit_import_runs
+                    WHERE status = 'success'
+                    ORDER BY completed_at DESC
+                    LIMIT 1;
+                    """
+                )
+                last_success = cur.fetchone()
+
+                cur.execute("SELECT MAX(reported_at) AS max_reported_at FROM fuel_prices;")
+                max_reported_at = cur.fetchone()
+
+        datetime_fields = ["started_at", "completed_at", "source_file_timestamp"]
+        return {
+            "status": "ok",
+            "update_in_progress": _mimit_update_lock.locked(),
+            "last_run": serialize_datetime_fields([dict(last_run)], datetime_fields)[0] if last_run else None,
+            "last_completed_update_at": last_success["completed_at"].isoformat() if last_success and last_success["completed_at"] else None,
+            "last_dataset_date": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
+            "last_prices_imported": last_success["prices_imported"] if last_success else None,
+            "last_stations_imported": last_success["stations_imported"] if last_success else None,
+            "last_prices_csv": last_success["prices_csv"] if last_success else None,
+            "last_stations_csv": last_success["stations_csv"] if last_success else None,
+            "max_fuel_prices_reported_at": max_reported_at["max_reported_at"].isoformat() if max_reported_at and max_reported_at["max_reported_at"] else None,
+        }
+    except Exception as exc:
+        print(f"[MIMIT] Debug status failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="MIMIT debug status failed")
+    finally:
+        conn.close()
+
+
 @app.get("/admin/mimit-diagnostics")
 def admin_mimit_diagnostics(
     _: None = Depends(require_admin_update_token),
@@ -1198,7 +1268,7 @@ def admin_mimit_diagnostics(
                         WHERE cs.distance_km <= %s
                           AND fp.fuel_type = %s
                           AND (%s IS NULL OR fp.is_self_service = %s)
-                        ORDER BY cs.id, fp.price ASC, fp.is_self_service DESC, fp.reported_at DESC
+                        ORDER BY cs.id, fp.reported_at DESC, fp.price ASC, fp.is_self_service DESC
                     )
                     SELECT
                         id,
@@ -1781,7 +1851,7 @@ def get_nearby_stations(
                         WHERE cs.distance_km <= %s
                           AND fp.fuel_type = %s
                           AND (%s IS NULL OR fp.is_self_service = %s)
-                        ORDER BY cs.id, fp.price ASC, fp.is_self_service DESC, fp.reported_at DESC
+                        ORDER BY cs.id, fp.reported_at DESC, fp.price ASC, fp.is_self_service DESC
                     )
                     SELECT
                         id,
