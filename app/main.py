@@ -39,6 +39,11 @@ ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
 APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_IDS = [
+    client_id.strip()
+    for client_id in (os.getenv("GOOGLE_CLIENT_IDS") or GOOGLE_CLIENT_ID or "").split(",")
+    if client_id.strip()
+]
 
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
@@ -139,7 +144,12 @@ def auth_debug_log(message: str) -> None:
     print(f"[AUTH][GOOGLE] {message}")
 
 
-def verify_jwt_with_jwks(token: str, jwks_url: str, audience: str, issuer: str | None = None) -> dict[str, Any]:
+def verify_jwt_with_jwks(
+    token: str,
+    jwks_url: str,
+    audience: str | list[str],
+    issuer: str | None = None,
+) -> dict[str, Any]:
     jwk_client = PyJWKClient(jwks_url)
     signing_key = jwk_client.get_signing_key_from_jwt(token)
     decode_kwargs: dict[str, Any] = {
@@ -181,7 +191,7 @@ def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
 
 
 def verify_google_id_token(id_token: str) -> dict[str, Any]:
-    if not GOOGLE_CLIENT_ID:
+    if not GOOGLE_CLIENT_IDS:
         raise HTTPException(status_code=500, detail="Google auth not configured")
 
     try:
@@ -189,7 +199,7 @@ def verify_google_id_token(id_token: str) -> dict[str, Any]:
         claims = verify_jwt_with_jwks(
             id_token,
             GOOGLE_JWKS_URL,
-            audience=GOOGLE_CLIENT_ID,
+            audience=GOOGLE_CLIENT_IDS,
         )
     except PyJWTError as exc:
         auth_debug_log(f"token verification failed type={exc.__class__.__name__}")
@@ -1799,7 +1809,8 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
 @app.post("/auth/google")
 def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
     auth_debug_log("endpoint reached")
-    auth_debug_log(f"config present={bool(GOOGLE_CLIENT_ID)}")
+    auth_debug_log(f"config present={bool(GOOGLE_CLIENT_IDS)}")
+    auth_debug_log(f"configured audiences count={len(GOOGLE_CLIENT_IDS)}")
     auth_debug_log(f"id_token length={len(payload.id_token) if payload.id_token else 0}")
 
     try:
