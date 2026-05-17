@@ -202,6 +202,13 @@ def verify_google_id_token(id_token: str) -> dict[str, Any]:
             audience=GOOGLE_CLIENT_IDS,
         )
     except PyJWTError as exc:
+        if exc.__class__.__name__ == "InvalidAudienceError":
+            try:
+                unverified_claims = jwt.decode(id_token, options={"verify_signature": False})
+                auth_debug_log(f"token audience={unverified_claims.get('aud')}")
+                auth_debug_log(f"token authorized_party={unverified_claims.get('azp')}")
+            except Exception as decode_exc:
+                auth_debug_log(f"token audience decode failed type={decode_exc.__class__.__name__}")
         auth_debug_log(f"token verification failed type={exc.__class__.__name__}")
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
     except Exception as exc:
