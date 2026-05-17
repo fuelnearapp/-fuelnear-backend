@@ -135,6 +135,10 @@ def parse_token_email_verified(value: Any) -> bool:
     return False
 
 
+def auth_debug_log(message: str) -> None:
+    print(f"[AUTH][GOOGLE] {message}")
+
+
 def verify_jwt_with_jwks(token: str, jwks_url: str, audience: str, issuer: str | None = None) -> dict[str, Any]:
     jwk_client = PyJWKClient(jwks_url)
     signing_key = jwk_client.get_signing_key_from_jwt(token)
@@ -178,22 +182,29 @@ def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
 
 def verify_google_id_token(id_token: str) -> dict[str, Any]:
     if not GOOGLE_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
+        raise HTTPException(status_code=500, detail="Google auth not configured")
 
     try:
+        auth_debug_log("token verification started")
         claims = verify_jwt_with_jwks(
             id_token,
             GOOGLE_JWKS_URL,
             audience=GOOGLE_CLIENT_ID,
         )
-    except (PyJWTError, Exception):
+    except PyJWTError as exc:
+        auth_debug_log(f"token verification failed type={exc.__class__.__name__}")
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
+    except Exception as exc:
+        auth_debug_log(f"jwks verification failed type={exc.__class__.__name__}")
+        raise HTTPException(status_code=502, detail="Google token verification unavailable")
 
     if claims.get("iss") not in GOOGLE_ISSUERS:
+        auth_debug_log("token verification failed type=InvalidIssuer")
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
 
     provider_user_id = claims.get("sub")
     if not provider_user_id:
+        auth_debug_log("token verification failed type=MissingSubject")
         raise HTTPException(status_code=401, detail="Invalid Google ID token")
 
     return {
@@ -640,6 +651,7 @@ def authenticate_with_provider(
     provider_claims: dict[str, Any],
     display_name: str | None,
     device_info: str | None,
+    log_prefix: str | None = None,
 ) -> dict[str, Any]:
     provider = provider_claims["provider"]
     provider_user_id = provider_claims["provider_user_id"]
@@ -652,6 +664,8 @@ def authenticate_with_provider(
         with conn:
             ensure_auth_provider_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if log_prefix:
+                    print(f"{log_prefix} user lookup/create started")
                 cur.execute(
                     """
                     SELECT user_id
@@ -731,6 +745,8 @@ def authenticate_with_provider(
                 if not user_row["is_active"]:
                     raise HTTPException(status_code=403, detail="User account is inactive")
 
+                if log_prefix:
+                    print(f"{log_prefix} session create started")
                 session_payload = create_user_session(conn, user_id=user_row["id"], device_info=device_info, ip_address=None)
                 user_payload = build_user_payload(conn, dict(user_row))
 
@@ -742,7 +758,13 @@ def authenticate_with_provider(
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"[AUTH] Provider authentication failed. provider={provider} error={exc.__class__.__name__}")
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        print(
+            f"[AUTH] Provider authentication failed. provider={provider} "
+            f"error={exc.__class__.__name__} pgcode={pgcode} table={table} constraint={constraint}"
+        )
         raise HTTPException(status_code=500, detail="Provider authentication failed")
     finally:
         conn.close()
@@ -1029,6 +1051,12 @@ def ensure_auth_schema(conn) -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE users
+            ALTER COLUMN password_hash DROP NOT NULL;
             """
         )
 
@@ -1770,12 +1798,26 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
 
 @app.post("/auth/google")
 def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
-    claims = verify_google_id_token(payload.id_token)
-    return authenticate_with_provider(
-        claims,
-        display_name=payload.display_name,
-        device_info=payload.device_info,
-    )
+    auth_debug_log("endpoint reached")
+    auth_debug_log(f"config present={bool(GOOGLE_CLIENT_ID)}")
+    auth_debug_log(f"id_token length={len(payload.id_token) if payload.id_token else 0}")
+
+    try:
+        if not payload.id_token or not payload.id_token.strip():
+            raise HTTPException(status_code=400, detail="Google ID token is required")
+
+        claims = verify_google_id_token(payload.id_token)
+        return authenticate_with_provider(
+            claims,
+            display_name=payload.display_name,
+            device_info=payload.device_info,
+            log_prefix="[AUTH][GOOGLE]",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[AUTH][GOOGLE] unexpected failure type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Google authentication failed")
 
 
 # Add refresh and logout endpoints after /auth/login and before /auth/me
