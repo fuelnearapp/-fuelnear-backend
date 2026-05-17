@@ -9,6 +9,8 @@ import re
 from urllib.parse import urlparse
 
 import psycopg2
+import jwt
+from jwt import PyJWKClient, PyJWTError
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from pydantic import BaseModel, EmailStr
@@ -35,6 +37,12 @@ ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
+APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 app = FastAPI(title="FuelNear Backend")
 
@@ -61,6 +69,19 @@ class LoginRequest(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+
+class AppleAuthRequest(BaseModel):
+    identity_token: str
+    authorization_code: str | None = None
+    display_name: str | None = None
+    device_info: str | None = None
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+    display_name: str | None = None
+    device_info: str | None = None
 
 
 class CommunityPriceReportRequest(BaseModel):
@@ -102,6 +123,86 @@ def sanitize_display_name(value: str | None) -> str | None:
 def default_display_name_from_email(email: str) -> str:
     local_part = email.split("@", 1)[0].strip()
     return local_part or "FuelNear User"
+
+
+def parse_token_email_verified(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+
+    return False
+
+
+def verify_jwt_with_jwks(token: str, jwks_url: str, audience: str, issuer: str | None = None) -> dict[str, Any]:
+    jwk_client = PyJWKClient(jwks_url)
+    signing_key = jwk_client.get_signing_key_from_jwt(token)
+    decode_kwargs: dict[str, Any] = {
+        "audience": audience,
+        "algorithms": ["RS256"],
+    }
+
+    if issuer:
+        decode_kwargs["issuer"] = issuer
+
+    return jwt.decode(token, signing_key.key, **decode_kwargs)
+
+
+def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
+    if not APPLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="APPLE_CLIENT_ID is not configured")
+
+    try:
+        claims = verify_jwt_with_jwks(
+            identity_token,
+            APPLE_JWKS_URL,
+            audience=APPLE_CLIENT_ID,
+            issuer="https://appleid.apple.com",
+        )
+    except (PyJWTError, Exception):
+        raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+    provider_user_id = claims.get("sub")
+    if not provider_user_id:
+        raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+    return {
+        "provider": "apple",
+        "provider_user_id": str(provider_user_id),
+        "email": normalize_email(str(claims["email"])) if claims.get("email") else None,
+        "email_verified": parse_token_email_verified(claims.get("email_verified")),
+        "display_name": None,
+    }
+
+
+def verify_google_id_token(id_token: str) -> dict[str, Any]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
+
+    try:
+        claims = verify_jwt_with_jwks(
+            id_token,
+            GOOGLE_JWKS_URL,
+            audience=GOOGLE_CLIENT_ID,
+        )
+    except (PyJWTError, Exception):
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    if claims.get("iss") not in GOOGLE_ISSUERS:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    provider_user_id = claims.get("sub")
+    if not provider_user_id:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    return {
+        "provider": "google",
+        "provider_user_id": str(provider_user_id),
+        "email": normalize_email(str(claims["email"])) if claims.get("email") else None,
+        "email_verified": parse_token_email_verified(claims.get("email_verified")),
+        "display_name": sanitize_display_name(claims.get("name")),
+    }
 
 
 def normalize_community_fuel_type(raw_fuel_type: str) -> str:
@@ -521,6 +622,132 @@ def revoke_current_session(authorization: str | None) -> dict[str, Any]:
         conn.close()
 
 
+def fetch_user_for_auth_payload(cur, user_id: int) -> dict[str, Any] | None:
+    cur.execute(
+        """
+        SELECT id, email, password_hash, display_name, referral_code, referred_by_user_id,
+               is_email_verified, is_active, created_at, updated_at
+        FROM users
+        WHERE id = %s
+        LIMIT 1;
+        """,
+        (user_id,),
+    )
+    return cur.fetchone()
+
+
+def authenticate_with_provider(
+    provider_claims: dict[str, Any],
+    display_name: str | None,
+    device_info: str | None,
+) -> dict[str, Any]:
+    provider = provider_claims["provider"]
+    provider_user_id = provider_claims["provider_user_id"]
+    email = provider_claims.get("email")
+    email_verified = bool(provider_claims.get("email_verified"))
+    provider_display_name = sanitize_display_name(display_name) or sanitize_display_name(provider_claims.get("display_name"))
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_auth_provider_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT user_id
+                    FROM user_auth_providers
+                    WHERE provider = %s
+                      AND provider_user_id = %s
+                    LIMIT 1;
+                    """,
+                    (provider, provider_user_id),
+                )
+                provider_row = cur.fetchone()
+
+                if provider_row:
+                    user_row = fetch_user_for_auth_payload(cur, provider_row["user_id"])
+                    if user_row is None:
+                        raise HTTPException(status_code=404, detail="User not found")
+                else:
+                    if not email:
+                        raise HTTPException(status_code=400, detail="Email is required for first sign-in")
+
+                    fallback_display_name = provider_display_name or default_display_name_from_email(email)
+                    cur.execute(
+                        """
+                        INSERT INTO users (
+                            email,
+                            password_hash,
+                            display_name,
+                            referral_code,
+                            referred_by_user_id,
+                            is_email_verified,
+                            is_active
+                        )
+                        VALUES (%s, NULL, %s, %s, NULL, %s, TRUE)
+                        ON CONFLICT (email) DO UPDATE SET
+                            is_email_verified = users.is_email_verified OR EXCLUDED.is_email_verified,
+                            updated_at = NOW()
+                        RETURNING id, email, password_hash, display_name, referral_code, referred_by_user_id,
+                                  is_email_verified, is_active, created_at, updated_at;
+                        """,
+                        (
+                            email,
+                            fallback_display_name,
+                            generate_unique_referral_code(conn),
+                            email_verified,
+                        ),
+                    )
+                    user_row = cur.fetchone()
+
+                    if user_row["email"] == email and not email_verified and user_row["password_hash"]:
+                        raise HTTPException(status_code=401, detail="Email must be verified to link provider")
+
+                    cur.execute(
+                        """
+                        INSERT INTO user_auth_providers (
+                            user_id,
+                            provider,
+                            provider_user_id,
+                            email,
+                            email_verified,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (provider, provider_user_id) DO UPDATE SET
+                            email = COALESCE(EXCLUDED.email, user_auth_providers.email),
+                            email_verified = EXCLUDED.email_verified,
+                            updated_at = NOW()
+                        RETURNING user_id;
+                        """,
+                        (user_row["id"], provider, provider_user_id, email, email_verified),
+                    )
+                    linked_provider = cur.fetchone()
+                    user_row = fetch_user_for_auth_payload(cur, linked_provider["user_id"])
+                    if user_row is None:
+                        raise HTTPException(status_code=404, detail="User not found")
+
+                if not user_row["is_active"]:
+                    raise HTTPException(status_code=403, detail="User account is inactive")
+
+                session_payload = create_user_session(conn, user_id=user_row["id"], device_info=device_info, ip_address=None)
+                user_payload = build_user_payload(conn, dict(user_row))
+
+        return {
+            "status": "ok",
+            "user": user_payload,
+            "session": session_payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[AUTH] Provider authentication failed. provider={provider} error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Provider authentication failed")
+    finally:
+        conn.close()
+
+
 def delete_current_account(authorization: str | None) -> dict[str, str]:
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
@@ -766,6 +993,26 @@ def ensure_community_price_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_price_reports_latest ON user_price_reports(station_id, fuel_type, is_self_service, reported_at DESC);")
 
 
+def ensure_auth_provider_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_auth_providers (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL CHECK (provider IN ('apple', 'google')),
+                provider_user_id TEXT NOT NULL,
+                email TEXT NULL,
+                email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (provider, provider_user_id)
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_auth_providers_user_id ON user_auth_providers(user_id);")
+
+
 def ensure_auth_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -784,12 +1031,6 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
-        cur.execute(
-            """
-            ALTER TABLE user_sessions
-            ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ NULL;
-            """
-        )
 
         cur.execute(
             """
@@ -806,7 +1047,6 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
-
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS rewards (
@@ -822,7 +1062,6 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
-
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_sessions (
@@ -836,6 +1075,12 @@ def ensure_auth_schema(conn) -> None:
                 revoked_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE user_sessions
+            ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ NULL;
             """
         )
 
@@ -862,6 +1107,7 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
+        ensure_auth_provider_schema(conn)
         ensure_community_price_schema(conn)
         ensure_mimit_import_schema(conn)
 
@@ -1509,6 +1755,27 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Login failed")
     finally:
         conn.close()
+
+
+@app.post("/auth/apple")
+def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
+    claims = verify_apple_identity_token(payload.identity_token)
+    claims["display_name"] = payload.display_name
+    return authenticate_with_provider(
+        claims,
+        display_name=payload.display_name,
+        device_info=payload.device_info,
+    )
+
+
+@app.post("/auth/google")
+def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
+    claims = verify_google_id_token(payload.id_token)
+    return authenticate_with_provider(
+        claims,
+        display_name=payload.display_name,
+        device_info=payload.device_info,
+    )
 
 
 # Add refresh and logout endpoints after /auth/login and before /auth/me
