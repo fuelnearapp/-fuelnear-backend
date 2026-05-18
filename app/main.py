@@ -153,6 +153,10 @@ def apple_auth_debug_log(message: str) -> None:
     print(f"[AUTH][APPLE] {message}")
 
 
+def account_delete_log(message: str) -> None:
+    print(f"[AUTH][DELETE_ACCOUNT] {message}")
+
+
 def apple_full_name_to_display_name(value: Any) -> str | None:
     if isinstance(value, str):
         return sanitize_display_name(value)
@@ -818,13 +822,16 @@ def authenticate_with_provider(
 
 
 def delete_current_account(authorization: str | None) -> dict[str, str]:
+    account_delete_log("endpoint reached")
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
+    account_delete_log(f"authenticated user id present={bool(user_id)}")
 
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
+                account_delete_log("deletion started")
                 cur.execute("DELETE FROM user_sessions WHERE user_id = %s;", (user_id,))
                 cur.execute(
                     """
@@ -837,13 +844,21 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
                 deleted_user = cur.fetchone()
 
                 if deleted_user is None:
+                    account_delete_log("deletion failure type=UserNotFound")
                     raise HTTPException(status_code=404, detail="User not found")
 
+        account_delete_log("deletion success")
         return {"status": "ok"}
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"[AUTH] Account deletion failed. error={exc.__class__.__name__}")
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        account_delete_log(
+            f"deletion failure type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
         raise HTTPException(status_code=500, detail="Account deletion failed")
     finally:
         conn.close()
@@ -1931,6 +1946,11 @@ def get_current_user_profile(authorization: str | None = Header(default=None, al
         "status": "ok",
         "user": user_payload,
     }
+
+
+@app.delete("/auth/me")
+def delete_current_user_profile(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, str]:
+    return delete_current_account(authorization)
 
 
 @app.delete("/account")
