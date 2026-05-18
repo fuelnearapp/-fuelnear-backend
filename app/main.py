@@ -37,7 +37,7 @@ ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
-APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID")
+APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
     client_id.strip()
@@ -77,8 +77,13 @@ class RefreshRequest(BaseModel):
 
 
 class AppleAuthRequest(BaseModel):
-    identity_token: str
+    identity_token: str | None = None
+    identityToken: str | None = None
     authorization_code: str | None = None
+    authorizationCode: str | None = None
+    email: str | None = None
+    full_name: Any | None = None
+    fullName: Any | None = None
     display_name: str | None = None
     device_info: str | None = None
 
@@ -144,6 +149,24 @@ def auth_debug_log(message: str) -> None:
     print(f"[AUTH][GOOGLE] {message}")
 
 
+def apple_auth_debug_log(message: str) -> None:
+    print(f"[AUTH][APPLE] {message}")
+
+
+def apple_full_name_to_display_name(value: Any) -> str | None:
+    if isinstance(value, str):
+        return sanitize_display_name(value)
+
+    if isinstance(value, dict):
+        name_parts = [
+            value.get("givenName") or value.get("given_name") or value.get("firstName") or value.get("first_name"),
+            value.get("familyName") or value.get("family_name") or value.get("lastName") or value.get("last_name"),
+        ]
+        return sanitize_display_name(" ".join(str(part).strip() for part in name_parts if part))
+
+    return None
+
+
 def verify_jwt_with_jwks(
     token: str,
     jwks_url: str,
@@ -165,22 +188,29 @@ def verify_jwt_with_jwks(
 
 def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
     if not APPLE_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="APPLE_CLIENT_ID is not configured")
+        raise HTTPException(status_code=500, detail="Apple auth not configured")
 
     try:
+        apple_auth_debug_log("token verification started")
         claims = verify_jwt_with_jwks(
             identity_token,
             APPLE_JWKS_URL,
             audience=APPLE_CLIENT_ID,
             issuer="https://appleid.apple.com",
         )
-    except (PyJWTError, Exception):
+    except PyJWTError as exc:
+        apple_auth_debug_log(f"token verification failed type={exc.__class__.__name__}")
         raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+    except Exception as exc:
+        apple_auth_debug_log(f"jwks verification failed type={exc.__class__.__name__}")
+        raise HTTPException(status_code=502, detail="Apple token verification unavailable")
 
     provider_user_id = claims.get("sub")
     if not provider_user_id:
+        apple_auth_debug_log("token verification failed type=MissingSubject")
         raise HTTPException(status_code=401, detail="Invalid Apple identity token")
 
+    apple_auth_debug_log("token verification success")
     return {
         "provider": "apple",
         "provider_user_id": str(provider_user_id),
@@ -1804,12 +1834,39 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
 
 @app.post("/auth/apple")
 def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
-    claims = verify_apple_identity_token(payload.identity_token)
-    claims["display_name"] = payload.display_name
+    identity_token = payload.identityToken or payload.identity_token
+    display_name = (
+        sanitize_display_name(payload.display_name)
+        or apple_full_name_to_display_name(payload.fullName)
+        or apple_full_name_to_display_name(payload.full_name)
+    )
+
+    apple_auth_debug_log("endpoint reached")
+    apple_auth_debug_log(f"config present={bool(APPLE_CLIENT_ID)}")
+    apple_auth_debug_log(f"token length={len(identity_token) if identity_token else 0}")
+
+    if not identity_token or not identity_token.strip():
+        raise HTTPException(status_code=400, detail="Apple identity token is required")
+
+    try:
+        unverified_claims = jwt.decode(identity_token, options={"verify_signature": False})
+        apple_auth_debug_log(f"token audience={unverified_claims.get('aud')}")
+        apple_auth_debug_log(f"token subject present={bool(unverified_claims.get('sub'))}")
+    except Exception as exc:
+        apple_auth_debug_log(f"token preflight decode failed type={exc.__class__.__name__}")
+
+    claims = verify_apple_identity_token(identity_token)
+    payload_email = normalize_email(payload.email) if payload.email else None
+    if payload_email and not claims.get("email"):
+        claims["email"] = payload_email
+        claims["email_verified"] = True
+
+    claims["display_name"] = display_name
     return authenticate_with_provider(
         claims,
-        display_name=payload.display_name,
+        display_name=display_name,
         device_info=payload.device_info,
+        log_prefix="[AUTH][APPLE]",
     )
 
 
