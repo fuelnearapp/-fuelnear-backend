@@ -85,12 +85,14 @@ class AppleAuthRequest(BaseModel):
     full_name: Any | None = None
     fullName: Any | None = None
     display_name: str | None = None
+    referral_code: str | None = None
     device_info: str | None = None
 
 
 class GoogleAuthRequest(BaseModel):
     id_token: str
     display_name: str | None = None
+    referral_code: str | None = None
     device_info: str | None = None
 
 
@@ -698,10 +700,50 @@ def fetch_user_for_auth_payload(cur, user_id: int) -> dict[str, Any] | None:
     return cur.fetchone()
 
 
+def normalize_referral_code_input(referral_code: str | None) -> str | None:
+    if not referral_code:
+        return None
+
+    normalized = referral_code.strip().upper()
+    return normalized or None
+
+
+def resolve_active_referrer_id(cur, referral_code: str) -> int:
+    cur.execute(
+        "SELECT id FROM users WHERE referral_code = %s AND is_active = TRUE LIMIT 1;",
+        (referral_code,),
+    )
+    referrer = cur.fetchone()
+    if referrer is None:
+        raise HTTPException(status_code=400, detail="Invalid referral code")
+
+    return referrer["id"]
+
+
+def create_pending_referral(cur, referrer_user_id: int, referred_user_id: int, referral_code: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO referrals (
+            referrer_user_id,
+            referred_user_id,
+            referral_code_used,
+            status
+        )
+        VALUES (%s, %s, %s, 'pending');
+        """,
+        (
+            referrer_user_id,
+            referred_user_id,
+            referral_code,
+        ),
+    )
+
+
 def authenticate_with_provider(
     provider_claims: dict[str, Any],
     display_name: str | None,
     device_info: str | None,
+    referral_code: str | None = None,
     log_prefix: str | None = None,
 ) -> dict[str, Any]:
     provider = provider_claims["provider"]
@@ -709,6 +751,7 @@ def authenticate_with_provider(
     email = provider_claims.get("email")
     email_verified = bool(provider_claims.get("email_verified"))
     provider_display_name = sanitize_display_name(display_name) or sanitize_display_name(provider_claims.get("display_name"))
+    referral_code_input = normalize_referral_code_input(referral_code)
 
     conn = get_connection()
     try:
@@ -717,6 +760,7 @@ def authenticate_with_provider(
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if log_prefix:
                     print(f"{log_prefix} user lookup/create started")
+                    print(f"{log_prefix} referral_code present={bool(referral_code_input)}")
                 cur.execute(
                     """
                     SELECT user_id
@@ -730,6 +774,9 @@ def authenticate_with_provider(
                 provider_row = cur.fetchone()
 
                 if provider_row:
+                    if log_prefix:
+                        print(f"{log_prefix} referral skipped because existing user=true")
+                        print(f"{log_prefix} referral applied=false")
                     user_row = fetch_user_for_auth_payload(cur, provider_row["user_id"])
                     if user_row is None:
                         raise HTTPException(status_code=404, detail="User not found")
@@ -737,36 +784,74 @@ def authenticate_with_provider(
                     if not email:
                         raise HTTPException(status_code=400, detail="Email is required for first sign-in")
 
-                    fallback_display_name = provider_display_name or default_display_name_from_email(email)
                     cur.execute(
                         """
-                        INSERT INTO users (
-                            email,
-                            password_hash,
-                            display_name,
-                            referral_code,
-                            referred_by_user_id,
-                            is_email_verified,
-                            is_active
-                        )
-                        VALUES (%s, NULL, %s, %s, NULL, %s, TRUE)
-                        ON CONFLICT (email) DO UPDATE SET
-                            is_email_verified = users.is_email_verified OR EXCLUDED.is_email_verified,
-                            updated_at = NOW()
-                        RETURNING id, email, password_hash, display_name, referral_code, referred_by_user_id,
-                                  is_email_verified, is_active, created_at, updated_at;
+                        SELECT id, email, password_hash, display_name, referral_code, referred_by_user_id,
+                               is_email_verified, is_active, created_at, updated_at
+                        FROM users
+                        WHERE email = %s
+                        LIMIT 1;
                         """,
-                        (
-                            email,
-                            fallback_display_name,
-                            generate_unique_referral_code(conn),
-                            email_verified,
-                        ),
+                        (email,),
                     )
-                    user_row = cur.fetchone()
+                    existing_user_row = cur.fetchone()
+                    referral_applied = False
+                    referrer_user_id = None
+
+                    if existing_user_row is None and referral_code_input:
+                        referrer_user_id = resolve_active_referrer_id(cur, referral_code_input)
+
+                    fallback_display_name = provider_display_name or default_display_name_from_email(email)
+
+                    if existing_user_row is None:
+                        cur.execute(
+                            """
+                            INSERT INTO users (
+                                email,
+                                password_hash,
+                                display_name,
+                                referral_code,
+                                referred_by_user_id,
+                                is_email_verified,
+                                is_active
+                            )
+                            VALUES (%s, NULL, %s, %s, %s, %s, TRUE)
+                            RETURNING id, email, password_hash, display_name, referral_code, referred_by_user_id,
+                                      is_email_verified, is_active, created_at, updated_at;
+                            """,
+                            (
+                                email,
+                                fallback_display_name,
+                                generate_unique_referral_code(conn),
+                                referrer_user_id,
+                                email_verified,
+                            ),
+                        )
+                        user_row = cur.fetchone()
+
+                        if referral_code_input and referrer_user_id is not None:
+                            create_pending_referral(cur, referrer_user_id, user_row["id"], referral_code_input)
+                            referral_applied = True
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE users
+                            SET is_email_verified = users.is_email_verified OR %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING id, email, password_hash, display_name, referral_code, referred_by_user_id,
+                                      is_email_verified, is_active, created_at, updated_at;
+                            """,
+                            (email_verified, existing_user_row["id"]),
+                        )
+                        user_row = cur.fetchone()
 
                     if user_row["email"] == email and not email_verified and user_row["password_hash"]:
                         raise HTTPException(status_code=401, detail="Email must be verified to link provider")
+
+                    if log_prefix:
+                        print(f"{log_prefix} referral skipped because existing user={bool(existing_user_row)}")
+                        print(f"{log_prefix} referral applied={referral_applied}")
 
                     cur.execute(
                         """
@@ -1881,6 +1966,7 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
         claims,
         display_name=display_name,
         device_info=payload.device_info,
+        referral_code=payload.referral_code,
         log_prefix="[AUTH][APPLE]",
     )
 
@@ -1901,6 +1987,7 @@ def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
             claims,
             display_name=payload.display_name,
             device_info=payload.device_info,
+            referral_code=payload.referral_code,
             log_prefix="[AUTH][GOOGLE]",
         )
     except HTTPException:
