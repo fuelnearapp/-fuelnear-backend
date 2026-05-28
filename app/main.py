@@ -96,6 +96,10 @@ class GoogleAuthRequest(BaseModel):
     device_info: str | None = None
 
 
+class ApplyReferralCodeRequest(BaseModel):
+    referral_code: str | None = None
+
+
 class CommunityPriceReportRequest(BaseModel):
     fuel_type: str
     price: float
@@ -2046,6 +2050,96 @@ def delete_account(authorization: str | None = Header(default=None, alias="Autho
 
 
 # === USER REFERRALS, REWARDS, SUBSCRIPTION ENDPOINTS ===
+
+@app.post("/user/referral-code")
+def apply_current_user_referral_code(
+    payload: ApplyReferralCodeRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, str]:
+    print("[REFERRAL] apply code endpoint reached")
+    referral_code_input = normalize_referral_code_input(payload.referral_code)
+    print(f"[REFERRAL] referral_code present={bool(referral_code_input)}")
+
+    if not referral_code_input:
+        print("[REFERRAL] referral applied=false")
+        raise HTTPException(status_code=400, detail="Referral code is required")
+
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, referred_by_user_id
+                    FROM users
+                    WHERE id = %s
+                    FOR UPDATE;
+                    """,
+                    (user_id,),
+                )
+                current_user = cur.fetchone()
+                if current_user is None:
+                    print("[REFERRAL] referral applied=false")
+                    raise HTTPException(status_code=404, detail="User not found")
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM referrals
+                    WHERE referred_user_id = %s
+                    LIMIT 1;
+                    """,
+                    (user_id,),
+                )
+                already_referred = bool(current_user["referred_by_user_id"] or cur.fetchone())
+                print(f"[REFERRAL] already referred={already_referred}")
+                if already_referred:
+                    print("[REFERRAL] referral applied=false")
+                    raise HTTPException(status_code=409, detail="Referral code already applied")
+
+                try:
+                    referrer_user_id = resolve_active_referrer_id(cur, referral_code_input)
+                except HTTPException:
+                    print("[REFERRAL] referral applied=false")
+                    raise
+
+                if referrer_user_id == user_id:
+                    print("[REFERRAL] referral applied=false")
+                    raise HTTPException(status_code=400, detail="Cannot use your own referral code")
+
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET referred_by_user_id = %s,
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (referrer_user_id, user_id),
+                )
+                create_pending_referral(cur, referrer_user_id, user_id, referral_code_input)
+
+        print("[REFERRAL] referral applied=true")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except psycopg2.errors.UniqueViolation:
+        print("[REFERRAL] referral applied=false")
+        raise HTTPException(status_code=409, detail="Referral code already applied")
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        print(
+            f"[REFERRAL] apply code failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Referral code apply failed")
+    finally:
+        conn.close()
+
 
 @app.get("/user/referrals")
 def get_current_user_referrals(authorization: str | None = Header(default=None, alias="Authorization")) -> dict[str, Any]:
