@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
+from app.apns_client import APNsConfigurationError, apns_is_configured, send_apns_push
 from app.auth_utils import (
     generate_access_token,
     generate_refresh_token,
@@ -100,6 +101,33 @@ class ApplyReferralCodeRequest(BaseModel):
     referral_code: str | None = None
 
 
+class DeviceTokenRequest(BaseModel):
+    device_token: str
+    platform: str
+    environment: str | None = None
+    app_version: str | None = None
+    device_info: str | None = None
+
+
+class DeleteDeviceTokenRequest(BaseModel):
+    device_token: str
+
+
+class NotificationPreferencesRequest(BaseModel):
+    price_notifications_enabled: bool | None = None
+    fuel_type: str | None = None
+    radius_km: float | None = None
+    favorites_only: bool | None = None
+
+
+class AdminTestPushRequest(BaseModel):
+    user_id: int | None = None
+    device_token: str | None = None
+    title: str
+    body: str
+    payload: dict[str, Any] | None = None
+
+
 class CommunityPriceReportRequest(BaseModel):
     fuel_type: str
     price: float
@@ -161,6 +189,80 @@ def apple_auth_debug_log(message: str) -> None:
 
 def account_delete_log(message: str) -> None:
     print(f"[AUTH][DELETE_ACCOUNT] {message}")
+
+
+def device_token_log(message: str) -> None:
+    print(f"[DEVICE_TOKEN] {message}")
+
+
+def notification_preferences_log(message: str) -> None:
+    print(f"[NOTIFICATION_PREFERENCES] {message}")
+
+
+def normalize_device_token(value: str | None) -> str:
+    token = value.strip() if value else ""
+    if not token:
+        raise HTTPException(status_code=400, detail="Device token is required")
+
+    return token
+
+
+def normalize_device_platform(value: str | None) -> str:
+    platform = value.strip().lower() if value else ""
+    if platform != "ios":
+        raise HTTPException(status_code=400, detail="Unsupported device platform")
+
+    return platform
+
+
+def normalize_device_environment(value: str | None) -> str:
+    environment = value.strip().lower() if value else "production"
+    if environment not in {"sandbox", "production"}:
+        raise HTTPException(status_code=400, detail="Unsupported device environment")
+
+    return environment
+
+
+def device_token_log_id(device_token: str) -> str:
+    return hash_token(device_token)[:12]
+
+
+def normalize_notification_fuel_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    fuel_type = normalize_community_fuel_type(value)
+    if fuel_type not in SUPPORTED_COMMUNITY_FUEL_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported fuel type")
+
+    return fuel_type
+
+
+def normalize_notification_radius_km(value: float | None) -> float | None:
+    if value is None:
+        return None
+
+    radius_km = float(value)
+    if not isfinite(radius_km) or radius_km <= 0 or radius_km > 100:
+        raise HTTPException(status_code=400, detail="Invalid radius_km")
+
+    return radius_km
+
+
+def normalize_push_text(value: str | None, field_name: str) -> str:
+    text = value.strip() if value else ""
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+
+    return text
+
+
+def request_fields_set(payload: BaseModel) -> set[str]:
+    fields_set = getattr(payload, "model_fields_set", None)
+    if fields_set is not None:
+        return set(fields_set)
+
+    return set(getattr(payload, "__fields_set__", set()))
 
 
 def apple_full_name_to_display_name(value: Any) -> str | None:
@@ -921,6 +1023,7 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
         with conn:
             with conn.cursor() as cur:
                 account_delete_log("deletion started")
+                cur.execute("DELETE FROM user_device_tokens WHERE user_id = %s;", (user_id,))
                 cur.execute("DELETE FROM user_sessions WHERE user_id = %s;", (user_id,))
                 cur.execute(
                     """
@@ -1186,6 +1289,54 @@ def ensure_auth_provider_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_auth_providers_user_id ON user_auth_providers(user_id);")
 
 
+def ensure_user_device_tokens_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_device_tokens (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_token TEXT NOT NULL UNIQUE,
+                platform TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'production',
+                app_version TEXT NULL,
+                device_info TEXT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_device_tokens_user_id ON user_device_tokens(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_device_tokens_active ON user_device_tokens(is_active, platform, environment);")
+
+
+def ensure_price_notification_preferences_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_notification_preferences (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                price_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                fuel_type TEXT NULL,
+                radius_km DOUBLE PRECISION NULL,
+                favorites_only BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (user_id)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_price_notification_preferences_user_id
+            ON price_notification_preferences(user_id);
+            """
+        )
+
+
 def ensure_auth_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -1287,6 +1438,8 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
         ensure_auth_provider_schema(conn)
+        ensure_user_device_tokens_schema(conn)
+        ensure_price_notification_preferences_schema(conn)
         ensure_community_price_schema(conn)
         ensure_mimit_import_schema(conn)
 
@@ -1780,6 +1933,146 @@ def admin_process_referrals(_: None = Depends(require_admin_update_token)) -> di
         conn.close()
 
 
+@app.post("/admin/test-push")
+def admin_test_push(
+    payload: AdminTestPushRequest,
+    _: None = Depends(require_admin_update_token),
+) -> dict[str, Any]:
+    title = normalize_push_text(payload.title, "title")
+    body = normalize_push_text(payload.body, "body")
+    explicit_device_token = normalize_device_token(payload.device_token) if payload.device_token else None
+
+    if payload.user_id is None and explicit_device_token is None:
+        raise HTTPException(status_code=400, detail="user_id or device_token is required")
+
+    print(f"[APNS] configured={apns_is_configured()}")
+
+    targets: list[dict[str, Any]] = []
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_device_tokens_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if explicit_device_token:
+                    cur.execute(
+                        """
+                        SELECT id, device_token, environment
+                        FROM user_device_tokens
+                        WHERE device_token = %s
+                        LIMIT 1;
+                        """,
+                        (explicit_device_token,),
+                    )
+                    existing_token = cur.fetchone()
+                    if existing_token:
+                        targets.append(dict(existing_token))
+                    else:
+                        targets.append(
+                            {
+                                "id": None,
+                                "device_token": explicit_device_token,
+                                "environment": None,
+                            }
+                        )
+                elif payload.user_id is not None:
+                    cur.execute(
+                        """
+                        SELECT id, device_token, environment
+                        FROM user_device_tokens
+                        WHERE user_id = %s
+                          AND is_active = TRUE
+                          AND platform = 'ios'
+                        ORDER BY last_seen_at DESC;
+                        """,
+                        (payload.user_id,),
+                    )
+                    targets.extend([dict(row) for row in cur.fetchall()])
+
+        unique_targets: dict[str, dict[str, Any]] = {}
+        for target in targets:
+            unique_targets[target["device_token"]] = target
+        targets = list(unique_targets.values())
+
+        print(f"[APNS] target token count={len(targets)}")
+
+        sent_success_count = 0
+        sent_failure_count = 0
+        invalid_token_count = 0
+        items: list[dict[str, Any]] = []
+
+        for target in targets:
+            device_token = target["device_token"]
+            token_log_id = device_token_log_id(device_token)
+
+            try:
+                result = send_apns_push(
+                    device_token=device_token,
+                    title=title,
+                    body=body,
+                    environment=target.get("environment"),
+                    payload=payload.payload,
+                )
+            except APNsConfigurationError as exc:
+                print(f"[APNS] send failed token hash prefix={token_log_id} type={exc.__class__.__name__}")
+                raise HTTPException(status_code=500, detail=str(exc))
+
+            if result["success"]:
+                sent_success_count += 1
+            else:
+                sent_failure_count += 1
+
+            if result["invalid_token"]:
+                invalid_token_count += 1
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE user_device_tokens
+                            SET is_active = FALSE,
+                                updated_at = NOW()
+                            WHERE device_token = %s;
+                            """,
+                            (device_token,),
+                        )
+
+            print(
+                "[APNS] send result "
+                f"token hash prefix={token_log_id} "
+                f"success={result['success']} "
+                f"status_code={result['status_code']} "
+                f"reason={result['reason']}"
+            )
+            items.append(
+                {
+                    "token_hash_prefix": token_log_id,
+                    "success": result["success"],
+                    "status_code": result["status_code"],
+                    "reason": result["reason"],
+                    "invalid_token": result["invalid_token"],
+                    "temporary_error": result["temporary_error"],
+                    "environment": result["environment"],
+                }
+            )
+
+        print(f"[APNS] sent success count={sent_success_count} failure count={sent_failure_count}")
+        return {
+            "status": "ok",
+            "apns_configured": apns_is_configured(),
+            "target_token_count": len(targets),
+            "sent_success_count": sent_success_count,
+            "sent_failure_count": sent_failure_count,
+            "invalid_token_count": invalid_token_count,
+            "items": items,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[APNS] test push failed type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="APNs test push failed")
+    finally:
+        conn.close()
+
+
 # === AUTH ENDPOINTS ===
 
 
@@ -2050,6 +2343,332 @@ def delete_account(authorization: str | None = Header(default=None, alias="Autho
 
 
 # === USER REFERRALS, REWARDS, SUBSCRIPTION ENDPOINTS ===
+
+@app.post("/user/device-token")
+def upsert_current_user_device_token(
+    payload: DeviceTokenRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    device_token_log("upsert endpoint reached")
+    token_present = bool(payload.device_token and payload.device_token.strip())
+    device_token_log(f"token present={token_present}")
+
+    device_token = normalize_device_token(payload.device_token)
+    token_log_id = device_token_log_id(device_token)
+    device_token_log(f"token hash prefix={token_log_id}")
+    platform = normalize_device_platform(payload.platform)
+    environment = normalize_device_environment(payload.environment)
+    app_version = sanitize_display_name(payload.app_version)
+    device_info = sanitize_display_name(payload.device_info)
+
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_device_tokens_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM user_device_tokens
+                    WHERE device_token = %s
+                    LIMIT 1;
+                    """,
+                    (device_token,),
+                )
+                existing_token = cur.fetchone()
+
+                cur.execute(
+                    """
+                    INSERT INTO user_device_tokens (
+                        user_id,
+                        device_token,
+                        platform,
+                        environment,
+                        app_version,
+                        device_info,
+                        is_active,
+                        created_at,
+                        updated_at,
+                        last_seen_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW(), NOW())
+                    ON CONFLICT (device_token) DO UPDATE SET
+                        user_id = EXCLUDED.user_id,
+                        platform = EXCLUDED.platform,
+                        environment = EXCLUDED.environment,
+                        app_version = EXCLUDED.app_version,
+                        device_info = EXCLUDED.device_info,
+                        is_active = TRUE,
+                        updated_at = NOW(),
+                        last_seen_at = NOW()
+                    RETURNING id, platform, environment, is_active, created_at, updated_at, last_seen_at;
+                    """,
+                    (
+                        user_id,
+                        device_token,
+                        platform,
+                        environment,
+                        app_version,
+                        device_info,
+                    ),
+                )
+                device_row = cur.fetchone()
+
+        operation = "updated" if existing_token else "created"
+        device_token_log(f"upsert {operation}=true token hash prefix={token_log_id}")
+        return {
+            "status": "ok",
+            "operation": operation,
+            "device": serialize_datetime_fields(
+                [dict(device_row)],
+                ["created_at", "updated_at", "last_seen_at"],
+            )[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        device_token_log(
+            f"upsert failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Device token update failed")
+    finally:
+        conn.close()
+
+
+@app.delete("/user/device-token")
+def deactivate_current_user_device_token(
+    payload: DeleteDeviceTokenRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, str]:
+    device_token_log("delete endpoint reached")
+    token_present = bool(payload.device_token and payload.device_token.strip())
+    device_token_log(f"token present={token_present}")
+
+    device_token = normalize_device_token(payload.device_token)
+    token_log_id = device_token_log_id(device_token)
+    device_token_log(f"token hash prefix={token_log_id}")
+
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_device_tokens_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE user_device_tokens
+                    SET is_active = FALSE,
+                        updated_at = NOW(),
+                        last_seen_at = NOW()
+                    WHERE user_id = %s
+                      AND device_token = %s
+                    RETURNING id;
+                    """,
+                    (user_id, device_token),
+                )
+                deactivated = cur.fetchone()
+
+        device_token_log(f"delete deactivated={bool(deactivated)} token hash prefix={token_log_id}")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        device_token_log(
+            f"delete failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Device token delete failed")
+    finally:
+        conn.close()
+
+
+@app.get("/user/notification-preferences")
+def get_current_user_notification_preferences(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    notification_preferences_log("preferences get")
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_price_notification_preferences_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO price_notification_preferences (
+                        user_id,
+                        price_notifications_enabled,
+                        fuel_type,
+                        radius_km,
+                        favorites_only,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, TRUE, NULL, NULL, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        updated_at = price_notification_preferences.updated_at
+                    RETURNING
+                        user_id,
+                        price_notifications_enabled,
+                        fuel_type,
+                        radius_km,
+                        favorites_only,
+                        created_at,
+                        updated_at;
+                    """,
+                    (user_id,),
+                )
+                preferences = cur.fetchone()
+
+        notification_preferences_log(f"preferences get enabled={preferences['price_notifications_enabled']}")
+        return {
+            "status": "ok",
+            "preferences": serialize_datetime_fields(
+                [dict(preferences)],
+                ["created_at", "updated_at"],
+            )[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        notification_preferences_log(
+            f"preferences get failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Notification preferences get failed")
+    finally:
+        conn.close()
+
+
+@app.put("/user/notification-preferences")
+def update_current_user_notification_preferences(
+    payload: NotificationPreferencesRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    notification_preferences_log("preferences update")
+    fields_set = request_fields_set(payload)
+
+    updates: dict[str, Any] = {}
+    if "price_notifications_enabled" in fields_set:
+        if payload.price_notifications_enabled is None:
+            raise HTTPException(status_code=400, detail="Invalid price_notifications_enabled")
+        updates["price_notifications_enabled"] = bool(payload.price_notifications_enabled)
+
+    if "fuel_type" in fields_set:
+        updates["fuel_type"] = normalize_notification_fuel_type(payload.fuel_type)
+
+    if "radius_km" in fields_set:
+        updates["radius_km"] = normalize_notification_radius_km(payload.radius_km)
+
+    if "favorites_only" in fields_set:
+        if payload.favorites_only is None:
+            raise HTTPException(status_code=400, detail="Invalid favorites_only")
+        updates["favorites_only"] = bool(payload.favorites_only)
+
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_price_notification_preferences_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO price_notification_preferences (
+                        user_id,
+                        price_notifications_enabled,
+                        fuel_type,
+                        radius_km,
+                        favorites_only,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, TRUE, NULL, NULL, FALSE, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING;
+                    """,
+                    (user_id,),
+                )
+
+                if updates:
+                    set_clauses = [f"{field} = %s" for field in updates]
+                    values = list(updates.values())
+                    set_clauses.append("updated_at = NOW()")
+                    values.append(user_id)
+                    cur.execute(
+                        f"""
+                        UPDATE price_notification_preferences
+                        SET {", ".join(set_clauses)}
+                        WHERE user_id = %s
+                        RETURNING
+                            user_id,
+                            price_notifications_enabled,
+                            fuel_type,
+                            radius_km,
+                            favorites_only,
+                            created_at,
+                            updated_at;
+                        """,
+                        values,
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT
+                            user_id,
+                            price_notifications_enabled,
+                            fuel_type,
+                            radius_km,
+                            favorites_only,
+                            created_at,
+                            updated_at
+                        FROM price_notification_preferences
+                        WHERE user_id = %s;
+                        """,
+                        (user_id,),
+                    )
+
+                preferences = cur.fetchone()
+
+        notification_preferences_log(f"preferences update enabled={preferences['price_notifications_enabled']}")
+        return {
+            "status": "ok",
+            "preferences": serialize_datetime_fields(
+                [dict(preferences)],
+                ["created_at", "updated_at"],
+            )[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        notification_preferences_log(
+            f"preferences update failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Notification preferences update failed")
+    finally:
+        conn.close()
+
 
 @app.post("/user/referral-code")
 def apply_current_user_referral_code(
