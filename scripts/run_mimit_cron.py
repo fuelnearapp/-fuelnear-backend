@@ -41,7 +41,7 @@ def essential_response(raw_body: bytes) -> str:
 
     summary = {
         key: parsed[key]
-        for key in ("status", "message", "run_id")
+        for key in ("status", "message", "started", "running", "run_id", "running_run_id")
         if key in parsed
     }
     return json.dumps(summary or parsed, ensure_ascii=True)[:500]
@@ -83,6 +83,20 @@ def main() -> int:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     parsed_body = None
 
+                background_job_accepted = bool(
+                    isinstance(parsed_body, dict)
+                    and (
+                        parsed_body.get("started") is True
+                        or parsed_body.get("running") is True
+                    )
+                )
+
+                if background_job_accepted:
+                    print(
+                        f"[MIMIT CRON] Request accepted status={response.status} response={response_summary}",
+                        flush=True,
+                    )
+                    return 0
                 if isinstance(parsed_body, dict) and parsed_body.get("status") == "busy":
                     retry_reason = "backend reported update busy"
                 else:

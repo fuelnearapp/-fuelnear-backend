@@ -12,7 +12,7 @@ import psycopg2
 import jwt
 from jwt import PyJWKClient, PyJWTError
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depends
 from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
@@ -1647,11 +1647,46 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def run_mimit_update_background(conn, run_id: int) -> None:
+    started_at = time.monotonic()
+    try:
+        print(f"[MIMIT] Background update started. run_id={run_id}")
+        result = update_mimit_data(download=True)
+        with conn:
+            finish_mimit_import_run(conn, run_id, result)
+        duration_seconds = int(time.monotonic() - started_at)
+        print(
+            f"[MIMIT] Background update finished successfully. run_id={run_id} "
+            f"duration_seconds={duration_seconds}"
+        )
+    except Exception as exc:
+        duration_seconds = int(time.monotonic() - started_at)
+        print(
+            f"[MIMIT] Background update failed. run_id={run_id} "
+            f"duration_seconds={duration_seconds} type={exc.__class__.__name__}"
+        )
+        try:
+            with conn:
+                fail_mimit_import_run(conn, run_id, str(exc))
+        except Exception as persist_error:
+            print(
+                f"[MIMIT] Failed to persist background import failure. run_id={run_id} "
+                f"type={persist_error.__class__.__name__}"
+            )
+    finally:
+        release_mimit_update_lock(conn)
+        conn.close()
+
+
 @app.get("/admin/update-mimit")
-def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+def admin_update_mimit(
+    background_tasks: BackgroundTasks,
+    _: None = Depends(require_admin_update_token),
+) -> dict[str, Any]:
     conn = get_connection()
     run_id: int | None = None
     lock_acquired = False
+    handed_off_to_background = False
 
     try:
         lock_acquired = try_acquire_mimit_update_lock(conn)
@@ -1667,6 +1702,8 @@ def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[st
             return {
                 "status": "busy",
                 "message": "MIMIT update is currently running",
+                "started": False,
+                "running": True,
                 "update_state": "running",
                 "running_run_id": runtime_state["run_id"],
                 "started_at": runtime_state["started_at"],
@@ -1683,17 +1720,15 @@ def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[st
         if orphaned_runs:
             print(f"[MIMIT] Reconciled orphaned runs. count={orphaned_runs}")
 
-        print(f"[MIMIT] Update started. run_id={run_id}")
-        result = update_mimit_data(download=True)
-        with conn:
-            finish_mimit_import_run(conn, run_id, result)
-
-        print(f"[MIMIT] Update finished successfully. run_id={run_id}")
+        background_tasks.add_task(run_mimit_update_background, conn, run_id)
+        handed_off_to_background = True
+        print(f"[MIMIT] Background update scheduled. run_id={run_id}")
         return {
-            "status": "ok",
-            "message": "MIMIT update completed",
+            "status": "running",
+            "message": "MIMIT update started",
+            "started": True,
+            "running": True,
             "run_id": run_id,
-            "result": result,
         }
     except HTTPException:
         raise
@@ -1710,9 +1745,10 @@ def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[st
 
         raise HTTPException(status_code=500, detail=f"MIMIT update failed: {exc}")
     finally:
-        if lock_acquired:
-            release_mimit_update_lock(conn)
-        conn.close()
+        if not handed_off_to_background:
+            if lock_acquired:
+                release_mimit_update_lock(conn)
+            conn.close()
 
 
 @app.get("/mimit/status")
@@ -1791,6 +1827,7 @@ def get_mimit_status() -> dict[str, Any]:
             "status": "ok",
             "update_state": runtime_state["state"],
             "update_in_progress": runtime_state["update_in_progress"],
+            "run_id": runtime_state["run_id"],
             "started_at": runtime_state["started_at"],
             "duration_seconds": runtime_state["duration_seconds"],
             "stale": runtime_state["stale"],
@@ -1869,6 +1906,7 @@ def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[st
             "status": "ok",
             "update_state": runtime_state["state"],
             "update_in_progress": runtime_state["update_in_progress"],
+            "run_id": runtime_state["run_id"],
             "started_at": runtime_state["started_at"],
             "duration_seconds": runtime_state["duration_seconds"],
             "stale": runtime_state["stale"],
