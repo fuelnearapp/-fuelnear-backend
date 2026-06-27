@@ -36,6 +36,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
 MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(30 * 60)))
 ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
+PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
+    0.0,
+    float(os.getenv("PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR", "0.01")),
+)
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
@@ -1527,6 +1531,8 @@ def ensure_sent_price_notifications_schema(conn) -> None:
                 mimit_run_id BIGINT NOT NULL REFERENCES mimit_import_runs(id) ON DELETE CASCADE,
                 fuel_type TEXT NOT NULL,
                 station_id BIGINT NULL REFERENCES stations(id) ON DELETE SET NULL,
+                price DOUBLE PRECISION NULL CHECK (price > 0),
+                distance_km DOUBLE PRECISION NULL CHECK (distance_km >= 0),
                 sent_at TIMESTAMPTZ NULL,
                 status TEXT NOT NULL
                     CHECK (status IN ('processing', 'sent', 'failed')),
@@ -1536,6 +1542,8 @@ def ensure_sent_price_notifications_schema(conn) -> None:
             );
             """
         )
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION NULL;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS distance_km DOUBLE PRECISION NULL;")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sent_price_notifications_run_status
@@ -1714,6 +1722,8 @@ def find_best_price_for_notification(
             WITH candidate_stations AS (
                 SELECT
                     s.id,
+                    s.name,
+                    s.brand,
                     (
                         6371 * acos(
                             least(
@@ -1734,7 +1744,12 @@ def find_best_price_for_notification(
                 fp.price,
                 fp.fuel_type,
                 fp.reported_at,
-                cs.distance_km
+                cs.distance_km,
+                COALESCE(
+                    NULLIF(BTRIM(cs.brand), ''),
+                    NULLIF(BTRIM(cs.name), ''),
+                    'Distributore'
+                ) AS station_name
             FROM candidate_stations cs
             JOIN fuel_prices fp ON fp.station_id = cs.id
             WHERE cs.distance_km <= %s
@@ -1772,20 +1787,39 @@ def price_notification_fuel_label(fuel_type: str) -> str:
     return labels.get(fuel_type, fuel_type.capitalize())
 
 
+def truncate_price_notification_station_name(value: str, max_length: int = 28) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    shortened = cleaned[: max_length - 3].rstrip(" ,.-")
+    return f"{shortened}..."
+
+
 def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "mimit_run_id": mimit_run_id,
+        "minimum_improvement_eur": PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR,
         "users_considered": 0,
         "sent_count": 0,
         "failed_count": 0,
         "skipped_count": 0,
         "invalid_tokens_count": 0,
+        "skipped_same_price": 0,
+        "skipped_worse_price": 0,
+        "skipped_below_threshold": 0,
         "skip_reasons": {},
     }
 
     def skip(reason: str) -> None:
         summary["skipped_count"] += 1
         summary["skip_reasons"][reason] = summary["skip_reasons"].get(reason, 0) + 1
+        if reason in {
+            "skipped_same_price",
+            "skipped_worse_price",
+            "skipped_below_threshold",
+        }:
+            summary[reason] += 1
 
     conn = get_connection()
     try:
@@ -1875,6 +1909,38 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 skip("skipped_no_price")
                 continue
 
+            current_price = round(float(best_price["price"]), 3)
+            distance_km = round(float(best_price["distance_km"]), 2)
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT price
+                        FROM sent_price_notifications
+                        WHERE user_id = %s
+                          AND fuel_type = %s
+                          AND status = 'sent'
+                          AND price IS NOT NULL
+                        ORDER BY sent_at DESC, id DESC
+                        LIMIT 1;
+                        """,
+                        (user_id, fuel_type),
+                    )
+                    last_notification = cur.fetchone()
+
+            if last_notification is not None:
+                last_notified_price = round(float(last_notification[0]), 3)
+                improvement = last_notified_price - current_price
+                if abs(improvement) < 0.0005:
+                    skip("skipped_same_price")
+                    continue
+                if improvement < 0:
+                    skip("skipped_worse_price")
+                    continue
+                if improvement + 1e-9 < PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR:
+                    skip("skipped_below_threshold")
+                    continue
+
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1884,15 +1950,24 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                             mimit_run_id,
                             fuel_type,
                             station_id,
+                            price,
+                            distance_km,
                             status,
                             created_at,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, 'processing', NOW(), NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, 'processing', NOW(), NOW())
                         ON CONFLICT (user_id, mimit_run_id) DO NOTHING
                         RETURNING id;
                         """,
-                        (user_id, mimit_run_id, fuel_type, best_price["station_id"]),
+                        (
+                            user_id,
+                            mimit_run_id,
+                            fuel_type,
+                            best_price["station_id"],
+                            current_price,
+                            distance_km,
+                        ),
                     )
                     notification_row = cur.fetchone()
 
@@ -1901,13 +1976,17 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 continue
 
             fuel_label = price_notification_fuel_label(fuel_type)
-            formatted_price = f"{float(best_price['price']):.3f}".replace(".", ",")
-            body = f"{fuel_label} da {formatted_price} €/L vicino a te."
+            station_name = truncate_price_notification_station_name(best_price["station_name"])
+            formatted_price = f"{current_price:.3f}".replace(".", ",")
+            formatted_distance = f"{distance_km:.1f}".replace(".", ",")
+            body = (
+                f"{fuel_label} a {formatted_price} €/L da {station_name}, "
+                f"a {formatted_distance} km da te."
+            )
             any_sent = False
 
             for token_row in device_tokens:
                 device_token = token_row["device_token"]
-                token_log_id = device_token_log_id(device_token)
                 try:
                     result = send_apns_push(
                         device_token=device_token,
@@ -1918,12 +1997,14 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                             "type": "price_alert",
                             "station_id": int(best_price["station_id"]),
                             "fuel_type": fuel_type,
+                            "price": current_price,
+                            "distance_km": distance_km,
                         },
                     )
                 except APNsConfigurationError as exc:
                     print(
                         f"[PRICE_NOTIFICATIONS] APNs configuration failure "
-                        f"token_hash_prefix={token_log_id} type={exc.__class__.__name__}"
+                        f"type={exc.__class__.__name__}"
                     )
                     continue
 
@@ -1945,7 +2026,7 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 if not result["success"]:
                     print(
                         f"[PRICE_NOTIFICATIONS] APNs send failed "
-                        f"token_hash_prefix={token_log_id} status_code={result['status_code']} "
+                        f"status_code={result['status_code']} "
                         f"temporary={result['temporary_error']} reason={result['reason']}"
                     )
 
@@ -1972,7 +2053,10 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
             f"[PRICE_NOTIFICATIONS] run_id={mimit_run_id} "
             f"users_considered={summary['users_considered']} sent={summary['sent_count']} "
             f"skipped={summary['skipped_count']} failed={summary['failed_count']} "
-            f"invalid_tokens={summary['invalid_tokens_count']}"
+            f"invalid_tokens={summary['invalid_tokens_count']} "
+            f"skipped_same_price={summary['skipped_same_price']} "
+            f"skipped_worse_price={summary['skipped_worse_price']} "
+            f"skipped_below_threshold={summary['skipped_below_threshold']}"
         )
         return summary
     finally:
