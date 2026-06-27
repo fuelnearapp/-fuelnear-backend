@@ -34,7 +34,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
-MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(2 * 60 * 60)))
+MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(30 * 60)))
 ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
@@ -1249,6 +1249,23 @@ def get_running_mimit_import_run(conn) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def mark_mimit_import_run_orphaned(conn, run_id: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE mimit_import_runs
+            SET status = 'failed',
+                completed_at = NOW(),
+                error_message = 'Orphaned import run: advisory lock is not held'
+            WHERE id = %s
+              AND status = 'running'
+              AND completed_at IS NULL;
+            """,
+            (run_id,),
+        )
+        return cur.rowcount == 1
+
+
 def safe_int_from_import_result(result: dict[str, Any], keys: list[str]) -> int | None:
     for key in keys:
         value = result.get(key)
@@ -1869,6 +1886,70 @@ def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[st
         print(f"[MIMIT] Debug status failed. error={exc.__class__.__name__}")
         raise HTTPException(status_code=500, detail="MIMIT debug status failed")
     finally:
+        conn.close()
+
+
+@app.post("/admin/mimit-lock-check")
+def admin_mimit_lock_check(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+    conn = get_connection()
+    probe_lock_acquired = False
+
+    try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
+                probe_lock_acquired = bool(cur.fetchone()[0])
+
+            advisory_lock_held = not probe_lock_acquired
+            running_run = get_running_mimit_import_run(conn)
+            orphaned_run_marked_failed = False
+
+            if running_run and not advisory_lock_held:
+                orphaned_run_marked_failed = mark_mimit_import_run_orphaned(
+                    conn,
+                    int(running_run["id"]),
+                )
+
+            if probe_lock_acquired:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
+                probe_lock_acquired = False
+
+        started_at = running_run.get("started_at") if running_run else None
+        duration_seconds = None
+        if isinstance(started_at, datetime):
+            duration_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+
+        run_id = int(running_run["id"]) if running_run else None
+        orphaned = bool(running_run and not advisory_lock_held)
+        print(
+            f"[MIMIT] Lock check. run_id={run_id} advisory_lock_held={advisory_lock_held} "
+            f"orphaned={orphaned} marked_failed={orphaned_run_marked_failed}"
+        )
+
+        return {
+            "status": "ok",
+            "running_run_id": run_id,
+            "advisory_lock_held": advisory_lock_held,
+            "duration_seconds": duration_seconds,
+            "stale": bool(duration_seconds is not None and duration_seconds >= MIMIT_STALE_AFTER_SECONDS),
+            "stale_after_seconds": MIMIT_STALE_AFTER_SECONDS,
+            "last_progress_at": None,
+            "last_progress_available": False,
+            "orphaned": orphaned,
+            "orphaned_run_marked_failed": orphaned_run_marked_failed,
+        }
+    except Exception as exc:
+        print(f"[MIMIT] Lock check failed. type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="MIMIT lock check failed")
+    finally:
+        if probe_lock_acquired:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
+            except Exception:
+                pass
         conn.close()
 
 
