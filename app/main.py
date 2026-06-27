@@ -119,6 +119,13 @@ class DeleteDeviceTokenRequest(BaseModel):
     device_token: str
 
 
+class UserLocationRequest(BaseModel):
+    lat: float
+    lng: float
+    accuracy: float | None = None
+    source: str | None = None
+
+
 class NotificationPreferencesRequest(BaseModel):
     price_notifications_enabled: bool | None = None
     fuel_type: str | None = None
@@ -205,6 +212,10 @@ def device_token_log(message: str) -> None:
 
 def notification_preferences_log(message: str) -> None:
     print(f"[NOTIFICATION_PREFERENCES] {message}")
+
+
+def user_location_log(message: str) -> None:
+    print(f"[USER_LOCATION] {message}")
 
 
 def normalize_device_token(value: str | None) -> str:
@@ -1454,6 +1465,26 @@ def ensure_user_device_tokens_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_device_tokens_active ON user_device_tokens(is_active, platform, environment);")
 
 
+def ensure_user_locations_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_locations (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                lat DOUBLE PRECISION NOT NULL CHECK (lat >= -90 AND lat <= 90),
+                lng DOUBLE PRECISION NOT NULL CHECK (lng >= -180 AND lng <= 180),
+                accuracy DOUBLE PRECISION NULL CHECK (accuracy > 0),
+                source TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (user_id)
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_locations_user_id ON user_locations(user_id);")
+
+
 def ensure_price_notification_preferences_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -1615,6 +1646,7 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
         ensure_auth_provider_schema(conn)
         ensure_user_device_tokens_schema(conn)
+        ensure_user_locations_schema(conn)
         ensure_price_notification_preferences_schema(conn)
         ensure_mimit_import_schema(conn)
         ensure_sent_price_notifications_schema(conn)
@@ -1760,6 +1792,7 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
         with conn:
             ensure_mimit_import_schema(conn)
             ensure_user_device_tokens_schema(conn)
+            ensure_user_locations_schema(conn)
             ensure_price_notification_preferences_schema(conn)
             ensure_sent_price_notifications_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1779,16 +1812,17 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 cur.execute(
                     """
                     SELECT
-                        user_id,
-                        COALESCE(NULLIF(fuel_type, ''), 'benzina') AS fuel_type,
-                        COALESCE(radius_km, 3.0) AS radius_km,
-                        favorites_only,
-                        latitude,
-                        longitude,
-                        location_updated_at
-                    FROM price_notification_preferences
-                    WHERE price_notifications_enabled = TRUE
-                    ORDER BY user_id;
+                        p.user_id,
+                        COALESCE(NULLIF(p.fuel_type, ''), 'benzina') AS fuel_type,
+                        COALESCE(p.radius_km, 3.0) AS radius_km,
+                        p.favorites_only,
+                        COALESCE(ul.lat, p.latitude) AS latitude,
+                        COALESCE(ul.lng, p.longitude) AS longitude,
+                        COALESCE(ul.updated_at, p.location_updated_at) AS location_updated_at
+                    FROM price_notification_preferences p
+                    LEFT JOIN user_locations ul ON ul.user_id = p.user_id
+                    WHERE p.price_notifications_enabled = TRUE
+                    ORDER BY p.user_id;
                     """
                 )
                 preferences = [dict(row) for row in cur.fetchall()]
@@ -3197,6 +3231,122 @@ def deactivate_current_user_device_token(
             f"pgcode={pgcode} table={table} constraint={constraint}"
         )
         raise HTTPException(status_code=500, detail="Device token delete failed")
+    finally:
+        conn.close()
+
+
+@app.post("/user/location")
+def upsert_current_user_location(
+    payload: UserLocationRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    user_location_log("location update endpoint reached")
+    user_payload = get_current_user_from_token(authorization)
+    user_id = int(user_payload["id"])
+    user_location_log(f"user_id={user_id} has_location=true")
+
+    if not isfinite(payload.lat) or not -90 <= payload.lat <= 90:
+        raise HTTPException(status_code=400, detail="Invalid latitude")
+    if not isfinite(payload.lng) or not -180 <= payload.lng <= 180:
+        raise HTTPException(status_code=400, detail="Invalid longitude")
+    if payload.accuracy is not None and (
+        not isfinite(payload.accuracy) or payload.accuracy <= 0
+    ):
+        raise HTTPException(status_code=400, detail="Invalid location accuracy")
+
+    normalized_source = payload.source.strip() if payload.source else ""
+    source = normalized_source or None
+    if source and len(source) > 100:
+        raise HTTPException(status_code=400, detail="Invalid location source")
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_locations_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_locations (
+                        user_id,
+                        lat,
+                        lng,
+                        accuracy,
+                        source,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        lat = EXCLUDED.lat,
+                        lng = EXCLUDED.lng,
+                        accuracy = EXCLUDED.accuracy,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    RETURNING user_id, lat, lng, accuracy, source, created_at, updated_at;
+                    """,
+                    (
+                        user_id,
+                        float(payload.lat),
+                        float(payload.lng),
+                        float(payload.accuracy) if payload.accuracy is not None else None,
+                        source,
+                    ),
+                )
+                location = cur.fetchone()
+
+        return {
+            "status": "ok",
+            "has_location": True,
+            "location": serialize_datetime_fields(
+                [dict(location)],
+                ["created_at", "updated_at"],
+            )[0],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        user_location_log(f"location update failed user_id={user_id} type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Location update failed")
+    finally:
+        conn.close()
+
+
+@app.get("/user/location")
+def get_current_user_location(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = int(user_payload["id"])
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_locations_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, lat, lng, accuracy, source, created_at, updated_at
+                    FROM user_locations
+                    WHERE user_id = %s
+                    LIMIT 1;
+                    """,
+                    (user_id,),
+                )
+                location = cur.fetchone()
+
+        has_location = location is not None
+        user_location_log(f"location get user_id={user_id} has_location={has_location}")
+        return {
+            "status": "ok",
+            "has_location": has_location,
+            "location": serialize_datetime_fields(
+                [dict(location)],
+                ["created_at", "updated_at"],
+            )[0] if location else None,
+        }
+    except Exception as exc:
+        user_location_log(f"location get failed user_id={user_id} type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Location get failed")
     finally:
         conn.close()
 
