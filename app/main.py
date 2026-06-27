@@ -34,6 +34,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
+MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(2 * 60 * 60)))
 ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
@@ -56,6 +57,11 @@ app = FastAPI(title="FuelNear Backend")
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
 _mimit_update_lock = threading.Lock()
+_mimit_state_lock = threading.Lock()
+_mimit_update_started_at: datetime | None = None
+_mimit_update_run_id: int | None = None
+_mimit_stale_warning_logged = False
+MIMIT_ADVISORY_LOCK_ID = 618_493_027
 
 
 class RegisterRequest(BaseModel):
@@ -1060,15 +1066,100 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
 
 
 
-def run_mimit_update(download: bool = True) -> dict[str, object] | None:
+def get_mimit_runtime_state() -> dict[str, Any]:
+    global _mimit_stale_warning_logged
+
+    with _mimit_state_lock:
+        started_at = _mimit_update_started_at
+        run_id = _mimit_update_run_id
+        lock_active = _mimit_update_lock.locked()
+
+        duration_seconds = None
+        if lock_active and started_at is not None:
+            duration_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+
+        stale = bool(
+            lock_active
+            and duration_seconds is not None
+            and duration_seconds >= MIMIT_STALE_AFTER_SECONDS
+        )
+        if stale and not _mimit_stale_warning_logged:
+            print(
+                f"[MIMIT] Stale lock detected. run_id={run_id} "
+                f"duration_seconds={duration_seconds}"
+            )
+            _mimit_stale_warning_logged = True
+
+    return {
+        "state": "running" if lock_active else "idle",
+        "update_in_progress": lock_active,
+        "run_id": run_id,
+        "started_at": started_at.isoformat() if started_at else None,
+        "duration_seconds": duration_seconds,
+        "stale": stale,
+        "stale_after_seconds": MIMIT_STALE_AFTER_SECONDS,
+    }
+
+
+def try_acquire_mimit_update_lock(conn) -> bool:
+    global _mimit_update_started_at, _mimit_update_run_id, _mimit_stale_warning_logged
+
     if not _mimit_update_lock.acquire(blocking=False):
-        print("[MIMIT] Update skipped: another update is already running.")
-        return None
+        return False
 
     try:
-        return update_mimit_data(download=download)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
+            advisory_lock_acquired = bool(cur.fetchone()[0])
+
+        if not advisory_lock_acquired:
+            _mimit_update_lock.release()
+            return False
+
+        with _mimit_state_lock:
+            _mimit_update_started_at = datetime.now(timezone.utc)
+            _mimit_update_run_id = None
+            _mimit_stale_warning_logged = False
+
+        print("[MIMIT] Update lock acquired.")
+        return True
+    except Exception:
+        if _mimit_update_lock.locked():
+            _mimit_update_lock.release()
+        raise
+
+
+def set_mimit_update_run_id(run_id: int) -> None:
+    global _mimit_update_run_id
+
+    with _mimit_state_lock:
+        _mimit_update_run_id = run_id
+
+
+def release_mimit_update_lock(conn) -> None:
+    global _mimit_update_started_at, _mimit_update_run_id, _mimit_stale_warning_logged
+
+    runtime_state = get_mimit_runtime_state()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
+            advisory_lock_released = bool(cur.fetchone()[0])
+        if not advisory_lock_released:
+            print("[MIMIT] Advisory lock was not held during release.")
+    except Exception as exc:
+        # Closing the PostgreSQL connection also releases its advisory locks.
+        print(f"[MIMIT] Advisory lock release deferred to connection close. type={exc.__class__.__name__}")
     finally:
-        _mimit_update_lock.release()
+        with _mimit_state_lock:
+            _mimit_update_started_at = None
+            _mimit_update_run_id = None
+            _mimit_stale_warning_logged = False
+        if _mimit_update_lock.locked():
+            _mimit_update_lock.release()
+        print(
+            f"[MIMIT] Update lock released. run_id={runtime_state['run_id']} "
+            f"duration_seconds={runtime_state['duration_seconds']}"
+        )
 
 
 def require_admin_update_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
@@ -1124,6 +1215,38 @@ def create_mimit_import_run(conn) -> int:
         row = cur.fetchone()
 
     return int(row[0])
+
+
+def fail_orphaned_mimit_import_runs(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE mimit_import_runs
+            SET status = 'failed',
+                completed_at = NOW(),
+                error_message = 'Import process ended before recording completion'
+            WHERE status = 'running'
+              AND completed_at IS NULL;
+            """
+        )
+        return cur.rowcount
+
+
+def get_running_mimit_import_run(conn) -> dict[str, Any] | None:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, started_at, completed_at, status
+            FROM mimit_import_runs
+            WHERE status = 'running'
+              AND completed_at IS NULL
+            ORDER BY started_at DESC
+            LIMIT 1;
+            """
+        )
+        row = cur.fetchone()
+
+    return dict(row) if row else None
 
 
 def safe_int_from_import_result(result: dict[str, Any], keys: list[str]) -> int | None:
@@ -1456,6 +1579,37 @@ def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) ->
     return serialized
 
 
+def merge_mimit_runtime_state(last_run: dict[str, Any] | None) -> dict[str, Any]:
+    runtime_state = get_mimit_runtime_state()
+    if runtime_state["update_in_progress"] or not last_run or last_run.get("status") != "running":
+        return runtime_state
+
+    started_at = last_run.get("started_at")
+    duration_seconds = None
+    if isinstance(started_at, datetime):
+        duration_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+
+    stale = bool(
+        duration_seconds is not None
+        and duration_seconds >= MIMIT_STALE_AFTER_SECONDS
+    )
+    if stale:
+        print(
+            f"[MIMIT] Stale database run detected. run_id={last_run.get('id')} "
+            f"duration_seconds={duration_seconds}"
+        )
+
+    return {
+        "state": "running",
+        "update_in_progress": True,
+        "run_id": last_run.get("id"),
+        "started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+        "duration_seconds": duration_seconds,
+        "stale": stale,
+        "stale_after_seconds": MIMIT_STALE_AFTER_SECONDS,
+    }
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     conn = get_connection()
@@ -1480,28 +1634,44 @@ def health_check() -> dict[str, str]:
 def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
     conn = get_connection()
     run_id: int | None = None
+    lock_acquired = False
 
     try:
-        with conn:
-            ensure_mimit_import_schema(conn)
-            run_id = create_mimit_import_run(conn)
-
-        print(f"[MIMIT] Update started. run_id={run_id}")
-        result = run_mimit_update(download=True)
-
-        if result is None:
+        lock_acquired = try_acquire_mimit_update_lock(conn)
+        if not lock_acquired:
             with conn:
-                fail_mimit_import_run(conn, run_id, "MIMIT update already in progress")
+                ensure_mimit_import_schema(conn)
+                running_run = get_running_mimit_import_run(conn)
+            runtime_state = merge_mimit_runtime_state(running_run)
+            print(
+                f"[MIMIT] Update busy. run_id={runtime_state['run_id']} "
+                f"duration_seconds={runtime_state['duration_seconds']}"
+            )
             return {
                 "status": "busy",
-                "message": "MIMIT update already in progress",
-                "run_id": run_id,
+                "message": "MIMIT update is currently running",
+                "update_state": "running",
+                "running_run_id": runtime_state["run_id"],
+                "started_at": runtime_state["started_at"],
+                "duration_seconds": runtime_state["duration_seconds"],
+                "stale": runtime_state["stale"],
             }
 
         with conn:
+            ensure_mimit_import_schema(conn)
+            orphaned_runs = fail_orphaned_mimit_import_runs(conn)
+            run_id = create_mimit_import_run(conn)
+        set_mimit_update_run_id(run_id)
+
+        if orphaned_runs:
+            print(f"[MIMIT] Reconciled orphaned runs. count={orphaned_runs}")
+
+        print(f"[MIMIT] Update started. run_id={run_id}")
+        result = update_mimit_data(download=True)
+        with conn:
             finish_mimit_import_run(conn, run_id, result)
 
-        print(f"[MIMIT] Update completed. run_id={run_id} result={result}")
+        print(f"[MIMIT] Update finished successfully. run_id={run_id}")
         return {
             "status": "ok",
             "message": "MIMIT update completed",
@@ -1512,7 +1682,7 @@ def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[st
         raise
     except Exception as exc:
         error_message = str(exc)
-        print(f"[MIMIT] Update failed. run_id={run_id} error={error_message}")
+        print(f"[MIMIT] Update finished with failure. run_id={run_id} type={exc.__class__.__name__}")
 
         if run_id is not None:
             try:
@@ -1523,6 +1693,8 @@ def admin_update_mimit(_: None = Depends(require_admin_update_token)) -> dict[st
 
         raise HTTPException(status_code=500, detail=f"MIMIT update failed: {exc}")
     finally:
+        if lock_acquired:
+            release_mimit_update_lock(conn)
         conn.close()
 
 
@@ -1574,17 +1746,49 @@ def get_mimit_status() -> dict[str, Any]:
                 )
                 last_success = cur.fetchone()
 
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        started_at,
+                        completed_at,
+                        status,
+                        stations_imported,
+                        prices_imported,
+                        stations_csv,
+                        prices_csv,
+                        source_file_timestamp,
+                        error_message
+                    FROM mimit_import_runs
+                    WHERE status = 'failed'
+                    ORDER BY completed_at DESC
+                    LIMIT 1;
+                    """
+                )
+                last_failed = cur.fetchone()
+
+        runtime_state = merge_mimit_runtime_state(dict(last_run) if last_run else None)
+        datetime_fields = ["started_at", "completed_at", "source_file_timestamp"]
+
         return {
             "status": "ok",
+            "update_state": runtime_state["state"],
+            "update_in_progress": runtime_state["update_in_progress"],
+            "started_at": runtime_state["started_at"],
+            "duration_seconds": runtime_state["duration_seconds"],
+            "stale": runtime_state["stale"],
+            "stale_after_seconds": runtime_state["stale_after_seconds"],
             "last_status": last_run["status"] if last_run else None,
-            "last_run": serialize_datetime_fields([dict(last_run)], ["started_at", "completed_at", "source_file_timestamp"])[0] if last_run else None,
+            "last_run": serialize_datetime_fields([dict(last_run)], datetime_fields)[0] if last_run else None,
+            "last_success": serialize_datetime_fields([dict(last_success)], datetime_fields)[0] if last_success else None,
+            "last_failed": serialize_datetime_fields([dict(last_failed)], datetime_fields)[0] if last_failed else None,
             "last_successful_update_at": last_success["completed_at"].isoformat() if last_success and last_success["completed_at"] else None,
             "stations_imported": last_success["stations_imported"] if last_success else None,
             "prices_imported": last_success["prices_imported"] if last_success else None,
             "stations_csv": last_success["stations_csv"] if last_success else None,
             "prices_csv": last_success["prices_csv"] if last_success else None,
             "source_file_timestamp": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
-            "last_error": last_run["error_message"] if last_run and last_run["status"] == "failed" else None,
+            "last_error": last_failed["error_message"] if last_failed else None,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"MIMIT status failed: {exc}")
@@ -1643,9 +1847,15 @@ def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[st
                 max_reported_at = cur.fetchone()
 
         datetime_fields = ["started_at", "completed_at", "source_file_timestamp"]
+        runtime_state = merge_mimit_runtime_state(dict(last_run) if last_run else None)
         return {
             "status": "ok",
-            "update_in_progress": _mimit_update_lock.locked(),
+            "update_state": runtime_state["state"],
+            "update_in_progress": runtime_state["update_in_progress"],
+            "started_at": runtime_state["started_at"],
+            "duration_seconds": runtime_state["duration_seconds"],
+            "stale": runtime_state["stale"],
+            "stale_after_seconds": runtime_state["stale_after_seconds"],
             "last_run": serialize_datetime_fields([dict(last_run)], datetime_fields)[0] if last_run else None,
             "last_completed_update_at": last_success["completed_at"].isoformat() if last_success and last_success["completed_at"] else None,
             "last_dataset_date": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
