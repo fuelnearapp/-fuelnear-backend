@@ -124,6 +124,8 @@ class NotificationPreferencesRequest(BaseModel):
     fuel_type: str | None = None
     radius_km: float | None = None
     favorites_only: bool | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class AdminTestPushRequest(BaseModel):
@@ -1475,6 +1477,40 @@ def ensure_price_notification_preferences_schema(conn) -> None:
             ON price_notification_preferences(user_id);
             """
         )
+        cur.execute("ALTER TABLE price_notification_preferences ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION NULL;")
+        cur.execute("ALTER TABLE price_notification_preferences ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION NULL;")
+        cur.execute("ALTER TABLE price_notification_preferences ADD COLUMN IF NOT EXISTS location_updated_at TIMESTAMPTZ NULL;")
+
+
+def ensure_sent_price_notifications_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.stations');")
+        if cur.fetchone()[0] is None:
+            return
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_price_notifications (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                mimit_run_id BIGINT NOT NULL REFERENCES mimit_import_runs(id) ON DELETE CASCADE,
+                fuel_type TEXT NOT NULL,
+                station_id BIGINT NULL REFERENCES stations(id) ON DELETE SET NULL,
+                sent_at TIMESTAMPTZ NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN ('processing', 'sent', 'failed')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (user_id, mimit_run_id)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sent_price_notifications_run_status
+            ON sent_price_notifications(mimit_run_id, status);
+            """
+        )
 
 
 def ensure_auth_schema(conn) -> None:
@@ -1580,8 +1616,9 @@ def ensure_auth_schema(conn) -> None:
         ensure_auth_provider_schema(conn)
         ensure_user_device_tokens_schema(conn)
         ensure_price_notification_preferences_schema(conn)
-        ensure_community_price_schema(conn)
         ensure_mimit_import_schema(conn)
+        ensure_sent_price_notifications_schema(conn)
+        ensure_community_price_schema(conn)
 
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
@@ -1627,6 +1664,287 @@ def merge_mimit_runtime_state(last_run: dict[str, Any] | None) -> dict[str, Any]
     }
 
 
+def find_best_price_for_notification(
+    conn,
+    *,
+    latitude: float,
+    longitude: float,
+    radius_km: float,
+    fuel_type: str,
+) -> dict[str, Any] | None:
+    lat_delta = radius_km / 111.32
+    lng_divisor = 111.32 * max(cos(radians(latitude)), 0.01)
+    lng_delta = radius_km / lng_divisor
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            WITH candidate_stations AS (
+                SELECT
+                    s.id,
+                    (
+                        6371 * acos(
+                            least(
+                                1,
+                                cos(radians(%s)) * cos(radians(s.latitude)) *
+                                cos(radians(s.longitude) - radians(%s)) +
+                                sin(radians(%s)) * sin(radians(s.latitude))
+                            )
+                        )
+                    ) AS distance_km
+                FROM stations s
+                WHERE s.is_active = TRUE
+                  AND s.latitude BETWEEN %s AND %s
+                  AND s.longitude BETWEEN %s AND %s
+            )
+            SELECT
+                cs.id AS station_id,
+                fp.price,
+                fp.fuel_type,
+                fp.reported_at,
+                cs.distance_km
+            FROM candidate_stations cs
+            JOIN fuel_prices fp ON fp.station_id = cs.id
+            WHERE cs.distance_km <= %s
+              AND fp.fuel_type = %s
+            ORDER BY fp.price ASC, cs.distance_km ASC, fp.reported_at DESC
+            LIMIT 1;
+            """,
+            (
+                latitude,
+                longitude,
+                latitude,
+                latitude - lat_delta,
+                latitude + lat_delta,
+                longitude - lng_delta,
+                longitude + lng_delta,
+                radius_km,
+                fuel_type,
+            ),
+        )
+        row = cur.fetchone()
+
+    return dict(row) if row else None
+
+
+def price_notification_fuel_label(fuel_type: str) -> str:
+    labels = {
+        "benzina": "Benzina",
+        "benzina_premium": "Benzina premium",
+        "diesel": "Diesel",
+        "diesel_premium": "Diesel premium",
+        "gpl": "GPL",
+        "hvo": "HVO",
+        "metano": "Metano",
+    }
+    return labels.get(fuel_type, fuel_type.capitalize())
+
+
+def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "mimit_run_id": mimit_run_id,
+        "users_considered": 0,
+        "sent_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "invalid_tokens_count": 0,
+        "skip_reasons": {},
+    }
+
+    def skip(reason: str) -> None:
+        summary["skipped_count"] += 1
+        summary["skip_reasons"][reason] = summary["skip_reasons"].get(reason, 0) + 1
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            ensure_user_device_tokens_schema(conn)
+            ensure_price_notification_preferences_schema(conn)
+            ensure_sent_price_notifications_schema(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM mimit_import_runs
+                    WHERE id = %s
+                      AND status = 'success'
+                    LIMIT 1;
+                    """,
+                    (mimit_run_id,),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("MIMIT run is not successful")
+
+                cur.execute(
+                    """
+                    SELECT
+                        user_id,
+                        COALESCE(NULLIF(fuel_type, ''), 'benzina') AS fuel_type,
+                        COALESCE(radius_km, 3.0) AS radius_km,
+                        favorites_only,
+                        latitude,
+                        longitude,
+                        location_updated_at
+                    FROM price_notification_preferences
+                    WHERE price_notifications_enabled = TRUE
+                    ORDER BY user_id;
+                    """
+                )
+                preferences = [dict(row) for row in cur.fetchall()]
+
+        summary["users_considered"] = len(preferences)
+        apns_configured = apns_is_configured()
+
+        for preference in preferences:
+            user_id = int(preference["user_id"])
+            fuel_type = preference["fuel_type"]
+            radius_km = float(preference["radius_km"])
+
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT id, device_token, environment
+                        FROM user_device_tokens
+                        WHERE user_id = %s
+                          AND platform = 'ios'
+                          AND is_active = TRUE
+                        ORDER BY last_seen_at DESC;
+                        """,
+                        (user_id,),
+                    )
+                    device_tokens = [dict(row) for row in cur.fetchall()]
+
+            if not device_tokens:
+                skip("skipped_no_active_device")
+                continue
+            if preference["favorites_only"]:
+                skip("skipped_favorites_unsupported")
+                continue
+            if preference["latitude"] is None or preference["longitude"] is None:
+                skip("skipped_no_location")
+                continue
+            if not apns_configured:
+                skip("skipped_apns_not_configured")
+                continue
+
+            with conn:
+                best_price = find_best_price_for_notification(
+                    conn,
+                    latitude=float(preference["latitude"]),
+                    longitude=float(preference["longitude"]),
+                    radius_km=radius_km,
+                    fuel_type=fuel_type,
+                )
+            if best_price is None:
+                skip("skipped_no_price")
+                continue
+
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO sent_price_notifications (
+                            user_id,
+                            mimit_run_id,
+                            fuel_type,
+                            station_id,
+                            status,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, 'processing', NOW(), NOW())
+                        ON CONFLICT (user_id, mimit_run_id) DO NOTHING
+                        RETURNING id;
+                        """,
+                        (user_id, mimit_run_id, fuel_type, best_price["station_id"]),
+                    )
+                    notification_row = cur.fetchone()
+
+            if notification_row is None:
+                skip("skipped_duplicate_run")
+                continue
+
+            fuel_label = price_notification_fuel_label(fuel_type)
+            formatted_price = f"{float(best_price['price']):.3f}".replace(".", ",")
+            body = f"{fuel_label} da {formatted_price} €/L vicino a te."
+            any_sent = False
+
+            for token_row in device_tokens:
+                device_token = token_row["device_token"]
+                token_log_id = device_token_log_id(device_token)
+                try:
+                    result = send_apns_push(
+                        device_token=device_token,
+                        title="FuelNear",
+                        body=body,
+                        environment=token_row.get("environment"),
+                        payload={
+                            "type": "price_alert",
+                            "station_id": int(best_price["station_id"]),
+                            "fuel_type": fuel_type,
+                        },
+                    )
+                except APNsConfigurationError as exc:
+                    print(
+                        f"[PRICE_NOTIFICATIONS] APNs configuration failure "
+                        f"token_hash_prefix={token_log_id} type={exc.__class__.__name__}"
+                    )
+                    continue
+
+                any_sent = any_sent or bool(result["success"])
+                if result["invalid_token"]:
+                    summary["invalid_tokens_count"] += 1
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE user_device_tokens
+                                SET is_active = FALSE,
+                                    updated_at = NOW()
+                                WHERE id = %s;
+                                """,
+                                (token_row["id"],),
+                            )
+
+                if not result["success"]:
+                    print(
+                        f"[PRICE_NOTIFICATIONS] APNs send failed "
+                        f"token_hash_prefix={token_log_id} status_code={result['status_code']} "
+                        f"temporary={result['temporary_error']} reason={result['reason']}"
+                    )
+
+            final_status = "sent" if any_sent else "failed"
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE sent_price_notifications
+                        SET status = %s,
+                            sent_at = CASE WHEN %s = 'sent' THEN NOW() ELSE NULL END,
+                            updated_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (final_status, final_status, notification_row[0]),
+                    )
+
+            if any_sent:
+                summary["sent_count"] += 1
+            else:
+                summary["failed_count"] += 1
+
+        print(
+            f"[PRICE_NOTIFICATIONS] run_id={mimit_run_id} "
+            f"users_considered={summary['users_considered']} sent={summary['sent_count']} "
+            f"skipped={summary['skipped_count']} failed={summary['failed_count']} "
+            f"invalid_tokens={summary['invalid_tokens_count']}"
+        )
+        return summary
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     conn = get_connection()
@@ -1654,6 +1972,20 @@ def run_mimit_update_background(conn, run_id: int) -> None:
         result = update_mimit_data(download=True)
         with conn:
             finish_mimit_import_run(conn, run_id, result)
+
+        try:
+            notification_summary = process_price_notifications_for_run(run_id)
+            print(
+                f"[MIMIT] Price notifications processed. run_id={run_id} "
+                f"sent={notification_summary['sent_count']} "
+                f"skipped={notification_summary['skipped_count']}"
+            )
+        except Exception as notification_error:
+            print(
+                f"[MIMIT] Price notification processing failed. run_id={run_id} "
+                f"type={notification_error.__class__.__name__}"
+            )
+
         duration_seconds = int(time.monotonic() - started_at)
         print(
             f"[MIMIT] Background update finished successfully. run_id={run_id} "
@@ -2402,6 +2734,52 @@ def admin_test_push(
         conn.close()
 
 
+@app.post("/admin/process-price-notifications")
+def admin_process_price_notifications(
+    _: None = Depends(require_admin_update_token),
+) -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_mimit_import_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM mimit_import_runs
+                    WHERE status = 'success'
+                    ORDER BY completed_at DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        print(f"[PRICE_NOTIFICATIONS] Latest successful run lookup failed. type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Price notification processing failed")
+    finally:
+        conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="No successful MIMIT run found")
+
+    run_id = int(row[0])
+    try:
+        result = process_price_notifications_for_run(run_id)
+        return {
+            "status": "ok",
+            "mimit_run_id": run_id,
+            "result": result,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        print(
+            f"[PRICE_NOTIFICATIONS] Manual processing failed. run_id={run_id} "
+            f"type={exc.__class__.__name__}"
+        )
+        raise HTTPException(status_code=500, detail="Price notification processing failed")
+
+
 # === AUTH ENDPOINTS ===
 
 
@@ -2856,6 +3234,9 @@ def get_current_user_notification_preferences(
                         fuel_type,
                         radius_km,
                         favorites_only,
+                        latitude,
+                        longitude,
+                        location_updated_at,
                         created_at,
                         updated_at;
                     """,
@@ -2911,6 +3292,28 @@ def update_current_user_notification_preferences(
             raise HTTPException(status_code=400, detail="Invalid favorites_only")
         updates["favorites_only"] = bool(payload.favorites_only)
 
+    location_fields = {"latitude", "longitude"}
+    if fields_set.intersection(location_fields):
+        if not location_fields.issubset(fields_set):
+            raise HTTPException(status_code=400, detail="Latitude and longitude must be provided together")
+        if payload.latitude is None and payload.longitude is None:
+            updates["latitude"] = None
+            updates["longitude"] = None
+            updates["location_updated_at"] = None
+        elif payload.latitude is None or payload.longitude is None:
+            raise HTTPException(status_code=400, detail="Invalid notification location")
+        elif (
+            not isfinite(payload.latitude)
+            or not isfinite(payload.longitude)
+            or not -90 <= payload.latitude <= 90
+            or not -180 <= payload.longitude <= 180
+        ):
+            raise HTTPException(status_code=400, detail="Invalid notification location")
+        else:
+            updates["latitude"] = float(payload.latitude)
+            updates["longitude"] = float(payload.longitude)
+            updates["location_updated_at"] = datetime.now(timezone.utc)
+
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
 
@@ -2952,6 +3355,9 @@ def update_current_user_notification_preferences(
                             fuel_type,
                             radius_km,
                             favorites_only,
+                            latitude,
+                            longitude,
+                            location_updated_at,
                             created_at,
                             updated_at;
                         """,
@@ -2966,6 +3372,9 @@ def update_current_user_notification_preferences(
                             fuel_type,
                             radius_km,
                             favorites_only,
+                            latitude,
+                            longitude,
+                            location_updated_at,
                             created_at,
                             updated_at
                         FROM price_notification_preferences
