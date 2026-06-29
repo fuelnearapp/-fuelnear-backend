@@ -3,6 +3,7 @@ from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
 import os
+import secrets
 from math import cos, isfinite, radians
 import threading
 import time
@@ -88,7 +89,8 @@ class LoginRequest(BaseModel):
 
 
 class EmailVerificationRequest(BaseModel):
-    token: str
+    token: str | None = None
+    code: str | None = None
 
 
 class ResendEmailVerificationRequest(BaseModel):
@@ -686,45 +688,59 @@ def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
             """,
             (user_id,),
         )
-        cur.execute(
-            """
-            INSERT INTO email_verification_tokens (
-                user_id,
-                token_hash,
-                expires_at,
-                created_at
+        row = None
+        verification_code = None
+        for _ in range(10):
+            candidate_code = f"{secrets.randbelow(1_000_000):06d}"
+            cur.execute(
+                """
+                INSERT INTO email_verification_tokens (
+                    user_id,
+                    token_hash,
+                    code_hash,
+                    expires_at,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (code_hash) WHERE used_at IS NULL DO NOTHING
+                RETURNING id, user_id, expires_at, created_at;
+                """,
+                (user_id, token_hash, hash_token(candidate_code), expires_at),
             )
-            VALUES (%s, %s, %s, NOW())
-            RETURNING id, user_id, expires_at, created_at;
-            """,
-            (user_id, token_hash, expires_at),
-        )
-        row = cur.fetchone()
+            row = cur.fetchone()
+            if row is not None:
+                verification_code = candidate_code
+                break
+
+        if row is None or verification_code is None:
+            raise RuntimeError("Could not allocate email verification code")
 
     return {
         "token": token,
+        "code": verification_code,
         "row": dict(row),
     }
 
 
-def verify_email_token(conn, token: str) -> dict[str, Any] | None:
-    normalized_token = token.strip()
-    if not normalized_token:
+def verify_email_token(conn, credential: str) -> dict[str, Any] | None:
+    normalized_credential = credential.strip()
+    if not normalized_credential:
         return None
 
-    token_hash = hash_token(normalized_token)
+    credential_hash = hash_token(normalized_credential)
+    hash_column = "code_hash" if re.fullmatch(r"\d{6}", normalized_credential) else "token_hash"
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             SELECT id, user_id
             FROM email_verification_tokens
-            WHERE token_hash = %s
+            WHERE {hash_column} = %s
               AND used_at IS NULL
               AND expires_at > NOW()
             LIMIT 1
             FOR UPDATE;
             """,
-            (token_hash,),
+            (credential_hash,),
         )
         token_row = cur.fetchone()
         if token_row is None:
@@ -750,9 +766,10 @@ def verify_email_token(conn, token: str) -> dict[str, Any] | None:
             """
             UPDATE email_verification_tokens
             SET used_at = NOW()
-            WHERE id = %s;
+            WHERE user_id = %s
+              AND used_at IS NULL;
             """,
-            (token_row["id"],),
+            (token_row["user_id"],),
         )
 
     return dict(user_row)
@@ -1754,12 +1771,14 @@ def ensure_auth_schema(conn) -> None:
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 token_hash TEXT NOT NULL UNIQUE,
+                code_hash TEXT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
                 used_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
+        cur.execute("ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS code_hash TEXT NULL;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS rewards (
@@ -1818,6 +1837,13 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer_user_id ON referrals(referrer_user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id ON email_verification_tokens(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_token_hash ON email_verification_tokens(token_hash);")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verification_tokens_active_code_hash
+            ON email_verification_tokens(code_hash)
+            WHERE used_at IS NULL;
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
@@ -3149,6 +3175,7 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
         delivery_result = send_verification_email(
             to_email=email,
             verification_token=verification_token["token"],
+            verification_code=verification_token["code"],
             expires_at=verification_expires_at,
         )
         print(f"[AUTH][EMAIL] register delivery={delivery_result.delivery}")
@@ -3183,13 +3210,18 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
 @app.post("/auth/verify-email")
 def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
     print("[AUTH][EMAIL] verify endpoint reached")
+    credential = (payload.code or payload.token or "").strip()
+    if not credential:
+        raise HTTPException(status_code=400, detail="Verification code or token is required")
+    if payload.code is not None and not re.fullmatch(r"\d{6}", credential):
+        raise HTTPException(status_code=400, detail="Verification code must contain 6 digits")
     conn = get_connection()
     try:
         with conn:
-            user_row = verify_email_token(conn, payload.token)
+            user_row = verify_email_token(conn, credential)
             if user_row is None:
                 print("[AUTH][EMAIL] verify failed")
-                raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+                raise HTTPException(status_code=400, detail="Invalid or expired verification code or token")
 
             user_payload = build_user_payload(conn, user_row)
 
@@ -3214,6 +3246,7 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
     fallback_expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
     expires_at = fallback_expires_at
     verification_token_value: str | None = None
+    verification_code_value: str | None = None
     should_send_email = False
     try:
         with conn:
@@ -3232,6 +3265,7 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
             if user_row and user_row["is_active"] and not user_row["is_email_verified"]:
                 verification_token = create_email_verification_token(conn, user_row["id"])
                 verification_token_value = verification_token["token"]
+                verification_code_value = verification_token["code"]
                 expires_at = verification_token["row"]["expires_at"]
                 should_send_email = True
                 print("[AUTH][EMAIL] resend token created=true")
@@ -3239,10 +3273,11 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
                 print("[AUTH][EMAIL] resend token created=false")
 
         delivery = "not_configured" if not email_delivery_is_configured() else "accepted"
-        if should_send_email and verification_token_value:
+        if should_send_email and verification_token_value and verification_code_value:
             delivery_result = send_verification_email(
                 to_email=normalize_email(str(payload.email)),
                 verification_token=verification_token_value,
+                verification_code=verification_code_value,
                 expires_at=expires_at,
             )
             delivery = delivery_result.delivery

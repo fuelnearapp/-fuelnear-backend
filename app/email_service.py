@@ -6,6 +6,7 @@ from html import escape
 import os
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -51,10 +52,19 @@ def build_verification_link(token: str) -> str | None:
 def build_verification_email(
     *,
     verification_token: str,
+    verification_code: str,
     expires_at: datetime,
 ) -> tuple[str, str, str]:
     link = build_verification_link(verification_token)
-    expires_text = expires_at.isoformat()
+    month_names = (
+        "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+        "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre",
+    )
+    local_expires_at = expires_at.astimezone(ZoneInfo("Europe/Rome"))
+    expires_text = (
+        f"{local_expires_at.day} {month_names[local_expires_at.month - 1]} {local_expires_at.year} "
+        f"alle {local_expires_at:%H:%M} ({local_expires_at:%Z})"
+    )
     subject = "Verifica il tuo account FuelNear"
 
     text_lines = [
@@ -62,27 +72,37 @@ def build_verification_email(
         "",
         "Per completare la registrazione, verifica il tuo indirizzo email.",
         "",
-        f"Codice verifica: {verification_token}",
+        f"Codice di verifica: {verification_code}",
         f"Scadenza: {expires_text}",
     ]
     if link:
         text_lines.extend(["", f"Link verifica: {link}"])
 
-    safe_token = escape(verification_token)
+    safe_display_code = escape(" ".join(verification_code))
     safe_expires = escape(expires_text)
     link_html = ""
     if link:
         safe_link = escape(link, quote=True)
-        link_html = f'<p><a href="{safe_link}">Verifica account</a></p>'
+        link_html = f"""
+        <div style="margin:28px 0">
+          <a href="{safe_link}" style="display:inline-block;background:#147d55;color:#ffffff;text-decoration:none;font-weight:600;padding:12px 20px;border-radius:8px">Verifica account</a>
+        </div>
+        """
 
     html = f"""
-    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111827;line-height:1.5">
-      <h1 style="font-size:22px;margin:0 0 16px">FuelNear</h1>
-      <p>Per completare la registrazione, verifica il tuo indirizzo email.</p>
-      {link_html}
-      <p>Codice verifica:</p>
-      <p style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;background:#f3f4f6;padding:12px;border-radius:8px">{safe_token}</p>
-      <p style="color:#6b7280">Scade il {safe_expires}.</p>
+    <div style="margin:0;background:#f4f7f5;padding:32px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#17211d;line-height:1.55">
+      <div style="max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #dce5e0;border-radius:8px;overflow:hidden">
+        <div style="background:#147d55;color:#ffffff;padding:22px 28px;font-size:24px;font-weight:700">FuelNear</div>
+        <div style="padding:28px">
+          <h1 style="font-size:22px;margin:0 0 12px">Verifica il tuo account</h1>
+          <p style="margin:0 0 22px">Inserisci questo codice nell'app FuelNear per completare la registrazione:</p>
+          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:34px;font-weight:700;letter-spacing:0;text-align:center;background:#eef6f1;border:1px solid #c9ded2;padding:16px;border-radius:8px">{safe_display_code}</div>
+          <p style="color:#52615a;margin:18px 0 0">Il codice scade il {safe_expires}.</p>
+          {link_html}
+          <hr style="border:0;border-top:1px solid #e3e9e6;margin:28px 0 20px">
+          <p style="font-size:13px;color:#68766f;margin:0">Se non hai richiesto questa registrazione, ignora questa email.</p>
+        </div>
+      </div>
     </div>
     """
 
@@ -93,6 +113,7 @@ def send_verification_email(
     *,
     to_email: str,
     verification_token: str,
+    verification_code: str,
     expires_at: datetime,
 ) -> EmailDeliveryResult:
     email_debug_log("service invoked")
@@ -103,6 +124,7 @@ def send_verification_email(
     email_debug_log("send starting provider=resend")
     subject, text, html = build_verification_email(
         verification_token=verification_token,
+        verification_code=verification_code,
         expires_at=expires_at,
     )
     payload: dict[str, Any] = {
