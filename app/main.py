@@ -1,5 +1,7 @@
 from typing import Any
 from email.utils import parsedate_to_datetime
+import hashlib
+import hmac
 import os
 from math import cos, isfinite, radians
 import threading
@@ -96,6 +98,11 @@ class AppleAuthRequest(BaseModel):
     full_name: Any | None = None
     fullName: Any | None = None
     display_name: str | None = None
+    nonce: str | None = None
+    raw_nonce: str | None = None
+    rawNonce: str | None = None
+    hashed_nonce: str | None = None
+    hashedNonce: str | None = None
     referral_code: str | None = None
     device_info: str | None = None
 
@@ -321,7 +328,12 @@ def verify_jwt_with_jwks(
     return jwt.decode(token, signing_key.key, **decode_kwargs)
 
 
-def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
+def verify_apple_identity_token(
+    identity_token: str,
+    *,
+    raw_nonce: str | None = None,
+    expected_nonce: str | None = None,
+) -> dict[str, Any]:
     if not APPLE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Apple auth not configured")
 
@@ -344,6 +356,36 @@ def verify_apple_identity_token(identity_token: str) -> dict[str, Any]:
     if not provider_user_id:
         apple_auth_debug_log("token verification failed type=MissingSubject")
         raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+    normalized_raw_nonce = raw_nonce.strip() if raw_nonce else None
+    normalized_expected_nonce = expected_nonce.strip() if expected_nonce else None
+    if normalized_raw_nonce or normalized_expected_nonce:
+        claim_nonce = claims.get("nonce")
+        if not isinstance(claim_nonce, str) or not claim_nonce:
+            apple_auth_debug_log("token verification failed type=MissingNonce")
+            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+        hashed_raw_nonce = (
+            hashlib.sha256(normalized_raw_nonce.encode("utf-8")).hexdigest()
+            if normalized_raw_nonce
+            else None
+        )
+        if (
+            hashed_raw_nonce
+            and normalized_expected_nonce
+            and not hmac.compare_digest(hashed_raw_nonce, normalized_expected_nonce)
+        ):
+            apple_auth_debug_log("token verification failed type=NonceInputMismatch")
+            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+        nonce_to_verify = hashed_raw_nonce or normalized_expected_nonce
+        if nonce_to_verify is None or not hmac.compare_digest(claim_nonce, nonce_to_verify):
+            apple_auth_debug_log("token verification failed type=InvalidNonce")
+            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+
+        apple_auth_debug_log("nonce verification success")
+    else:
+        apple_auth_debug_log("nonce verification skipped input_present=false")
 
     apple_auth_debug_log("token verification success")
     return {
@@ -881,6 +923,8 @@ def authenticate_with_provider(
     email_verified = bool(provider_claims.get("email_verified"))
     provider_display_name = sanitize_display_name(display_name) or sanitize_display_name(provider_claims.get("display_name"))
     referral_code_input = normalize_referral_code_input(referral_code)
+    linked_by_provider = False
+    linked_by_verified_email = False
 
     conn = get_connection()
     try:
@@ -889,6 +933,9 @@ def authenticate_with_provider(
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if log_prefix:
                     print(f"{log_prefix} user lookup/create started")
+                    print(f"{log_prefix} provider={provider}")
+                    print(f"{log_prefix} email_claim_present={bool(email)}")
+                    print(f"{log_prefix} email_verified={email_verified}")
                     print(f"{log_prefix} referral_code present={bool(referral_code_input)}")
                 cur.execute(
                     """
@@ -903,6 +950,7 @@ def authenticate_with_provider(
                 provider_row = cur.fetchone()
 
                 if provider_row:
+                    linked_by_provider = True
                     if log_prefix:
                         print(f"{log_prefix} referral skipped because existing user=true")
                         print(f"{log_prefix} referral applied=false")
@@ -911,7 +959,10 @@ def authenticate_with_provider(
                         raise HTTPException(status_code=404, detail="User not found")
                 else:
                     if not email:
-                        raise HTTPException(status_code=400, detail="Email is required for first sign-in")
+                        if log_prefix:
+                            print(f"{log_prefix} linked_by_provider=false")
+                            print(f"{log_prefix} linked_by_verified_email=false")
+                        raise HTTPException(status_code=400, detail="Provider email is required for first sign-in")
 
                     cur.execute(
                         """
@@ -924,6 +975,13 @@ def authenticate_with_provider(
                         (email,),
                     )
                     existing_user_row = cur.fetchone()
+                    if existing_user_row is not None and not email_verified:
+                        if log_prefix:
+                            print(f"{log_prefix} linked_by_provider=false")
+                            print(f"{log_prefix} linked_by_verified_email=false")
+                        raise HTTPException(status_code=401, detail="Unable to link provider account")
+
+                    linked_by_verified_email = bool(existing_user_row and email_verified)
                     referral_applied = False
                     referrer_user_id = None
 
@@ -975,9 +1033,6 @@ def authenticate_with_provider(
                         )
                         user_row = cur.fetchone()
 
-                    if user_row["email"] == email and not email_verified and user_row["password_hash"]:
-                        raise HTTPException(status_code=401, detail="Email must be verified to link provider")
-
                     if log_prefix:
                         print(f"{log_prefix} referral skipped because existing user={bool(existing_user_row)}")
                         print(f"{log_prefix} referral applied={referral_applied}")
@@ -1011,6 +1066,8 @@ def authenticate_with_provider(
                     raise HTTPException(status_code=403, detail="User account is inactive")
 
                 if log_prefix:
+                    print(f"{log_prefix} linked_by_provider={linked_by_provider}")
+                    print(f"{log_prefix} linked_by_verified_email={linked_by_verified_email}")
                     print(f"{log_prefix} session create started")
                 session_payload = create_user_session(conn, user_id=user_row["id"], device_info=device_info, ip_address=None)
                 user_payload = build_user_payload(conn, dict(user_row))
@@ -3070,6 +3127,13 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     if not identity_token or not identity_token.strip():
         raise HTTPException(status_code=400, detail="Apple identity token is required")
 
+    raw_nonce = payload.rawNonce or payload.raw_nonce
+    expected_nonce = payload.hashedNonce or payload.hashed_nonce or payload.nonce
+    if raw_nonce and len(raw_nonce) > 512:
+        raise HTTPException(status_code=400, detail="Invalid Apple nonce")
+    if expected_nonce and len(expected_nonce) > 512:
+        raise HTTPException(status_code=400, detail="Invalid Apple nonce")
+
     try:
         unverified_claims = jwt.decode(identity_token, options={"verify_signature": False})
         apple_auth_debug_log(f"token audience={unverified_claims.get('aud')}")
@@ -3077,11 +3141,11 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     except Exception as exc:
         apple_auth_debug_log(f"token preflight decode failed type={exc.__class__.__name__}")
 
-    claims = verify_apple_identity_token(identity_token)
-    payload_email = normalize_email(payload.email) if payload.email else None
-    if payload_email and not claims.get("email"):
-        claims["email"] = payload_email
-        claims["email_verified"] = True
+    claims = verify_apple_identity_token(
+        identity_token,
+        raw_nonce=raw_nonce,
+        expected_nonce=expected_nonce,
+    )
 
     claims["display_name"] = display_name
     return authenticate_with_provider(
