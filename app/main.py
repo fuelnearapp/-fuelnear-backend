@@ -19,6 +19,7 @@ from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
 from app.apns_client import APNsConfigurationError, apns_is_configured, send_apns_push
+from app.email_service import email_delivery_is_configured, send_verification_email
 from app.auth_utils import (
     generate_access_token,
     generate_refresh_token,
@@ -3145,13 +3146,20 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
 
                 user_payload = build_user_payload(conn, dict(user_row))
 
+        delivery_result = send_verification_email(
+            to_email=email,
+            verification_token=verification_token["token"],
+            expires_at=verification_expires_at,
+        )
+        print(f"[AUTH][EMAIL] register delivery={delivery_result.delivery}")
+
         return {
             "status": "email_verification_required",
             "user": user_payload,
             "session": None,
             "email_verification": {
                 "required": True,
-                "delivery": "not_configured",
+                "delivery": delivery_result.delivery,
                 "expires_at": verification_expires_at.isoformat(),
             },
         }
@@ -3205,6 +3213,8 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
     conn = get_connection()
     fallback_expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
     expires_at = fallback_expires_at
+    verification_token_value: str | None = None
+    should_send_email = False
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -3221,16 +3231,28 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
 
             if user_row and user_row["is_active"] and not user_row["is_email_verified"]:
                 verification_token = create_email_verification_token(conn, user_row["id"])
+                verification_token_value = verification_token["token"]
                 expires_at = verification_token["row"]["expires_at"]
+                should_send_email = True
                 print("[AUTH][EMAIL] resend token created=true")
             else:
                 print("[AUTH][EMAIL] resend token created=false")
 
+        delivery = "not_configured" if not email_delivery_is_configured() else "accepted"
+        if should_send_email and verification_token_value:
+            delivery_result = send_verification_email(
+                to_email=normalize_email(str(payload.email)),
+                verification_token=verification_token_value,
+                expires_at=expires_at,
+            )
+            delivery = delivery_result.delivery
+
+        print(f"[AUTH][EMAIL] resend delivery={delivery}")
         return {
             "status": "ok",
             "email_verification": {
                 "required": True,
-                "delivery": "not_configured",
+                "delivery": delivery,
                 "expires_at": expires_at.isoformat(),
             },
         }
