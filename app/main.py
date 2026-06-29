@@ -45,6 +45,7 @@ PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
+EMAIL_VERIFICATION_TTL_HOURS = int(os.getenv("EMAIL_VERIFICATION_TTL_HOURS", "24"))
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
@@ -83,6 +84,14 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
     device_info: str | None = None
+
+
+class EmailVerificationRequest(BaseModel):
+    token: str
+
+
+class ResendEmailVerificationRequest(BaseModel):
+    email: EmailStr
 
 
 class RefreshRequest(BaseModel):
@@ -613,12 +622,14 @@ def process_pending_referrals(conn, min_age_days: int = 7, reward_days: int = 7)
                 r.referral_code_used,
                 r.status,
                 r.created_at,
-                u.is_active AS referred_user_is_active
+                u.is_active AS referred_user_is_active,
+                u.is_email_verified AS referred_user_is_email_verified
             FROM referrals r
             JOIN users u ON u.id = r.referred_user_id
             WHERE r.status = 'pending'
               AND r.created_at <= NOW() - (%s * INTERVAL '1 day')
               AND u.is_active = TRUE
+              AND u.is_email_verified = TRUE
             ORDER BY r.created_at ASC;
             """,
             (min_age_days,),
@@ -657,6 +668,93 @@ def process_pending_referrals(conn, min_age_days: int = 7, reward_days: int = 7)
         "processed_count": len(processed),
         "items": processed,
     }
+
+
+def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
+    token = generate_refresh_token()
+    token_hash = hash_token(token)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            UPDATE email_verification_tokens
+            SET used_at = NOW()
+            WHERE user_id = %s
+              AND used_at IS NULL;
+            """,
+            (user_id,),
+        )
+        cur.execute(
+            """
+            INSERT INTO email_verification_tokens (
+                user_id,
+                token_hash,
+                expires_at,
+                created_at
+            )
+            VALUES (%s, %s, %s, NOW())
+            RETURNING id, user_id, expires_at, created_at;
+            """,
+            (user_id, token_hash, expires_at),
+        )
+        row = cur.fetchone()
+
+    return {
+        "token": token,
+        "row": dict(row),
+    }
+
+
+def verify_email_token(conn, token: str) -> dict[str, Any] | None:
+    normalized_token = token.strip()
+    if not normalized_token:
+        return None
+
+    token_hash = hash_token(normalized_token)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, user_id
+            FROM email_verification_tokens
+            WHERE token_hash = %s
+              AND used_at IS NULL
+              AND expires_at > NOW()
+            LIMIT 1
+            FOR UPDATE;
+            """,
+            (token_hash,),
+        )
+        token_row = cur.fetchone()
+        if token_row is None:
+            return None
+
+        cur.execute(
+            """
+            UPDATE users
+            SET is_email_verified = TRUE,
+                updated_at = NOW()
+            WHERE id = %s
+              AND is_active = TRUE
+            RETURNING id, email, password_hash, display_name, referral_code, referred_by_user_id,
+                      is_email_verified, is_active, created_at, updated_at;
+            """,
+            (token_row["user_id"],),
+        )
+        user_row = cur.fetchone()
+        if user_row is None:
+            return None
+
+        cur.execute(
+            """
+            UPDATE email_verification_tokens
+            SET used_at = NOW()
+            WHERE id = %s;
+            """,
+            (token_row["id"],),
+        )
+
+    return dict(user_row)
 
 
 
@@ -1651,6 +1749,18 @@ def ensure_auth_schema(conn) -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS email_verification_tokens (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS rewards (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1705,6 +1815,8 @@ def ensure_auth_schema(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer_user_id ON referrals(referrer_user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id ON email_verification_tokens(user_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_token_hash ON email_verification_tokens(token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
@@ -3028,19 +3140,20 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
                         ),
                     )
 
-                session_payload = create_user_session(
-                    conn,
-                    user_id=user_row["id"],
-                    device_info=payload.device_info,
-                    ip_address=None,
-                )
+                verification_token = create_email_verification_token(conn, user_row["id"])
+                verification_expires_at = verification_token["row"]["expires_at"]
 
                 user_payload = build_user_payload(conn, dict(user_row))
 
         return {
-            "status": "ok",
+            "status": "email_verification_required",
             "user": user_payload,
-            "session": session_payload,
+            "session": None,
+            "email_verification": {
+                "required": True,
+                "delivery": "not_configured",
+                "expires_at": verification_expires_at.isoformat(),
+            },
         }
     except HTTPException:
         raise
@@ -3055,6 +3168,75 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
     except Exception as exc:
         print(f"[AUTH] Registration failed. error={exc.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Registration failed")
+    finally:
+        conn.close()
+
+
+@app.post("/auth/verify-email")
+def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
+    print("[AUTH][EMAIL] verify endpoint reached")
+    conn = get_connection()
+    try:
+        with conn:
+            user_row = verify_email_token(conn, payload.token)
+            if user_row is None:
+                print("[AUTH][EMAIL] verify failed")
+                raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+
+            user_payload = build_user_payload(conn, user_row)
+
+        print("[AUTH][EMAIL] verify success")
+        return {
+            "status": "ok",
+            "user": user_payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[AUTH][EMAIL] verify failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Email verification failed")
+    finally:
+        conn.close()
+
+
+@app.post("/auth/resend-verification-email")
+def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[str, Any]:
+    print("[AUTH][EMAIL] resend endpoint reached")
+    conn = get_connection()
+    fallback_expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
+    expires_at = fallback_expires_at
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, is_email_verified, is_active
+                    FROM users
+                    WHERE email = %s
+                    LIMIT 1;
+                    """,
+                    (normalize_email(str(payload.email)),),
+                )
+                user_row = cur.fetchone()
+
+            if user_row and user_row["is_active"] and not user_row["is_email_verified"]:
+                verification_token = create_email_verification_token(conn, user_row["id"])
+                expires_at = verification_token["row"]["expires_at"]
+                print("[AUTH][EMAIL] resend token created=true")
+            else:
+                print("[AUTH][EMAIL] resend token created=false")
+
+        return {
+            "status": "ok",
+            "email_verification": {
+                "required": True,
+                "delivery": "not_configured",
+                "expires_at": expires_at.isoformat(),
+            },
+        }
+    except Exception as exc:
+        print(f"[AUTH][EMAIL] resend failed. error={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Email verification resend failed")
     finally:
         conn.close()
 
@@ -3087,6 +3269,9 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
 
                 if not user_row["is_active"]:
                     raise HTTPException(status_code=403, detail="User account is inactive")
+
+                if not user_row["is_email_verified"]:
+                    raise HTTPException(status_code=403, detail="Email verification required")
 
                 session_payload = create_user_session(
                     conn,
