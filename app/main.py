@@ -3101,7 +3101,8 @@ def admin_process_price_notifications(
 def register_user(payload: RegisterRequest) -> dict[str, Any]:
     email = normalize_email(str(payload.email))
     display_name = sanitize_display_name(payload.display_name) or default_display_name_from_email(email)
-    referral_code_input = payload.referral_code.strip().upper() if payload.referral_code else None
+    referral_code_input = normalize_referral_code_input(payload.referral_code)
+    print(f"[AUTH][REGISTER] referral_present={str(referral_code_input is not None).lower()}")
 
     conn = get_connection()
     try:
