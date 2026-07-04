@@ -15,7 +15,10 @@ import psycopg2
 import jwt
 from jwt import PyJWKClient, PyJWTError
 from psycopg2.extras import RealDictCursor
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depends
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depends, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
@@ -61,6 +64,69 @@ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 app = FastAPI(title="FuelNear Backend")
+
+
+class APIError(HTTPException):
+    def __init__(self, status_code: int, error_code: str, message: str):
+        super().__init__(status_code=status_code, detail=message)
+        self.error_code = error_code
+        self.message = message
+
+
+@app.exception_handler(APIError)
+async def api_error_handler(_request: Request, exc: APIError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": exc.error_code,
+            "message": exc.message,
+            "detail": exc.message,
+        },
+        headers=exc.headers,
+    )
+
+
+AUTH_VALIDATION_PATHS = {
+    "/auth/register",
+    "/auth/login",
+    "/auth/verify-email",
+    "/auth/resend-verification-email",
+    "/user/referral-code",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
+    path = request.url.path
+    if path not in AUTH_VALIDATION_PATHS:
+        return await request_validation_exception_handler(request, exc)
+
+    invalid_fields = {
+        str(error.get("loc", ("",))[-1])
+        for error in exc.errors()
+        if error.get("loc")
+    }
+    if "email" in invalid_fields:
+        error_code = "INVALID_EMAIL"
+        message = "Invalid email address"
+    elif path == "/auth/verify-email":
+        error_code = "VERIFICATION_CODE_INVALID"
+        message = "Invalid verification code or token"
+    elif path == "/user/referral-code" or "referral_code" in invalid_fields:
+        error_code = "REFERRAL_CODE_INVALID"
+        message = "Invalid referral code"
+    else:
+        error_code = "INVALID_REQUEST"
+        message = "Invalid request"
+
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error_code": error_code,
+            "message": message,
+            "detail": message,
+        },
+    )
 
 
 _scheduler_started = False
@@ -722,21 +788,26 @@ def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
     }
 
 
-def verify_email_token(conn, credential: str) -> dict[str, Any] | None:
+def verify_email_token(conn, credential: str) -> dict[str, Any]:
     normalized_credential = credential.strip()
     if not normalized_credential:
-        return None
+        raise APIError(400, "VERIFICATION_CODE_INVALID", "Invalid verification code or token")
 
     credential_hash = hash_token(normalized_credential)
     hash_column = "code_hash" if re.fullmatch(r"\d{6}", normalized_credential) else "token_hash"
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             f"""
-            SELECT id, user_id
-            FROM email_verification_tokens
+            SELECT
+                evt.id,
+                evt.user_id,
+                evt.used_at,
+                evt.expires_at <= NOW() AS is_expired,
+                u.is_email_verified,
+                u.is_active
+            FROM email_verification_tokens evt
+            JOIN users u ON u.id = evt.user_id
             WHERE {hash_column} = %s
-              AND used_at IS NULL
-              AND expires_at > NOW()
             LIMIT 1
             FOR UPDATE;
             """,
@@ -744,7 +815,15 @@ def verify_email_token(conn, credential: str) -> dict[str, Any] | None:
         )
         token_row = cur.fetchone()
         if token_row is None:
-            return None
+            raise APIError(400, "VERIFICATION_CODE_INVALID", "Invalid verification code or token")
+        if token_row["is_email_verified"]:
+            raise APIError(409, "ACCOUNT_ALREADY_VERIFIED", "Email address is already verified")
+        if token_row["is_expired"]:
+            raise APIError(400, "VERIFICATION_CODE_EXPIRED", "Verification code or token has expired")
+        if token_row["used_at"] is not None:
+            raise APIError(400, "VERIFICATION_CODE_INVALID", "Invalid verification code or token")
+        if not token_row["is_active"]:
+            raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
 
         cur.execute(
             """
@@ -760,7 +839,7 @@ def verify_email_token(conn, credential: str) -> dict[str, Any] | None:
         )
         user_row = cur.fetchone()
         if user_row is None:
-            return None
+            raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
 
         cur.execute(
             """
@@ -885,11 +964,11 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
 
 def extract_bearer_token(authorization: str | None) -> str:
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+        raise APIError(401, "AUTHORIZATION_REQUIRED", "Authorization is required")
 
     parts = authorization.strip().split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+        raise APIError(401, "ACCESS_TOKEN_INVALID", "Invalid Authorization header")
 
     return parts[1].strip()
 
@@ -899,8 +978,9 @@ def get_current_user_from_token(authorization: str | None) -> dict[str, Any]:
     access_token = extract_bearer_token(authorization)
     access_token_hash = hash_token(access_token)
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -932,14 +1012,20 @@ def get_current_user_from_token(authorization: str | None) -> dict[str, Any]:
                 user = cur.fetchone()
 
                 if not user:
-                    raise HTTPException(status_code=401, detail="Invalid or expired access token")
+                    raise APIError(401, "ACCESS_TOKEN_INVALID", "Invalid or expired access token")
 
                 if not user["is_active"]:
-                    raise HTTPException(status_code=403, detail="User account is inactive")
+                    raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
 
                 return build_user_payload(conn, dict(user))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[AUTH] Access token validation failed. error={exc.__class__.__name__}")
+        raise APIError(500, "SERVER_ERROR", "Authentication service unavailable")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def revoke_current_session(authorization: str | None) -> dict[str, Any]:
@@ -1002,7 +1088,7 @@ def resolve_active_referrer_id(cur, referral_code: str) -> int:
     )
     referrer = cur.fetchone()
     if referrer is None:
-        raise HTTPException(status_code=400, detail="Invalid referral code")
+        raise APIError(400, "REFERRAL_CODE_INVALID", "Invalid referral code")
 
     return referrer["id"]
 
@@ -3104,24 +3190,18 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
     referral_code_input = normalize_referral_code_input(payload.referral_code)
     print(f"[AUTH][REGISTER] referral_present={str(referral_code_input is not None).lower()}")
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT id FROM users WHERE email = %s LIMIT 1;", (email,))
                 if cur.fetchone() is not None:
-                    raise HTTPException(status_code=409, detail="Email already registered")
+                    raise APIError(409, "EMAIL_ALREADY_EXISTS", "Email already registered")
 
                 referrer_user_id = None
                 if referral_code_input:
-                    cur.execute(
-                        "SELECT id FROM users WHERE referral_code = %s AND is_active = TRUE LIMIT 1;",
-                        (referral_code_input,),
-                    )
-                    referrer = cur.fetchone()
-                    if referrer is None:
-                        raise HTTPException(status_code=400, detail="Invalid referral code")
-                    referrer_user_id = referrer["id"]
+                    referrer_user_id = resolve_active_referrer_id(cur, referral_code_input)
 
                 password_hash_value = hash_password(payload.password)
                 user_referral_code = generate_unique_referral_code(conn)
@@ -3194,18 +3274,21 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        if str(exc) == "Password must be at least 8 characters long":
+            raise APIError(400, "PASSWORD_TOO_SHORT", "Password must be at least 8 characters long")
+        raise APIError(400, "INVALID_REQUEST", "Invalid registration request")
     except psycopg2.errors.UniqueViolation as exc:
         constraint_name = getattr(exc.diag, "constraint_name", None)
         print(f"[AUTH] Registration unique violation. constraint={constraint_name}")
         if constraint_name and "email" in constraint_name:
-            raise HTTPException(status_code=409, detail="Email already registered")
-        raise HTTPException(status_code=500, detail="Registration failed")
+            raise APIError(409, "EMAIL_ALREADY_EXISTS", "Email already registered")
+        raise APIError(500, "SERVER_ERROR", "Registration failed")
     except Exception as exc:
         print(f"[AUTH] Registration failed. error={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="Registration failed")
+        raise APIError(500, "SERVER_ERROR", "Registration failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/auth/verify-email")
@@ -3213,17 +3296,14 @@ def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
     print("[AUTH][EMAIL] verify endpoint reached")
     credential = (payload.code or payload.token or "").strip()
     if not credential:
-        raise HTTPException(status_code=400, detail="Verification code or token is required")
+        raise APIError(400, "VERIFICATION_CODE_INVALID", "Verification code or token is required")
     if payload.code is not None and not re.fullmatch(r"\d{6}", credential):
-        raise HTTPException(status_code=400, detail="Verification code must contain 6 digits")
-    conn = get_connection()
+        raise APIError(400, "VERIFICATION_CODE_INVALID", "Verification code must contain 6 digits")
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             user_row = verify_email_token(conn, credential)
-            if user_row is None:
-                print("[AUTH][EMAIL] verify failed")
-                raise HTTPException(status_code=400, detail="Invalid or expired verification code or token")
-
             user_payload = build_user_payload(conn, user_row)
 
         print("[AUTH][EMAIL] verify success")
@@ -3235,21 +3315,23 @@ def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
         raise
     except Exception as exc:
         print(f"[AUTH][EMAIL] verify failed. error={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="Email verification failed")
+        raise APIError(500, "SERVER_ERROR", "Email verification failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/auth/resend-verification-email")
 def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[str, Any]:
     print("[AUTH][EMAIL] resend endpoint reached")
-    conn = get_connection()
+    conn = None
     fallback_expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
     expires_at = fallback_expires_at
     verification_token_value: str | None = None
     verification_code_value: str | None = None
     should_send_email = False
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -3292,19 +3374,23 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
                 "expires_at": expires_at.isoformat(),
             },
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         print(f"[AUTH][EMAIL] resend failed. error={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="Email verification resend failed")
+        raise APIError(500, "SERVER_ERROR", "Email verification resend failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/auth/login")
 def login_user(payload: LoginRequest) -> dict[str, Any]:
     email = normalize_email(str(payload.email))
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -3320,16 +3406,16 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
                 user_row = cur.fetchone()
 
                 if user_row is None or not user_row["password_hash"]:
-                    raise HTTPException(status_code=401, detail="Invalid email or password")
+                    raise APIError(401, "INVALID_CREDENTIALS", "Invalid email or password")
 
                 if not verify_password(payload.password, user_row["password_hash"]):
-                    raise HTTPException(status_code=401, detail="Invalid email or password")
+                    raise APIError(401, "INVALID_CREDENTIALS", "Invalid email or password")
 
                 if not user_row["is_active"]:
-                    raise HTTPException(status_code=403, detail="User account is inactive")
+                    raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
 
                 if not user_row["is_email_verified"]:
-                    raise HTTPException(status_code=403, detail="Email verification required")
+                    raise APIError(403, "EMAIL_NOT_VERIFIED", "Email verification required")
 
                 session_payload = create_user_session(
                     conn,
@@ -3349,9 +3435,10 @@ def login_user(payload: LoginRequest) -> dict[str, Any]:
         raise
     except Exception as exc:
         print(f"[AUTH] Login failed. error={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="Login failed")
+        raise APIError(500, "SERVER_ERROR", "Login failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/auth/apple")
@@ -3960,13 +4047,14 @@ def apply_current_user_referral_code(
 
     if not referral_code_input:
         print("[REFERRAL] referral applied=false")
-        raise HTTPException(status_code=400, detail="Referral code is required")
+        raise APIError(400, "REFERRAL_CODE_INVALID", "Referral code is required")
 
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -3981,7 +4069,7 @@ def apply_current_user_referral_code(
                 current_user = cur.fetchone()
                 if current_user is None:
                     print("[REFERRAL] referral applied=false")
-                    raise HTTPException(status_code=404, detail="User not found")
+                    raise APIError(404, "ACCOUNT_NOT_FOUND", "User not found")
 
                 cur.execute(
                     """
@@ -3996,7 +4084,7 @@ def apply_current_user_referral_code(
                 print(f"[REFERRAL] already referred={already_referred}")
                 if already_referred:
                     print("[REFERRAL] referral applied=false")
-                    raise HTTPException(status_code=409, detail="Referral code already applied")
+                    raise APIError(409, "REFERRAL_CODE_ALREADY_USED", "Referral code already applied")
 
                 try:
                     referrer_user_id = resolve_active_referrer_id(cur, referral_code_input)
@@ -4006,7 +4094,7 @@ def apply_current_user_referral_code(
 
                 if referrer_user_id == user_id:
                     print("[REFERRAL] referral applied=false")
-                    raise HTTPException(status_code=400, detail="Cannot use your own referral code")
+                    raise APIError(400, "REFERRAL_SELF_NOT_ALLOWED", "Cannot use your own referral code")
 
                 cur.execute(
                     """
@@ -4025,7 +4113,7 @@ def apply_current_user_referral_code(
         raise
     except psycopg2.errors.UniqueViolation:
         print("[REFERRAL] referral applied=false")
-        raise HTTPException(status_code=409, detail="Referral code already applied")
+        raise APIError(409, "REFERRAL_CODE_ALREADY_USED", "Referral code already applied")
     except Exception as exc:
         pgcode = getattr(exc, "pgcode", None)
         constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
@@ -4034,9 +4122,10 @@ def apply_current_user_referral_code(
             f"[REFERRAL] apply code failed type={exc.__class__.__name__} "
             f"pgcode={pgcode} table={table} constraint={constraint}"
         )
-        raise HTTPException(status_code=500, detail="Referral code apply failed")
+        raise APIError(500, "SERVER_ERROR", "Referral code apply failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.get("/user/referrals")
