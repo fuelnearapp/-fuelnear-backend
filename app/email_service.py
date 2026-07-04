@@ -67,32 +67,72 @@ def build_verification_email(
     subject = "Verifica il tuo account FuelNear"
 
     text_lines = [
-        "Benvenuto su FuelNear.",
+        "FuelNear",
         "",
-        "Per completare la registrazione, verifica il tuo indirizzo email.",
+        "Verifica il tuo account",
+        "",
+        "Inserisci questo codice nell’app FuelNear per completare la registrazione.",
         "",
         f"Codice di verifica: {verification_code}",
         f"Scadenza: {expires_text}",
+        "",
+        "Se non hai richiesto questa registrazione, ignora questa email.",
     ]
 
     safe_display_code = escape(" ".join(verification_code))
     safe_expires = escape(expires_text)
 
-    html = f"""
-    <div style="margin:0;background:#f4f7f5;padding:32px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#17211d;line-height:1.55">
-      <div style="max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #dce5e0;border-radius:8px;overflow:hidden">
-        <div style="background:#147d55;color:#ffffff;padding:22px 28px;font-size:24px;font-weight:700">FuelNear</div>
-        <div style="padding:28px">
-          <h1 style="font-size:22px;margin:0 0 12px">Verifica il tuo account</h1>
-          <p style="margin:0 0 22px">Inserisci questo codice nell'app FuelNear per completare la registrazione:</p>
-          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:34px;font-weight:700;letter-spacing:0;text-align:center;background:#eef6f1;border:1px solid #c9ded2;padding:16px;border-radius:8px">{safe_display_code}</div>
-          <p style="color:#52615a;margin:18px 0 0">Il codice scade il {safe_expires}.</p>
-          <hr style="border:0;border-top:1px solid #e3e9e6;margin:28px 0 20px">
-          <p style="font-size:13px;color:#68766f;margin:0">Se non hai richiesto questa registrazione, ignora questa email.</p>
-        </div>
-      </div>
-    </div>
-    """
+    html = f"""<!doctype html>
+    <html lang="it">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="color-scheme" content="light dark">
+        <meta name="supported-color-schemes" content="light dark">
+        <style>
+          @media (prefers-color-scheme: dark) {{
+            .email-bg {{ background-color:#0b1018 !important; }}
+            .email-card {{ background-color:#151c27 !important; border-color:#293445 !important; }}
+            .email-title {{ color:#f5f8fc !important; }}
+            .email-copy {{ color:#c6d0dd !important; }}
+            .email-code {{ background-color:#112a46 !important; border-color:#245b91 !important; color:#67b4ff !important; }}
+            .email-divider {{ border-color:#293445 !important; }}
+            .email-muted {{ color:#8f9cac !important; }}
+          }}
+        </style>
+      </head>
+      <body class="email-bg" style="margin:0;padding:0;background-color:#f3f6fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#152033;">
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">Il tuo codice di verifica FuelNear.</div>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" class="email-bg" style="width:100%;background-color:#f3f6fa;">
+          <tr>
+            <td align="center" style="padding:40px 16px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" class="email-card" style="width:100%;max-width:540px;background-color:#ffffff;border:1px solid #dce4ee;border-radius:8px;overflow:hidden;">
+                <tr>
+                  <td style="padding:26px 30px 14px;">
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+                      <tr>
+                        <td align="center" valign="middle" style="width:38px;height:38px;background-color:#0a84ff;border-radius:50%;color:#ffffff;font-size:20px;font-weight:800;">F</td>
+                        <td class="email-title" style="padding-left:12px;color:#152033;font-size:21px;font-weight:700;">FuelNear</td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:18px 30px 30px;">
+                    <h1 class="email-title" style="margin:0 0 12px;color:#152033;font-size:24px;line-height:1.25;font-weight:700;">Verifica il tuo account</h1>
+                    <p class="email-copy" style="margin:0 0 26px;color:#4d5b70;font-size:16px;line-height:1.55;">Inserisci questo codice nell’app FuelNear per completare la registrazione.</p>
+                    <div class="email-code" style="box-sizing:border-box;width:100%;padding:20px 12px;background-color:#edf6ff;border:1px solid #b8d9fa;border-radius:8px;color:#006bd6;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:34px;line-height:1.2;font-weight:800;letter-spacing:0;text-align:center;white-space:nowrap;">{safe_display_code}</div>
+                    <p class="email-muted" style="margin:18px 0 0;color:#68778b;font-size:14px;line-height:1.5;">Il codice scade il {safe_expires}.</p>
+                    <div class="email-divider" style="border-top:1px solid #e2e8f0;margin:28px 0 18px;"></div>
+                    <p class="email-muted" style="margin:0;color:#7a8798;font-size:13px;line-height:1.5;">Se non hai richiesto questa registrazione, ignora questa email.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>"""
 
     return subject, "\n".join(text_lines), html
 
