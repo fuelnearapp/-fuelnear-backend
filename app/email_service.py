@@ -55,7 +55,6 @@ def build_verification_email(
     verification_code: str,
     expires_at: datetime,
 ) -> tuple[str, str, str]:
-    link = build_verification_link(verification_token)
     month_names = (
         "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
         "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre",
@@ -75,19 +74,9 @@ def build_verification_email(
         f"Codice di verifica: {verification_code}",
         f"Scadenza: {expires_text}",
     ]
-    if link:
-        text_lines.extend(["", f"Link verifica: {link}"])
 
     safe_display_code = escape(" ".join(verification_code))
     safe_expires = escape(expires_text)
-    link_html = ""
-    if link:
-        safe_link = escape(link, quote=True)
-        link_html = f"""
-        <div style="margin:28px 0">
-          <a href="{safe_link}" style="display:inline-block;background:#147d55;color:#ffffff;text-decoration:none;font-weight:600;padding:12px 20px;border-radius:8px">Verifica account</a>
-        </div>
-        """
 
     html = f"""
     <div style="margin:0;background:#f4f7f5;padding:32px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#17211d;line-height:1.55">
@@ -98,7 +87,6 @@ def build_verification_email(
           <p style="margin:0 0 22px">Inserisci questo codice nell'app FuelNear per completare la registrazione:</p>
           <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:34px;font-weight:700;letter-spacing:0;text-align:center;background:#eef6f1;border:1px solid #c9ded2;padding:16px;border-radius:8px">{safe_display_code}</div>
           <p style="color:#52615a;margin:18px 0 0">Il codice scade il {safe_expires}.</p>
-          {link_html}
           <hr style="border:0;border-top:1px solid #e3e9e6;margin:28px 0 20px">
           <p style="font-size:13px;color:#68766f;margin:0">Se non hai richiesto questa registrazione, ignora questa email.</p>
         </div>
