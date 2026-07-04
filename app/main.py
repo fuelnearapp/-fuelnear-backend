@@ -596,7 +596,7 @@ def build_user_payload(conn, user_row: dict[str, Any]) -> dict[str, Any]:
 
 # === REFERRAL REWARD & PROCESSING ===
 
-def grant_plus_days_reward(conn, user_id: int, days: int) -> dict[str, Any]:
+def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> dict[str, Any]:
     if days <= 0:
         raise ValueError("Reward days must be greater than zero")
 
@@ -606,7 +606,8 @@ def grant_plus_days_reward(conn, user_id: int, days: int) -> dict[str, Any]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, starts_at, expires_at
+            SELECT id, user_id, source, status, starts_at, expires_at,
+                   original_transaction_id, created_at, updated_at
             FROM user_subscriptions
             WHERE user_id = %s
               AND status = 'active'
@@ -622,6 +623,7 @@ def grant_plus_days_reward(conn, user_id: int, days: int) -> dict[str, Any]:
             """
             INSERT INTO rewards (
                 user_id,
+                referral_id,
                 reward_type,
                 reward_value,
                 status,
@@ -629,12 +631,44 @@ def grant_plus_days_reward(conn, user_id: int, days: int) -> dict[str, Any]:
                 created_at,
                 updated_at
             )
-            VALUES (%s, 'plus_days', %s, 'granted', NOW(), NOW(), NOW())
-            RETURNING id, reward_type, reward_value, status, granted_at, expires_at, created_at, updated_at;
+            VALUES (%s, %s, 'plus_days', %s, 'granted', NOW(), NOW(), NOW())
+            ON CONFLICT (referral_id) WHERE referral_id IS NOT NULL DO NOTHING
+            RETURNING id, referral_id, reward_type, reward_value, status, granted_at, expires_at, created_at, updated_at;
             """,
-            (user_id, str(days)),
+            (user_id, referral_id, str(days)),
         )
         reward_row = cur.fetchone()
+
+        if reward_row is None:
+            cur.execute(
+                """
+                SELECT id, referral_id, reward_type, reward_value, status,
+                       granted_at, expires_at, created_at, updated_at
+                FROM rewards
+                WHERE referral_id = %s
+                LIMIT 1;
+                """,
+                (referral_id,),
+            )
+            existing_reward = cur.fetchone()
+            if existing_reward is None:
+                raise RuntimeError("Referral reward conflict without existing reward")
+
+            return {
+                "reward": serialize_datetime_fields(
+                    [dict(existing_reward)],
+                    ["granted_at", "expires_at", "created_at", "updated_at"],
+                )[0],
+                "subscription": (
+                    serialize_datetime_fields(
+                        [dict(active_subscription)],
+                        ["starts_at", "expires_at", "created_at", "updated_at"],
+                    )[0]
+                    if active_subscription
+                    else None
+                ),
+                "already_granted": True,
+            }
 
         if active_subscription:
             new_expires_at = active_subscription["expires_at"] + timedelta(days=days)
@@ -672,6 +706,7 @@ def grant_plus_days_reward(conn, user_id: int, days: int) -> dict[str, Any]:
     return {
         "reward": serialize_datetime_fields([dict(reward_row)], ["granted_at", "expires_at", "created_at", "updated_at"])[0],
         "subscription": serialize_datetime_fields([dict(subscription_row)], ["starts_at", "expires_at", "created_at", "updated_at"])[0],
+        "already_granted": False,
     }
 
 
@@ -724,12 +759,18 @@ def process_pending_referrals(conn, min_age_days: int = 7, reward_days: int = 7)
         if not validated_referral:
             continue
 
-        reward_result = grant_plus_days_reward(conn, validated_referral["referrer_user_id"], reward_days)
+        reward_result = grant_plus_days_reward(
+            conn,
+            validated_referral["referrer_user_id"],
+            validated_referral["id"],
+            reward_days,
+        )
         processed.append(
             {
                 "referral": serialize_datetime_fields([dict(validated_referral)], ["validated_at", "created_at", "updated_at"])[0],
                 "reward": reward_result["reward"],
                 "subscription": reward_result["subscription"],
+                "already_granted": reward_result["already_granted"],
             }
         )
 
@@ -1870,6 +1911,7 @@ def ensure_auth_schema(conn) -> None:
             CREATE TABLE IF NOT EXISTS rewards (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                referral_id BIGINT NULL,
                 reward_type TEXT NOT NULL,
                 reward_value TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -1878,6 +1920,27 @@ def ensure_auth_schema(conn) -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        cur.execute("ALTER TABLE rewards ADD COLUMN IF NOT EXISTS referral_id BIGINT NULL;")
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'fk_rewards_referral_id'
+                      AND conrelid = 'rewards'::regclass
+                ) THEN
+                    ALTER TABLE rewards
+                    ADD CONSTRAINT fk_rewards_referral_id
+                    FOREIGN KEY (referral_id)
+                    REFERENCES referrals(id)
+                    ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
             """
         )
         cur.execute(
@@ -1931,6 +1994,13 @@ def ensure_auth_schema(conn) -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rewards_unique_referral_id
+            ON rewards(referral_id)
+            WHERE referral_id IS NOT NULL;
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_refresh_token_hash ON user_sessions(refresh_token_hash);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions(user_id);")
@@ -4141,17 +4211,12 @@ def get_current_user_referrals(authorization: str | None = Header(default=None, 
                     """
                     SELECT
                         r.id,
-                        r.referrer_user_id,
-                        r.referred_user_id,
                         r.referral_code_used,
                         r.status,
                         r.validated_at,
                         r.created_at,
-                        r.updated_at,
-                        u.email AS referred_user_email,
-                        u.display_name AS referred_user_display_name
+                        r.updated_at
                     FROM referrals r
-                    JOIN users u ON u.id = r.referred_user_id
                     WHERE r.referrer_user_id = %s
                     ORDER BY r.created_at DESC;
                     """,
@@ -4201,6 +4266,7 @@ def get_current_user_rewards(authorization: str | None = Header(default=None, al
                     SELECT
                         id,
                         user_id,
+                        referral_id,
                         reward_type,
                         reward_value,
                         status,
