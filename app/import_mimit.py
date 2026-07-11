@@ -1,7 +1,10 @@
 import csv
 import os
+import socket
+import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 import ssl
@@ -32,6 +35,21 @@ PREZZI_URL = os.getenv(
     "PREZZI_URL",
     "https://www.mimit.gov.it/images/exportCSV/prezzo_alle_8.csv",
 )
+MIMIT_DOWNLOAD_TIMEOUT_SECONDS = max(1, int(os.getenv("MIMIT_DOWNLOAD_TIMEOUT_SECONDS", "120")))
+MIMIT_DOWNLOAD_MAX_ATTEMPTS = max(1, int(os.getenv("MIMIT_DOWNLOAD_MAX_ATTEMPTS", "3")))
+MIMIT_RETRYABLE_HTTP_STATUSES = {502, 503, 504}
+
+
+def safe_download_log_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return "configured_url"
+
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def get_download_backoff_seconds(attempt: int) -> int:
+    return min(120, 10 * (2 ** max(0, attempt - 1)))
 
 
 def get_connection():
@@ -198,15 +216,71 @@ def normalize_fuel_type(raw_fuel: str) -> str:
 def download_file(url: str, destination: Path) -> dict[str, object]:
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     temporary_destination = destination.with_suffix(destination.suffix + ".tmp")
+    safe_url = safe_download_log_url(url)
+    last_modified = None
+    last_error: Exception | None = None
 
-    with urlopen(url, context=ssl_context) as response, open(temporary_destination, "wb") as output_file:
-        last_modified = response.headers.get("Last-Modified")
-        shutil.copyfileobj(response, output_file)
+    for attempt in range(1, MIMIT_DOWNLOAD_MAX_ATTEMPTS + 1):
+        if temporary_destination.exists():
+            temporary_destination.unlink()
+
+        print(
+            f"[MIMIT] download_attempt attempt={attempt}/{MIMIT_DOWNLOAD_MAX_ATTEMPTS} "
+            f"url={safe_url} timeout_seconds={MIMIT_DOWNLOAD_TIMEOUT_SECONDS}"
+        )
+        try:
+            with urlopen(
+                url,
+                context=ssl_context,
+                timeout=MIMIT_DOWNLOAD_TIMEOUT_SECONDS,
+            ) as response, open(temporary_destination, "wb") as output_file:
+                last_modified = response.headers.get("Last-Modified")
+                shutil.copyfileobj(response, output_file)
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in MIMIT_RETRYABLE_HTTP_STATUSES:
+                print(f"[MIMIT] download_failed url={safe_url} http_status={exc.code}")
+                raise RuntimeError(f"MIMIT download failed with HTTP {exc.code}") from exc
+
+            print(f"[MIMIT] temporary_http_error url={safe_url} http_status={exc.code}")
+        except (TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            print(f"[MIMIT] timeout url={safe_url} type={exc.__class__.__name__}")
+        except URLError as exc:
+            last_error = exc
+            reason_type = exc.reason.__class__.__name__ if exc.reason is not None else "unknown"
+            print(f"[MIMIT] download_failed url={safe_url} network_error={reason_type}")
+        except OSError as exc:
+            last_error = exc
+            print(f"[MIMIT] download_failed url={safe_url} network_error={exc.__class__.__name__}")
+        else:
+            if not temporary_destination.exists() or temporary_destination.stat().st_size == 0:
+                last_error = RuntimeError("Downloaded file is empty")
+                print(f"[MIMIT] download_failed url={safe_url} reason=empty_file")
+            else:
+                temporary_destination.replace(destination)
+                print(
+                    f"[MIMIT] download_success url={safe_url} "
+                    f"size_bytes={destination.stat().st_size}"
+                )
+                break
+
+        if attempt >= MIMIT_DOWNLOAD_MAX_ATTEMPTS:
+            if temporary_destination.exists():
+                temporary_destination.unlink()
+            print(f"[MIMIT] download_failed url={safe_url} attempts={attempt}")
+            raise RuntimeError("MIMIT download failed after retry attempts") from last_error
+
+        backoff_seconds = get_download_backoff_seconds(attempt)
+        print(
+            f"[MIMIT] download_retry url={safe_url} "
+            f"next_attempt={attempt + 1} backoff_seconds={backoff_seconds}"
+        )
+        time.sleep(backoff_seconds)
 
     if not temporary_destination.exists() or temporary_destination.stat().st_size == 0:
-        raise RuntimeError(f"Downloaded file is empty: {url}")
-
-    temporary_destination.replace(destination)
+        if not destination.exists() or destination.stat().st_size == 0:
+            raise RuntimeError("MIMIT download did not produce a valid file")
 
     parsed_last_modified = None
     if last_modified:

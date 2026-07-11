@@ -51,6 +51,16 @@ PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
 EMAIL_VERIFICATION_TTL_HOURS = int(os.getenv("EMAIL_VERIFICATION_TTL_HOURS", "24"))
+EMAIL_VERIFICATION_MAX_ATTEMPTS = max(1, int(os.getenv("EMAIL_VERIFICATION_MAX_ATTEMPTS", "5")))
+AUTH_LOGIN_RATE_LIMIT = max(1, int(os.getenv("AUTH_LOGIN_RATE_LIMIT", "5")))
+AUTH_LOGIN_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_LOGIN_RATE_WINDOW_SECONDS", str(5 * 60))))
+AUTH_REGISTER_RATE_LIMIT = max(1, int(os.getenv("AUTH_REGISTER_RATE_LIMIT", "5")))
+AUTH_REGISTER_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_REGISTER_RATE_WINDOW_SECONDS", str(60 * 60))))
+AUTH_RESEND_RATE_LIMIT = max(1, int(os.getenv("AUTH_RESEND_RATE_LIMIT", "3")))
+AUTH_RESEND_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_RESEND_RATE_WINDOW_SECONDS", str(60 * 60))))
+AUTH_VERIFY_RATE_LIMIT = max(1, int(os.getenv("AUTH_VERIFY_RATE_LIMIT", "10")))
+AUTH_VERIFY_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_VERIFY_RATE_WINDOW_SECONDS", str(10 * 60))))
+AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
@@ -159,6 +169,7 @@ class LoginRequest(BaseModel):
 class EmailVerificationRequest(BaseModel):
     token: str | None = None
     code: str | None = None
+    email: EmailStr | None = None
 
 
 class ResendEmailVerificationRequest(BaseModel):
@@ -307,6 +318,138 @@ def notification_preferences_log(message: str) -> None:
 
 def user_location_log(message: str) -> None:
     print(f"[USER_LOCATION] {message}")
+
+
+def auth_rate_limit_log(message: str) -> None:
+    print(f"[AUTH][RATE_LIMIT] {message}")
+
+
+def get_request_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        first_hop = forwarded_for.split(",", 1)[0].strip()
+        if first_hop:
+            return first_hop
+
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def build_rate_limit_bucket(*parts: str | None) -> str:
+    normalized_parts = [
+        (part or "").strip().lower()
+        for part in parts
+        if part is not None and str(part).strip()
+    ]
+    return "|".join(normalized_parts) or "unknown"
+
+
+def ensure_auth_rate_limit_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_rate_limits (
+                id BIGSERIAL PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                bucket_hash TEXT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (endpoint, bucket_hash)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_updated_at
+            ON auth_rate_limits(updated_at);
+            """
+        )
+
+
+def maybe_cleanup_auth_rate_limits(conn) -> None:
+    if secrets.randbelow(100) != 0:
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM auth_rate_limits
+            WHERE updated_at < NOW() - (%s * INTERVAL '1 hour');
+            """,
+            (AUTH_RATE_LIMIT_RETENTION_HOURS,),
+        )
+
+
+def check_auth_rate_limit(
+    endpoint: str,
+    bucket: str,
+    *,
+    limit: int,
+    window_seconds: int,
+) -> None:
+    bucket_hash = hash_token(bucket)
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_auth_rate_limit_schema(conn)
+            maybe_cleanup_auth_rate_limits(conn)
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO auth_rate_limits (
+                        endpoint,
+                        bucket_hash,
+                        window_start,
+                        request_count,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, NOW(), 1, NOW(), NOW())
+                    ON CONFLICT (endpoint, bucket_hash) DO UPDATE SET
+                        window_start = CASE
+                            WHEN auth_rate_limits.window_start <= NOW() - (%s * INTERVAL '1 second')
+                            THEN NOW()
+                            ELSE auth_rate_limits.window_start
+                        END,
+                        request_count = CASE
+                            WHEN auth_rate_limits.window_start <= NOW() - (%s * INTERVAL '1 second')
+                            THEN 1
+                            ELSE auth_rate_limits.request_count + 1
+                        END,
+                        updated_at = NOW()
+                    RETURNING request_count;
+                    """,
+                    (
+                        endpoint,
+                        bucket_hash,
+                        window_seconds,
+                        window_seconds,
+                    ),
+                )
+                row = cur.fetchone()
+
+        request_count = int(row["request_count"]) if row else limit + 1
+        remaining = max(0, limit - request_count)
+        if request_count > limit:
+            auth_rate_limit_log(
+                f"rate_limit_hit=true endpoint={endpoint} "
+                f"bucket={bucket_hash[:12]} remaining={remaining}"
+            )
+            raise APIError(
+                429,
+                "RATE_LIMITED",
+                "Troppi tentativi. Riprova più tardi.",
+            )
+    finally:
+        conn.close()
 
 
 def normalize_device_token(value: str | None) -> str:
@@ -995,12 +1138,15 @@ def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
         cur.execute(
             """
             UPDATE email_verification_tokens
-            SET used_at = NOW()
+            SET used_at = NOW(),
+                locked_at = COALESCE(locked_at, NOW()),
+                last_attempt_at = COALESCE(last_attempt_at, NOW())
             WHERE user_id = %s
               AND used_at IS NULL;
             """,
             (user_id,),
         )
+        invalidated_previous = cur.rowcount > 0
         row = None
         verification_code = None
         for _ in range(10):
@@ -1012,9 +1158,10 @@ def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
                     token_hash,
                     code_hash,
                     expires_at,
+                    failed_attempts,
                     created_at
                 )
-                VALUES (%s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, 0, NOW())
                 ON CONFLICT (code_hash) WHERE used_at IS NULL DO NOTHING
                 RETURNING id, user_id, expires_at, created_at;
                 """,
@@ -1032,10 +1179,77 @@ def create_email_verification_token(conn, user_id: int) -> dict[str, Any]:
         "token": token,
         "code": verification_code,
         "row": dict(row),
+        "invalidated_previous": invalidated_previous,
     }
 
 
-def verify_email_token(conn, credential: str) -> dict[str, Any]:
+def register_email_verification_failed_attempt(conn, email: str | None = None) -> None:
+    if not email:
+        print("[AUTH][EMAIL] verification_attempt_failed")
+        return
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                evt.id,
+                evt.failed_attempts,
+                evt.locked_at
+            FROM email_verification_tokens evt
+            JOIN users u ON u.id = evt.user_id
+            WHERE u.email = %s
+              AND evt.used_at IS NULL
+            ORDER BY evt.created_at DESC, evt.id DESC
+            LIMIT 1
+            FOR UPDATE;
+            """,
+            (email,),
+        )
+        token_row = cur.fetchone()
+        if token_row is None:
+            print("[AUTH][EMAIL] verification_attempt_failed")
+            return
+
+        if token_row["locked_at"] is not None:
+            print("[AUTH][EMAIL] verification_attempts_exceeded")
+            raise APIError(
+                400,
+                "VERIFICATION_ATTEMPTS_EXCEEDED",
+                "Troppi tentativi. Richiedi un nuovo codice.",
+            )
+
+        next_failed_attempts = int(token_row["failed_attempts"] or 0) + 1
+        attempts_exceeded = next_failed_attempts >= EMAIL_VERIFICATION_MAX_ATTEMPTS
+        cur.execute(
+            """
+            UPDATE email_verification_tokens
+            SET failed_attempts = %s,
+                last_attempt_at = NOW(),
+                locked_at = CASE WHEN %s THEN NOW() ELSE locked_at END,
+                used_at = CASE WHEN %s THEN NOW() ELSE used_at END
+            WHERE id = %s;
+            """,
+            (
+                next_failed_attempts,
+                attempts_exceeded,
+                attempts_exceeded,
+                token_row["id"],
+            ),
+        )
+        conn.commit()
+
+    if attempts_exceeded:
+        print("[AUTH][EMAIL] verification_attempts_exceeded")
+        raise APIError(
+            400,
+            "VERIFICATION_ATTEMPTS_EXCEEDED",
+            "Troppi tentativi. Richiedi un nuovo codice.",
+        )
+
+    print("[AUTH][EMAIL] verification_attempt_failed")
+
+
+def verify_email_token(conn, credential: str, email: str | None = None) -> dict[str, Any]:
     normalized_credential = credential.strip()
     if not normalized_credential:
         raise APIError(400, "VERIFICATION_CODE_INVALID", "Invalid verification code or token")
@@ -1049,6 +1263,8 @@ def verify_email_token(conn, credential: str) -> dict[str, Any]:
                 evt.id,
                 evt.user_id,
                 evt.used_at,
+                evt.failed_attempts,
+                evt.locked_at,
                 evt.expires_at <= NOW() AS is_expired,
                 u.is_email_verified,
                 u.is_active
@@ -1062,7 +1278,26 @@ def verify_email_token(conn, credential: str) -> dict[str, Any]:
         )
         token_row = cur.fetchone()
         if token_row is None:
+            register_email_verification_failed_attempt(conn, email)
             raise APIError(400, "VERIFICATION_CODE_INVALID", "Invalid verification code or token")
+        if token_row["locked_at"] is not None or int(token_row["failed_attempts"] or 0) >= EMAIL_VERIFICATION_MAX_ATTEMPTS:
+            cur.execute(
+                """
+                UPDATE email_verification_tokens
+                SET locked_at = COALESCE(locked_at, NOW()),
+                    used_at = COALESCE(used_at, NOW()),
+                    last_attempt_at = NOW()
+                WHERE id = %s;
+                """,
+                (token_row["id"],),
+            )
+            conn.commit()
+            print("[AUTH][EMAIL] verification_attempts_exceeded")
+            raise APIError(
+                400,
+                "VERIFICATION_ATTEMPTS_EXCEEDED",
+                "Troppi tentativi. Richiedi un nuovo codice.",
+            )
         if token_row["is_email_verified"]:
             raise APIError(409, "ACCOUNT_ALREADY_VERIFIED", "Email address is already verified")
         if token_row["is_expired"]:
@@ -1098,6 +1333,7 @@ def verify_email_token(conn, credential: str) -> dict[str, Any]:
             (token_row["user_id"],),
         )
 
+    print("[AUTH][EMAIL] verification_success")
     return dict(user_row)
 
 
@@ -2241,12 +2477,18 @@ def ensure_auth_schema(conn) -> None:
                 token_hash TEXT NOT NULL UNIQUE,
                 code_hash TEXT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_at TIMESTAMPTZ NULL,
+                last_attempt_at TIMESTAMPTZ NULL,
                 used_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
         cur.execute("ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS code_hash TEXT NULL;")
+        cur.execute("ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0;")
+        cur.execute("ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ NULL;")
+        cur.execute("ALTER TABLE email_verification_tokens ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ NULL;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS rewards (
@@ -2385,6 +2627,7 @@ def ensure_auth_schema(conn) -> None:
             WHERE status = 'active';
             """
         )
+        ensure_auth_rate_limit_schema(conn)
         ensure_auth_provider_schema(conn)
         ensure_user_device_tokens_schema(conn)
         ensure_user_locations_schema(conn)
@@ -3644,7 +3887,15 @@ def admin_process_price_notifications(
 
 
 @app.post("/auth/register")
-def register_user(payload: RegisterRequest) -> dict[str, Any]:
+def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
+    client_ip = get_request_ip(request)
+    check_auth_rate_limit(
+        "/auth/register",
+        build_rate_limit_bucket(client_ip),
+        limit=AUTH_REGISTER_RATE_LIMIT,
+        window_seconds=AUTH_REGISTER_RATE_WINDOW_SECONDS,
+    )
+
     email = normalize_email(str(payload.email))
     display_name = sanitize_display_name(payload.display_name) or default_display_name_from_email(email)
     referral_code_input = normalize_referral_code_input(payload.referral_code)
@@ -3752,9 +4003,19 @@ def register_user(payload: RegisterRequest) -> dict[str, Any]:
 
 
 @app.post("/auth/verify-email")
-def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
+def verify_email(payload: EmailVerificationRequest, request: Request) -> dict[str, Any]:
     print("[AUTH][EMAIL] verify endpoint reached")
     credential = (payload.code or payload.token or "").strip()
+    email = normalize_email(str(payload.email)) if payload.email else None
+    client_ip = get_request_ip(request)
+    verify_bucket = build_rate_limit_bucket(email) if email else build_rate_limit_bucket(client_ip)
+    check_auth_rate_limit(
+        "/auth/verify-email",
+        verify_bucket,
+        limit=AUTH_VERIFY_RATE_LIMIT,
+        window_seconds=AUTH_VERIFY_RATE_WINDOW_SECONDS,
+    )
+
     if not credential:
         raise APIError(400, "VERIFICATION_CODE_INVALID", "Verification code or token is required")
     if payload.code is not None and not re.fullmatch(r"\d{6}", credential):
@@ -3763,7 +4024,7 @@ def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
     try:
         conn = get_connection()
         with conn:
-            user_row = verify_email_token(conn, credential)
+            user_row = verify_email_token(conn, credential, email=email)
             user_payload = build_user_payload(conn, user_row)
 
         print("[AUTH][EMAIL] verify success")
@@ -3782,8 +4043,17 @@ def verify_email(payload: EmailVerificationRequest) -> dict[str, Any]:
 
 
 @app.post("/auth/resend-verification-email")
-def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[str, Any]:
+def resend_email_verification(payload: ResendEmailVerificationRequest, request: Request) -> dict[str, Any]:
     print("[AUTH][EMAIL] resend endpoint reached")
+    email = normalize_email(str(payload.email))
+    client_ip = get_request_ip(request)
+    check_auth_rate_limit(
+        "/auth/resend-verification-email",
+        build_rate_limit_bucket(email, client_ip),
+        limit=AUTH_RESEND_RATE_LIMIT,
+        window_seconds=AUTH_RESEND_RATE_WINDOW_SECONDS,
+    )
+
     conn = None
     fallback_expires_at = datetime.now(timezone.utc) + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
     expires_at = fallback_expires_at
@@ -3801,7 +4071,7 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
                     WHERE email = %s
                     LIMIT 1;
                     """,
-                    (normalize_email(str(payload.email)),),
+                    (email,),
                 )
                 user_row = cur.fetchone()
 
@@ -3812,13 +4082,17 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
                 expires_at = verification_token["row"]["expires_at"]
                 should_send_email = True
                 print("[AUTH][EMAIL] resend token created=true")
+                print(
+                    "[AUTH][EMAIL] resend_invalidated_previous="
+                    f"{str(bool(verification_token.get('invalidated_previous'))).lower()}"
+                )
             else:
                 print("[AUTH][EMAIL] resend token created=false")
 
         delivery = "not_configured" if not email_delivery_is_configured() else "accepted"
         if should_send_email and verification_token_value and verification_code_value:
             delivery_result = send_verification_email(
-                to_email=normalize_email(str(payload.email)),
+                to_email=email,
                 verification_token=verification_token_value,
                 verification_code=verification_code_value,
                 expires_at=expires_at,
@@ -3845,8 +4119,15 @@ def resend_email_verification(payload: ResendEmailVerificationRequest) -> dict[s
 
 
 @app.post("/auth/login")
-def login_user(payload: LoginRequest) -> dict[str, Any]:
+def login_user(payload: LoginRequest, request: Request) -> dict[str, Any]:
     email = normalize_email(str(payload.email))
+    client_ip = get_request_ip(request)
+    check_auth_rate_limit(
+        "/auth/login",
+        build_rate_limit_bucket(email, client_ip),
+        limit=AUTH_LOGIN_RATE_LIMIT,
+        window_seconds=AUTH_LOGIN_RATE_WINDOW_SECONDS,
+    )
 
     conn = None
     try:
