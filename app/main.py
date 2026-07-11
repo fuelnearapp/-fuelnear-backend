@@ -1,4 +1,5 @@
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
@@ -24,16 +25,28 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 
 from app.import_mimit import update_mimit_data
-from app.apns_client import APNsConfigurationError, apns_is_configured, send_apns_push
+from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
 from app.email_service import email_delivery_is_configured, send_verification_email
 from app.auth_utils import (
     generate_access_token,
     generate_refresh_token,
     generate_referral_code,
     hash_password,
+    PASSWORD_MAX_LENGTH,
+    PASSWORD_MIN_LENGTH,
+    password_hash_is_legacy,
+    validate_password_length,
     verify_password,
     hash_token,
 )
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 DB_NAME = os.getenv("DB_NAME", "fuelnear")
@@ -45,10 +58,24 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
 MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(30 * 60)))
 ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
+MIMIT_ADMIN_TOKEN = os.getenv("MIMIT_ADMIN_TOKEN")
+MIMIT_ADMIN_TOKEN_PREVIOUS = os.getenv("MIMIT_ADMIN_TOKEN_PREVIOUS")
+REFERRAL_ADMIN_TOKEN = os.getenv("REFERRAL_ADMIN_TOKEN")
+REFERRAL_ADMIN_TOKEN_PREVIOUS = os.getenv("REFERRAL_ADMIN_TOKEN_PREVIOUS")
+PRICE_NOTIFICATIONS_ADMIN_TOKEN = os.getenv("PRICE_NOTIFICATIONS_ADMIN_TOKEN")
+PRICE_NOTIFICATIONS_ADMIN_TOKEN_PREVIOUS = os.getenv("PRICE_NOTIFICATIONS_ADMIN_TOKEN_PREVIOUS")
+ADMIN_DEBUG_TOKEN = os.getenv("ADMIN_DEBUG_TOKEN")
+ADMIN_DEBUG_TOKEN_PREVIOUS = os.getenv("ADMIN_DEBUG_TOKEN_PREVIOUS")
 PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
     0.0,
     float(os.getenv("PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR", "0.01")),
 )
+APNS_MAX_CONCURRENCY = max(1, int(os.getenv("APNS_MAX_CONCURRENCY", "5")))
+USER_LOCATION_MAX_AGE_HOURS = max(1, int(os.getenv("USER_LOCATION_MAX_AGE_HOURS", str(7 * 24))))
+USER_LOCATION_RETENTION_DAYS = max(1, int(os.getenv("USER_LOCATION_RETENTION_DAYS", "30")))
+ENABLE_ADMIN_DEBUG_ENDPOINTS = env_flag("ENABLE_ADMIN_DEBUG_ENDPOINTS", False)
+ENABLE_ADMIN_TEST_PUSH = env_flag("ENABLE_ADMIN_TEST_PUSH", False)
+ENABLE_LEGACY_ADMIN_TOKEN_FALLBACK = env_flag("ENABLE_LEGACY_ADMIN_TOKEN_FALLBACK", False)
 
 ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
@@ -382,6 +409,38 @@ def notification_preferences_log(message: str) -> None:
 
 def user_location_log(message: str) -> None:
     print(f"[USER_LOCATION] {message}")
+
+
+def user_location_max_age_delta() -> timedelta:
+    return timedelta(hours=USER_LOCATION_MAX_AGE_HOURS)
+
+
+def is_user_location_fresh(updated_at: Any, now: datetime | None = None) -> bool:
+    if not isinstance(updated_at, datetime):
+        return False
+
+    reference_now = now or datetime.now(timezone.utc)
+    normalized_updated_at = updated_at
+    if normalized_updated_at.tzinfo is None:
+        normalized_updated_at = normalized_updated_at.replace(tzinfo=timezone.utc)
+
+    return normalized_updated_at >= reference_now - user_location_max_age_delta()
+
+
+def cleanup_expired_user_locations(conn) -> int:
+    ensure_user_locations_schema(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM user_locations
+            WHERE updated_at < NOW() - (%s * INTERVAL '1 day');
+            """,
+            (USER_LOCATION_RETENTION_DAYS,),
+        )
+        cleaned_count = cur.rowcount or 0
+
+    user_location_log(f"stale_locations_cleaned_count={cleaned_count}")
+    return cleaned_count
 
 
 def auth_rate_limit_log(message: str) -> None:
@@ -2045,12 +2104,91 @@ def release_mimit_update_lock(conn) -> None:
         )
 
 
-def require_admin_update_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
-    if not ADMIN_UPDATE_TOKEN:
-        raise HTTPException(status_code=500, detail="ADMIN_UPDATE_TOKEN is not configured")
+def configured_admin_tokens(*tokens: str | None, include_legacy: bool = False) -> list[str]:
+    configured = [token.strip() for token in tokens if token and token.strip()]
+    if include_legacy and ENABLE_LEGACY_ADMIN_TOKEN_FALLBACK and ADMIN_UPDATE_TOKEN and ADMIN_UPDATE_TOKEN.strip():
+        configured.append(ADMIN_UPDATE_TOKEN.strip())
+    return configured
 
-    if not x_admin_token or x_admin_token != ADMIN_UPDATE_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+def admin_token_matches(provided_token: str | None, allowed_tokens: list[str]) -> bool:
+    if not provided_token:
+        return False
+
+    normalized_provided_token = provided_token.strip()
+    if not normalized_provided_token:
+        return False
+
+    return any(hmac.compare_digest(normalized_provided_token, allowed_token) for allowed_token in allowed_tokens)
+
+
+def require_admin_token_for_scope(
+    scope: str,
+    provided_token: str | None,
+    *tokens: str | None,
+    include_legacy: bool = True,
+) -> None:
+    allowed_tokens = configured_admin_tokens(*tokens, include_legacy=include_legacy)
+    if not allowed_tokens:
+        print(f"[ADMIN] admin_token_not_configured scope={scope}")
+        raise HTTPException(status_code=500, detail="Admin authentication is not configured")
+
+    if not admin_token_matches(provided_token, allowed_tokens):
+        print(f"[ADMIN] admin_token_rejected scope={scope}")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_mimit_admin_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    require_admin_token_for_scope(
+        "mimit",
+        x_admin_token,
+        MIMIT_ADMIN_TOKEN,
+        MIMIT_ADMIN_TOKEN_PREVIOUS,
+    )
+
+
+def require_referral_admin_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    require_admin_token_for_scope(
+        "referral",
+        x_admin_token,
+        REFERRAL_ADMIN_TOKEN,
+        REFERRAL_ADMIN_TOKEN_PREVIOUS,
+    )
+
+
+def require_price_notifications_admin_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    require_admin_token_for_scope(
+        "price_notifications",
+        x_admin_token,
+        PRICE_NOTIFICATIONS_ADMIN_TOKEN,
+        PRICE_NOTIFICATIONS_ADMIN_TOKEN_PREVIOUS,
+    )
+
+
+def require_admin_debug_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    require_admin_token_for_scope(
+        "admin_debug",
+        x_admin_token,
+        ADMIN_DEBUG_TOKEN,
+        ADMIN_DEBUG_TOKEN_PREVIOUS,
+        include_legacy=False,
+    )
+
+
+def log_disabled_admin_endpoint(endpoint: str, mode: str) -> None:
+    print(f"[ADMIN] admin_endpoint_disabled endpoint={endpoint} mode={mode}")
+
+
+def require_admin_debug_endpoints_enabled(request: Request) -> None:
+    if not ENABLE_ADMIN_DEBUG_ENDPOINTS:
+        log_disabled_admin_endpoint(request.url.path, "debug")
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def require_admin_test_push_enabled(request: Request) -> None:
+    if not ENABLE_ADMIN_TEST_PUSH:
+        log_disabled_admin_endpoint(request.url.path, "test_push")
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def ensure_mimit_import_schema(conn) -> None:
@@ -2399,6 +2537,11 @@ def ensure_sent_price_notifications_schema(conn) -> None:
                 station_id BIGINT NULL REFERENCES stations(id) ON DELETE SET NULL,
                 price DOUBLE PRECISION NULL CHECK (price > 0),
                 distance_km DOUBLE PRECISION NULL CHECK (distance_km >= 0),
+                send_attempts INTEGER NOT NULL DEFAULT 0,
+                last_error_temporary BOOLEAN NULL,
+                last_status_code INTEGER NULL,
+                last_reason TEXT NULL,
+                processing_started_at TIMESTAMPTZ NULL,
                 sent_at TIMESTAMPTZ NULL,
                 status TEXT NOT NULL
                     CHECK (status IN ('processing', 'sent', 'failed')),
@@ -2410,6 +2553,11 @@ def ensure_sent_price_notifications_schema(conn) -> None:
         )
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS distance_km DOUBLE PRECISION NULL;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS send_attempts INTEGER NOT NULL DEFAULT 0;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_error_temporary BOOLEAN NULL;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_status_code INTEGER NULL;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_reason TEXT NULL;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ NULL;")
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sent_price_notifications_run_status
@@ -2896,18 +3044,77 @@ def truncate_price_notification_station_name(value: str, max_length: int = 28) -
     return f"{shortened}..."
 
 
+def send_price_notification_to_devices(
+    *,
+    apns_client: APNsPushClient,
+    device_tokens: list[dict[str, Any]],
+    title: str,
+    body: str,
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not device_tokens:
+        return []
+
+    max_workers = min(APNS_MAX_CONCURRENCY, len(device_tokens))
+
+    def send_one(token_row: dict[str, Any]) -> dict[str, Any]:
+        device_token = token_row["device_token"]
+        try:
+            result = apns_client.send_push(
+                device_token=device_token,
+                title=title,
+                body=body,
+                environment=token_row.get("environment"),
+                payload=payload,
+            )
+        except APNsConfigurationError:
+            raise
+        except Exception as exc:
+            result = {
+                "success": False,
+                "status_code": None,
+                "reason": exc.__class__.__name__,
+                "invalid_token": False,
+                "temporary_error": True,
+                "environment": token_row.get("environment"),
+                "attempts": 1,
+            }
+
+        return {
+            "token_id": token_row.get("id"),
+            "token_hash_prefix": device_token_log_id(device_token),
+            "result": result,
+        }
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(send_one, token_row) for token_row in device_tokens]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    return results
+
+
 def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "mimit_run_id": mimit_run_id,
         "minimum_improvement_eur": PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR,
         "users_considered": 0,
+        "attempted_count": 0,
         "sent_count": 0,
         "failed_count": 0,
+        "temporary_failed_count": 0,
+        "permanent_failed_count": 0,
+        "retried_count": 0,
         "skipped_count": 0,
         "invalid_tokens_count": 0,
+        "client_reused": False,
+        "jwt_reused": False,
+        "stale_locations_cleaned_count": 0,
         "skipped_same_price": 0,
         "skipped_worse_price": 0,
         "skipped_below_threshold": 0,
+        "skipped_stale_location": 0,
         "skip_reasons": {},
     }
 
@@ -2918,10 +3125,12 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
             "skipped_same_price",
             "skipped_worse_price",
             "skipped_below_threshold",
+            "skipped_stale_location",
         }:
             summary[reason] += 1
 
     conn = get_connection()
+    apns_client: APNsPushClient | None = None
     try:
         with conn:
             ensure_mimit_import_schema(conn)
@@ -2929,6 +3138,7 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
             ensure_user_locations_schema(conn)
             ensure_price_notification_preferences_schema(conn)
             ensure_sent_price_notifications_schema(conn)
+            summary["stale_locations_cleaned_count"] = cleanup_expired_user_locations(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -2963,6 +3173,7 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
 
         summary["users_considered"] = len(preferences)
         apns_configured = apns_is_configured()
+        apns_client = APNsPushClient()
 
         for preference in preferences:
             user_id = int(preference["user_id"])
@@ -2992,6 +3203,10 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 continue
             if preference["latitude"] is None or preference["longitude"] is None:
                 skip("skipped_no_location")
+                continue
+            if not is_user_location_fresh(preference["location_updated_at"]):
+                user_location_log("location_present=true location_stale=true")
+                skip("skipped_stale_location")
                 continue
             if not apns_configured:
                 skip("skipped_apns_not_configured")
@@ -3053,12 +3268,28 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                             price,
                             distance_km,
                             status,
+                            processing_started_at,
+                            last_error_temporary,
+                            last_status_code,
+                            last_reason,
                             created_at,
                             updated_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, 'processing', NOW(), NOW())
-                        ON CONFLICT (user_id, mimit_run_id) DO NOTHING
-                        RETURNING id;
+                        VALUES (%s, %s, %s, %s, %s, %s, 'processing', NOW(), NULL, NULL, NULL, NOW(), NOW())
+                        ON CONFLICT (user_id, mimit_run_id) DO UPDATE SET
+                            fuel_type = EXCLUDED.fuel_type,
+                            station_id = EXCLUDED.station_id,
+                            price = EXCLUDED.price,
+                            distance_km = EXCLUDED.distance_km,
+                            status = 'processing',
+                            processing_started_at = NOW(),
+                            last_error_temporary = NULL,
+                            last_status_code = NULL,
+                            last_reason = NULL,
+                            updated_at = NOW()
+                        WHERE sent_price_notifications.status = 'failed'
+                          AND sent_price_notifications.last_error_temporary IS TRUE
+                        RETURNING sent_price_notifications.id;
                         """,
                         (
                             user_id,
@@ -3083,49 +3314,73 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 f"{fuel_label} a {formatted_price} €/L da {station_name}, "
                 f"a {formatted_distance} km da te."
             )
-            any_sent = False
+            push_payload = {
+                "type": "price_alert",
+                "station_id": int(best_price["station_id"]),
+                "fuel_type": fuel_type,
+                "price": current_price,
+                "distance_km": distance_km,
+            }
+            send_results: list[dict[str, Any]] = []
+            configuration_error = False
+            try:
+                send_results = send_price_notification_to_devices(
+                    apns_client=apns_client,
+                    device_tokens=device_tokens,
+                    title="FuelNear",
+                    body=body,
+                    payload=push_payload,
+                )
+            except APNsConfigurationError as exc:
+                configuration_error = True
+                summary["permanent_failed_count"] += 1
+                print(
+                    f"[PRICE_NOTIFICATIONS] APNs configuration failure "
+                    f"type={exc.__class__.__name__}"
+                )
 
-            for token_row in device_tokens:
-                device_token = token_row["device_token"]
-                try:
-                    result = send_apns_push(
-                        device_token=device_token,
-                        title="FuelNear",
-                        body=body,
-                        environment=token_row.get("environment"),
-                        payload={
-                            "type": "price_alert",
-                            "station_id": int(best_price["station_id"]),
-                            "fuel_type": fuel_type,
-                            "price": current_price,
-                            "distance_km": distance_km,
-                        },
-                    )
-                except APNsConfigurationError as exc:
-                    print(
-                        f"[PRICE_NOTIFICATIONS] APNs configuration failure "
-                        f"type={exc.__class__.__name__}"
-                    )
-                    continue
+            any_sent = False
+            any_temporary_failed = False
+            last_status_code: int | None = None
+            last_reason: str | None = "APNsConfigurationError" if configuration_error else None
+            send_attempts = 0
+
+            for send_result in send_results:
+                result = send_result["result"]
+                attempts = max(1, int(result.get("attempts") or 1))
+                send_attempts += attempts
+                summary["attempted_count"] += 1
+                summary["retried_count"] += max(0, attempts - 1)
 
                 any_sent = any_sent or bool(result["success"])
                 if result["invalid_token"]:
                     summary["invalid_tokens_count"] += 1
-                    with conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE user_device_tokens
-                                SET is_active = FALSE,
-                                    updated_at = NOW()
-                                WHERE id = %s;
-                                """,
-                                (token_row["id"],),
-                            )
+                    token_id = send_result.get("token_id")
+                    if token_id is not None:
+                        with conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE user_device_tokens
+                                    SET is_active = FALSE,
+                                        updated_at = NOW()
+                                    WHERE id = %s;
+                                    """,
+                                    (token_id,),
+                                )
 
                 if not result["success"]:
+                    if result["temporary_error"]:
+                        summary["temporary_failed_count"] += 1
+                        any_temporary_failed = True
+                    else:
+                        summary["permanent_failed_count"] += 1
+
+                    last_status_code = result["status_code"]
+                    last_reason = str(result["reason"] or "")[:128] or None
                     print(
                         f"[PRICE_NOTIFICATIONS] APNs send failed "
+                        f"token hash prefix={send_result['token_hash_prefix']} "
                         f"status_code={result['status_code']} "
                         f"temporary={result['temporary_error']} reason={result['reason']}"
                     )
@@ -3138,10 +3393,25 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                         UPDATE sent_price_notifications
                         SET status = %s,
                             sent_at = CASE WHEN %s = 'sent' THEN NOW() ELSE NULL END,
+                            send_attempts = send_attempts + %s,
+                            last_error_temporary = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
+                            last_status_code = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
+                            last_reason = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
                             updated_at = NOW()
                         WHERE id = %s;
                         """,
-                        (final_status, final_status, notification_row[0]),
+                        (
+                            final_status,
+                            final_status,
+                            send_attempts,
+                            final_status,
+                            any_temporary_failed,
+                            final_status,
+                            last_status_code,
+                            final_status,
+                            last_reason,
+                            notification_row[0],
+                        ),
                     )
 
             if any_sent:
@@ -3149,17 +3419,24 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
             else:
                 summary["failed_count"] += 1
 
+        summary["client_reused"] = bool(apns_client.client_reused) if apns_client else False
+        summary["jwt_reused"] = bool(apns_client.jwt_reused) if apns_client else False
         print(
             f"[PRICE_NOTIFICATIONS] run_id={mimit_run_id} "
-            f"users_considered={summary['users_considered']} sent={summary['sent_count']} "
-            f"skipped={summary['skipped_count']} failed={summary['failed_count']} "
+            f"users_considered={summary['users_considered']} attempted={summary['attempted_count']} "
+            f"sent={summary['sent_count']} skipped={summary['skipped_count']} "
+            f"failed={summary['failed_count']} temporary_failed={summary['temporary_failed_count']} "
+            f"permanent_failed={summary['permanent_failed_count']} retried={summary['retried_count']} "
             f"invalid_tokens={summary['invalid_tokens_count']} "
+            f"client_reused={summary['client_reused']} jwt_reused={summary['jwt_reused']} "
             f"skipped_same_price={summary['skipped_same_price']} "
             f"skipped_worse_price={summary['skipped_worse_price']} "
             f"skipped_below_threshold={summary['skipped_below_threshold']}"
         )
         return summary
     finally:
+        if apns_client is not None:
+            apns_client.close()
         conn.close()
 
 
@@ -3231,7 +3508,7 @@ def run_mimit_update_background(conn, run_id: int) -> None:
 @app.get("/admin/update-mimit")
 def admin_update_mimit(
     background_tasks: BackgroundTasks,
-    _: None = Depends(require_admin_update_token),
+    _: None = Depends(require_mimit_admin_token),
 ) -> dict[str, Any]:
     conn = get_connection()
     run_id: int | None = None
@@ -3410,7 +3687,10 @@ def get_mimit_status() -> dict[str, Any]:
 
 
 @app.get("/debug/mimit-status")
-def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+def debug_mimit_status(
+    _: None = Depends(require_admin_debug_endpoints_enabled),
+    __: None = Depends(require_admin_debug_token),
+) -> dict[str, Any]:
     conn = get_connection()
     try:
         with conn:
@@ -3488,7 +3768,10 @@ def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[st
 
 
 @app.post("/admin/mimit-lock-check")
-def admin_mimit_lock_check(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+def admin_mimit_lock_check(
+    _: None = Depends(require_admin_debug_endpoints_enabled),
+    __: None = Depends(require_admin_debug_token),
+) -> dict[str, Any]:
     conn = get_connection()
     probe_lock_acquired = False
 
@@ -3554,7 +3837,8 @@ def admin_mimit_lock_check(_: None = Depends(require_admin_update_token)) -> dic
 
 @app.get("/admin/mimit-diagnostics")
 def admin_mimit_diagnostics(
-    _: None = Depends(require_admin_update_token),
+    _: None = Depends(require_admin_debug_endpoints_enabled),
+    __: None = Depends(require_admin_debug_token),
     lat: float = Query(default=41.4477, description="Default: Anzio latitude"),
     lng: float = Query(default=12.6297, description="Default: Anzio longitude"),
     radius_km: float = Query(default=10.0, gt=0, le=100),
@@ -3805,7 +4089,7 @@ def admin_mimit_diagnostics(
 # === ADMIN REFERRAL PROCESSING ENDPOINT ===
 
 @app.post("/admin/process-referrals")
-def admin_process_referrals(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
+def admin_process_referrals(_: None = Depends(require_referral_admin_token)) -> dict[str, Any]:
     conn = None
     try:
         conn = get_connection()
@@ -3835,7 +4119,8 @@ def admin_process_referrals(_: None = Depends(require_admin_update_token)) -> di
 @app.post("/admin/test-push")
 def admin_test_push(
     payload: AdminTestPushRequest,
-    _: None = Depends(require_admin_update_token),
+    _: None = Depends(require_admin_test_push_enabled),
+    __: None = Depends(require_admin_debug_token),
 ) -> dict[str, Any]:
     title = normalize_push_text(payload.title, "title")
     body = normalize_push_text(payload.body, "body")
@@ -3899,70 +4184,71 @@ def admin_test_push(
         invalid_token_count = 0
         items: list[dict[str, Any]] = []
 
-        for target in targets:
-            device_token = target["device_token"]
-            token_log_id = device_token_log_id(device_token)
+        with APNsPushClient() as apns_client:
+            for target in targets:
+                device_token = target["device_token"]
+                token_log_id = device_token_log_id(device_token)
 
-            try:
-                result = send_apns_push(
-                    device_token=device_token,
-                    title=title,
-                    body=body,
-                    environment=target.get("environment"),
-                    payload=payload.payload,
-                )
-            except APNsConfigurationError as exc:
-                request_id = log_internal_exception(
-                    "admin_test_push_apns_configuration",
-                    exc,
-                    token_hash_prefix=token_log_id,
-                )
+                try:
+                    result = apns_client.send_push(
+                        device_token=device_token,
+                        title=title,
+                        body=body,
+                        environment=target.get("environment"),
+                        payload=payload.payload,
+                    )
+                except APNsConfigurationError as exc:
+                    request_id = log_internal_exception(
+                        "admin_test_push_apns_configuration",
+                        exc,
+                        token_hash_prefix=token_log_id,
+                    )
+                    print(
+                        "[APNS] send failed "
+                        f"token hash prefix={token_log_id} request_id={request_id}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"APNs test push failed. request_id={request_id}",
+                    )
+
+                if result["success"]:
+                    sent_success_count += 1
+                else:
+                    sent_failure_count += 1
+
+                if result["invalid_token"]:
+                    invalid_token_count += 1
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                UPDATE user_device_tokens
+                                SET is_active = FALSE,
+                                    updated_at = NOW()
+                                WHERE device_token = %s;
+                                """,
+                                (device_token,),
+                            )
+
                 print(
-                    "[APNS] send failed "
-                    f"token hash prefix={token_log_id} request_id={request_id}"
+                    "[APNS] send result "
+                    f"token hash prefix={token_log_id} "
+                    f"success={result['success']} "
+                    f"status_code={result['status_code']} "
+                    f"reason={result['reason']}"
                 )
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"APNs test push failed. request_id={request_id}",
+                items.append(
+                    {
+                        "token_hash_prefix": token_log_id,
+                        "success": result["success"],
+                        "status_code": result["status_code"],
+                        "reason": result["reason"],
+                        "invalid_token": result["invalid_token"],
+                        "temporary_error": result["temporary_error"],
+                        "environment": result["environment"],
+                    }
                 )
-
-            if result["success"]:
-                sent_success_count += 1
-            else:
-                sent_failure_count += 1
-
-            if result["invalid_token"]:
-                invalid_token_count += 1
-                with conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE user_device_tokens
-                            SET is_active = FALSE,
-                                updated_at = NOW()
-                            WHERE device_token = %s;
-                            """,
-                            (device_token,),
-                        )
-
-            print(
-                "[APNS] send result "
-                f"token hash prefix={token_log_id} "
-                f"success={result['success']} "
-                f"status_code={result['status_code']} "
-                f"reason={result['reason']}"
-            )
-            items.append(
-                {
-                    "token_hash_prefix": token_log_id,
-                    "success": result["success"],
-                    "status_code": result["status_code"],
-                    "reason": result["reason"],
-                    "invalid_token": result["invalid_token"],
-                    "temporary_error": result["temporary_error"],
-                    "environment": result["environment"],
-                }
-            )
 
         print(f"[APNS] sent success count={sent_success_count} failure count={sent_failure_count}")
         return {
@@ -3986,7 +4272,7 @@ def admin_test_push(
 
 @app.post("/admin/process-price-notifications")
 def admin_process_price_notifications(
-    _: None = Depends(require_admin_update_token),
+    _: None = Depends(require_price_notifications_admin_token),
 ) -> dict[str, Any]:
     conn = get_connection()
     try:
@@ -4065,6 +4351,7 @@ def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
                 if referral_code_input:
                     referrer_user_id = resolve_active_referrer_id(cur, referral_code_input)
 
+                validate_password_length(payload.password)
                 password_hash_value = hash_password(payload.password)
                 user_referral_code = generate_unique_referral_code(conn)
 
@@ -4136,8 +4423,10 @@ def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
     except HTTPException:
         raise
     except ValueError as exc:
-        if str(exc) == "Password must be at least 8 characters long":
-            raise APIError(400, "PASSWORD_TOO_SHORT", "Password must be at least 8 characters long")
+        if str(exc) == "Password is too short":
+            raise APIError(400, "PASSWORD_TOO_SHORT", f"Password must be at least {PASSWORD_MIN_LENGTH} characters long")
+        if str(exc) == "Password is too long":
+            raise APIError(400, "PASSWORD_TOO_LONG", f"Password must be at most {PASSWORD_MAX_LENGTH} characters long")
         raise APIError(400, "INVALID_REQUEST", "Invalid registration request")
     except psycopg2.errors.UniqueViolation as exc:
         constraint_name = getattr(exc.diag, "constraint_name", None)
@@ -4272,6 +4561,13 @@ def resend_email_verification(payload: ResendEmailVerificationRequest, request: 
 @app.post("/auth/login")
 def login_user(payload: LoginRequest, request: Request) -> dict[str, Any]:
     email = normalize_email(str(payload.email))
+    try:
+        validate_password_length(payload.password, check_minimum=False)
+    except ValueError as exc:
+        if str(exc) == "Password is too long":
+            raise APIError(400, "PASSWORD_TOO_LONG", f"Password must be at most {PASSWORD_MAX_LENGTH} characters long")
+        raise APIError(401, "INVALID_CREDENTIALS", "Invalid email or password")
+
     client_ip = get_request_ip(request)
     check_auth_rate_limit(
         "/auth/login",
@@ -4303,11 +4599,32 @@ def login_user(payload: LoginRequest, request: Request) -> dict[str, Any]:
                 if not verify_password(payload.password, user_row["password_hash"]):
                     raise APIError(401, "INVALID_CREDENTIALS", "Invalid email or password")
 
+                password_hash_legacy = password_hash_is_legacy(user_row["password_hash"])
+                password_rehash_performed = False
+                print(f"[AUTH] password_hash_legacy={str(password_hash_legacy).lower()}")
+
                 if not user_row["is_active"]:
                     raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
 
                 if not user_row["is_email_verified"]:
                     raise APIError(403, "EMAIL_NOT_VERIFIED", "Email verification required")
+
+                if password_hash_legacy:
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET password_hash = %s,
+                            updated_at = NOW()
+                        WHERE id = %s;
+                        """,
+                        (
+                            hash_password(payload.password),
+                            user_row["id"],
+                        ),
+                    )
+                    password_rehash_performed = True
+
+                print(f"[AUTH] password_rehash_performed={str(password_rehash_performed).lower()}")
 
                 session_payload = create_user_session(
                     conn,
@@ -4622,7 +4939,7 @@ def upsert_current_user_location(
     user_location_log("location update endpoint reached")
     user_payload = get_current_user_from_token(authorization)
     user_id = int(user_payload["id"])
-    user_location_log(f"user_id={user_id} has_location=true")
+    user_location_log(f"user_id={user_id} location_present=true location_stale=false")
 
     if not isfinite(payload.lat) or not -90 <= payload.lat <= 90:
         raise HTTPException(status_code=400, detail="Invalid latitude")
@@ -4714,10 +5031,24 @@ def get_current_user_location(
                 location = cur.fetchone()
 
         has_location = location is not None
-        user_location_log(f"location get user_id={user_id} has_location={has_location}")
+        location_stale = bool(location and not is_user_location_fresh(location["updated_at"]))
+        user_location_log(
+            f"location get user_id={user_id} "
+            f"location_present={str(has_location).lower()} "
+            f"location_stale={str(location_stale).lower()}"
+        )
+        if location_stale:
+            return {
+                "status": "ok",
+                "has_location": False,
+                "location_stale": True,
+                "location": None,
+            }
+
         return {
             "status": "ok",
             "has_location": has_location,
+            "location_stale": False,
             "location": serialize_datetime_fields(
                 [dict(location)],
                 ["created_at", "updated_at"],
@@ -4726,6 +5057,40 @@ def get_current_user_location(
     except Exception as exc:
         user_location_log(f"location get failed user_id={user_id} type={exc.__class__.__name__}")
         raise HTTPException(status_code=500, detail="Location get failed")
+    finally:
+        conn.close()
+
+
+@app.delete("/user/location")
+def delete_current_user_location(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = int(user_payload["id"])
+
+    conn = get_connection()
+    try:
+        with conn:
+            ensure_user_locations_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM user_locations
+                    WHERE user_id = %s;
+                    """,
+                    (user_id,),
+                )
+                deleted = (cur.rowcount or 0) > 0
+
+        user_location_log(f"location_deleted={str(deleted).lower()} user_id={user_id}")
+        return {
+            "status": "ok",
+            "location_deleted": deleted,
+            "has_location": False,
+        }
+    except Exception as exc:
+        user_location_log(f"location delete failed user_id={user_id} type={exc.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="Location delete failed")
     finally:
         conn.close()
 

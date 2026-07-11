@@ -60,12 +60,13 @@ def main() -> int:
         return 2
 
     admin_token = (
-        os.getenv("ADMIN_UPDATE_TOKEN", "").strip()
+        os.getenv("REFERRAL_ADMIN_TOKEN", "").strip()
+        or os.getenv("ADMIN_UPDATE_TOKEN", "").strip()
         or os.getenv("ADMIN_TOKEN", "").strip()
     )
     if not admin_token:
         print(
-            "[REFERRAL CRON] Configuration error: ADMIN_UPDATE_TOKEN or ADMIN_TOKEN is required",
+            "[REFERRAL CRON] Configuration error: REFERRAL_ADMIN_TOKEN is required",
             flush=True,
         )
         return 2

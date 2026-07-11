@@ -54,9 +54,12 @@ def main() -> int:
         print(f"[MIMIT CRON] Configuration error: {exc}", flush=True)
         return 2
 
-    admin_token = os.getenv("ADMIN_UPDATE_TOKEN", "").strip()
+    admin_token = (
+        os.getenv("MIMIT_ADMIN_TOKEN", "").strip()
+        or os.getenv("ADMIN_UPDATE_TOKEN", "").strip()
+    )
     if not admin_token:
-        print("[MIMIT CRON] Configuration error: ADMIN_UPDATE_TOKEN is required", flush=True)
+        print("[MIMIT CRON] Configuration error: MIMIT_ADMIN_TOKEN is required", flush=True)
         return 2
 
     attempts = len(RETRY_DELAYS_SECONDS) + 1
