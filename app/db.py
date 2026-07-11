@@ -44,7 +44,9 @@ class PooledConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        return self._raw_connection.__exit__(exc_type, exc, tb)
+        suppress = self._raw_connection.__exit__(exc_type, exc, tb)
+        self.close()
+        return suppress
 
     def close(self) -> None:
         if self._returned:
