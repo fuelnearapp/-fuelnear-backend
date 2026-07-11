@@ -2,6 +2,7 @@ from typing import Any
 from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 from math import cos, isfinite, radians
@@ -64,6 +65,8 @@ AUTH_VERIFY_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_VERIFY_RATE_WINDOW_
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
+ACCESS_LOG_MODE = os.getenv("FUELNEAR_ACCESS_LOG_MODE", "redacted").strip().lower()
+REDACTED_ACCESS_LOG_ENABLED = ACCESS_LOG_MODE in {"redacted", "safe", "production", "1", "true", "yes"}
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
@@ -77,6 +80,9 @@ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 app = FastAPI(title="FuelNear Backend")
+
+if REDACTED_ACCESS_LOG_ENABLED:
+    logging.getLogger("uvicorn.access").disabled = True
 
 
 class APIError(HTTPException):
@@ -97,6 +103,35 @@ async def api_error_handler(_request: Request, exc: APIError) -> JSONResponse:
         },
         headers=exc.headers,
     )
+
+
+def sanitize_request_id(value: str | None) -> str:
+    if not value:
+        return secrets.token_hex(8)
+
+    safe_value = re.sub(r"[^a-zA-Z0-9_.:-]", "", value.strip())
+    return safe_value[:64] or secrets.token_hex(8)
+
+
+@app.middleware("http")
+async def redacted_access_log_middleware(request: Request, call_next):
+    if not REDACTED_ACCESS_LOG_ENABLED:
+        return await call_next(request)
+
+    request_id = sanitize_request_id(request.headers.get("x-request-id"))
+    started_at = time.monotonic()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["x-request-id"] = request_id
+        return response
+    finally:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        print(
+            f"[ACCESS] request_id={request_id} method={request.method} "
+            f"path={request.url.path} status={status_code} duration_ms={duration_ms}"
+        )
 
 
 def log_internal_exception(area: str, exc: BaseException, **context: Any) -> str:
@@ -584,7 +619,6 @@ def verify_apple_identity_token(
     identity_token: str,
     *,
     raw_nonce: str | None = None,
-    expected_nonce: str | None = None,
 ) -> dict[str, Any]:
     if not APPLE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Apple auth not configured")
@@ -610,34 +644,37 @@ def verify_apple_identity_token(
         raise HTTPException(status_code=401, detail="Invalid Apple identity token")
 
     normalized_raw_nonce = raw_nonce.strip() if raw_nonce else None
-    normalized_expected_nonce = expected_nonce.strip() if expected_nonce else None
-    if normalized_raw_nonce or normalized_expected_nonce:
-        claim_nonce = claims.get("nonce")
-        if not isinstance(claim_nonce, str) or not claim_nonce:
-            apple_auth_debug_log("token verification failed type=MissingNonce")
-            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
-
-        hashed_raw_nonce = (
-            hashlib.sha256(normalized_raw_nonce.encode("utf-8")).hexdigest()
-            if normalized_raw_nonce
-            else None
+    apple_auth_debug_log(f"apple_nonce_present={str(bool(normalized_raw_nonce)).lower()}")
+    if not normalized_raw_nonce:
+        raise APIError(
+            400,
+            "APPLE_NONCE_REQUIRED",
+            "Impossibile completare l'accesso con Apple. Riprova.",
         )
-        if (
-            hashed_raw_nonce
-            and normalized_expected_nonce
-            and not hmac.compare_digest(hashed_raw_nonce, normalized_expected_nonce)
-        ):
-            apple_auth_debug_log("token verification failed type=NonceInputMismatch")
-            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
 
-        nonce_to_verify = hashed_raw_nonce or normalized_expected_nonce
-        if nonce_to_verify is None or not hmac.compare_digest(claim_nonce, nonce_to_verify):
-            apple_auth_debug_log("token verification failed type=InvalidNonce")
-            raise HTTPException(status_code=401, detail="Invalid Apple identity token")
+    claim_nonce = claims.get("nonce")
+    token_nonce_present = isinstance(claim_nonce, str) and bool(claim_nonce)
+    apple_auth_debug_log(f"apple_token_nonce_present={str(token_nonce_present).lower()}")
+    if not token_nonce_present:
+        apple_auth_debug_log("apple_nonce_valid=false")
+        apple_auth_debug_log("token verification failed type=MissingNonce")
+        raise APIError(
+            401,
+            "APPLE_NONCE_INVALID",
+            "Impossibile completare l'accesso con Apple. Riprova.",
+        )
 
-        apple_auth_debug_log("nonce verification success")
-    else:
-        apple_auth_debug_log("nonce verification skipped input_present=false")
+    hashed_raw_nonce = hashlib.sha256(normalized_raw_nonce.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(claim_nonce, hashed_raw_nonce):
+        apple_auth_debug_log("apple_nonce_valid=false")
+        apple_auth_debug_log("token verification failed type=InvalidNonce")
+        raise APIError(
+            401,
+            "APPLE_NONCE_INVALID",
+            "Impossibile completare l'accesso con Apple. Riprova.",
+        )
+
+    apple_auth_debug_log("apple_nonce_valid=true")
 
     apple_auth_debug_log("token verification success")
     return {
@@ -1437,14 +1474,18 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
             FROM user_sessions s
             JOIN users u ON u.id = s.user_id
             WHERE s.refresh_token_hash = %s
-            LIMIT 1;
+            LIMIT 1
+            FOR UPDATE OF s;
             """,
             (refresh_token_hash,),
         )
         session = cur.fetchone()
 
         if not session:
-            raise HTTPException(status_code=401, detail="Invalid refresh token")
+            print("[AUTH] refresh_reuse_detected=true")
+            raise APIError(401, "REFRESH_TOKEN_REUSED", "Refresh token has already been used")
+
+        print("[AUTH] refresh_lock_acquired=true")
 
         if session["revoked_at"] is not None:
             print("[AUTH] refresh_session_revoked=true")
@@ -1499,7 +1540,9 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
                 access_expires_at = %s,
                 expires_at = %s,
                 revoked_at = NULL
-            WHERE id = %s;
+            WHERE id = %s
+              AND refresh_token_hash = %s
+              AND revoked_at IS NULL;
             """,
             (
                 new_access_token_hash,
@@ -1507,8 +1550,14 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
                 access_expires_at,
                 refresh_expires_at,
                 session["id"],
+                refresh_token_hash,
             ),
         )
+        if cur.rowcount != 1:
+            print("[AUTH] refresh_rotation_conflict=true")
+            raise APIError(401, "REFRESH_TOKEN_REUSED", "Refresh token has already been used")
+
+        print("[AUTH] refresh_rotation_success=true")
 
     return {
         "session_id": session["id"],
@@ -4300,12 +4349,21 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     if not identity_token or not identity_token.strip():
         raise HTTPException(status_code=400, detail="Apple identity token is required")
 
-    raw_nonce = payload.rawNonce or payload.raw_nonce
-    expected_nonce = payload.hashedNonce or payload.hashed_nonce or payload.nonce
-    if raw_nonce and len(raw_nonce) > 512:
-        raise HTTPException(status_code=400, detail="Invalid Apple nonce")
-    if expected_nonce and len(expected_nonce) > 512:
-        raise HTTPException(status_code=400, detail="Invalid Apple nonce")
+    raw_nonce = (payload.rawNonce or payload.raw_nonce or "").strip()
+    apple_auth_debug_log(f"apple_nonce_present={str(bool(raw_nonce)).lower()}")
+    if not raw_nonce:
+        raise APIError(
+            400,
+            "APPLE_NONCE_REQUIRED",
+            "Impossibile completare l'accesso con Apple. Riprova.",
+        )
+    if len(raw_nonce) > 512:
+        apple_auth_debug_log("apple_nonce_valid=false")
+        raise APIError(
+            400,
+            "APPLE_NONCE_INVALID",
+            "Impossibile completare l'accesso con Apple. Riprova.",
+        )
 
     try:
         unverified_claims = jwt.decode(identity_token, options={"verify_signature": False})
@@ -4317,7 +4375,6 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     claims = verify_apple_identity_token(
         identity_token,
         raw_nonce=raw_nonce,
-        expected_nonce=expected_nonce,
     )
 
     claims["display_name"] = display_name
@@ -5583,4 +5640,4 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, access_log=not REDACTED_ACCESS_LOG_ENABLED)
