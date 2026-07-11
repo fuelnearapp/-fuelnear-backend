@@ -1420,9 +1420,23 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, user_id, revoked_at, expires_at
-            FROM user_sessions
-            WHERE refresh_token_hash = %s
+            SELECT
+                s.id,
+                s.user_id,
+                s.revoked_at,
+                s.expires_at,
+                u.is_active,
+                u.is_email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM user_auth_providers provider
+                    WHERE provider.user_id = u.id
+                      AND provider.email_verified = TRUE
+                    LIMIT 1
+                ) AS has_verified_social_provider
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.refresh_token_hash = %s
             LIMIT 1;
             """,
             (refresh_token_hash,),
@@ -1433,10 +1447,42 @@ def refresh_user_session(conn, refresh_token: str) -> dict[str, Any]:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
 
         if session["revoked_at"] is not None:
-            raise HTTPException(status_code=401, detail="Refresh token has been revoked")
+            print("[AUTH] refresh_session_revoked=true")
+            raise APIError(401, "SESSION_REVOKED", "Refresh token has been revoked")
 
         if session["expires_at"] <= now:
             raise HTTPException(status_code=401, detail="Refresh token has expired")
+
+        user_is_active = bool(session["is_active"])
+        user_is_email_verified = bool(session["is_email_verified"])
+        has_verified_social_provider = bool(session["has_verified_social_provider"])
+        print(f"[AUTH] refresh_user_active={str(user_is_active).lower()}")
+        print(f"[AUTH] refresh_email_verified={str(user_is_email_verified).lower()}")
+        print("[AUTH] refresh_session_revoked=false")
+
+        if not user_is_active:
+            cur.execute(
+                """
+                UPDATE user_sessions
+                SET revoked_at = NOW()
+                WHERE id = %s
+                  AND revoked_at IS NULL;
+                """,
+                (session["id"],),
+            )
+            raise APIError(403, "ACCOUNT_INACTIVE", "User account is inactive")
+
+        if not user_is_email_verified and not has_verified_social_provider:
+            cur.execute(
+                """
+                UPDATE user_sessions
+                SET revoked_at = NOW()
+                WHERE id = %s
+                  AND revoked_at IS NULL;
+                """,
+                (session["id"],),
+            )
+            raise APIError(403, "EMAIL_NOT_VERIFIED", "Email verification required")
 
         new_access_token = generate_access_token()
         new_refresh_token = generate_refresh_token()
