@@ -12,7 +12,6 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 import re
-from urllib.parse import urlparse
 
 import psycopg2
 import jwt
@@ -27,6 +26,7 @@ from pydantic import BaseModel, EmailStr
 from app.import_mimit import update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
 from app.email_service import email_delivery_is_configured, send_verification_email
+from app.db import DatabasePoolExhausted, close_connection_pool, get_connection
 from app.auth_utils import (
     generate_access_token,
     generate_refresh_token,
@@ -49,12 +49,6 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-DB_NAME = os.getenv("DB_NAME", "fuelnear")
-DB_USER = os.getenv("DB_USER", "matteo")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DATABASE_URL = os.getenv("DATABASE_URL")
 MIMIT_UPDATE_INTERVAL_SECONDS = int(os.getenv("MIMIT_UPDATE_INTERVAL_SECONDS", str(24 * 60 * 60)))
 MIMIT_STALE_AFTER_SECONDS = int(os.getenv("MIMIT_STALE_AFTER_SECONDS", str(30 * 60)))
 ADMIN_UPDATE_TOKEN = os.getenv("ADMIN_UPDATE_TOKEN")
@@ -159,6 +153,19 @@ async def redacted_access_log_middleware(request: Request, call_next):
             f"[ACCESS] request_id={request_id} method={request.method} "
             f"path={request.url.path} status={status_code} duration_ms={duration_ms}"
         )
+
+
+@app.exception_handler(DatabasePoolExhausted)
+async def database_pool_exhausted_handler(_request: Request, exc: DatabasePoolExhausted) -> JSONResponse:
+    request_id = log_internal_exception("database_pool_exhausted", exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error_code": "DATABASE_UNAVAILABLE",
+            "message": "Service temporarily unavailable",
+            "detail": f"Service temporarily unavailable. request_id={request_id}",
+        },
+    )
 
 
 def log_internal_exception(area: str, exc: BaseException, **context: Any) -> str:
@@ -2378,30 +2385,6 @@ def fail_mimit_import_run(conn, run_id: int, error_message: str) -> None:
         )
 
 
-def get_connection():
-    if DATABASE_URL:
-        parsed = urlparse(DATABASE_URL)
-        return psycopg2.connect(
-            dbname=parsed.path.lstrip("/"),
-            user=parsed.username,
-            password=parsed.password,
-            host=parsed.hostname,
-            port=parsed.port,
-        )
-
-    connection_kwargs = {
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "host": DB_HOST,
-        "port": DB_PORT,
-    }
-
-    if DB_PASSWORD:
-        connection_kwargs["password"] = DB_PASSWORD
-
-    return psycopg2.connect(**connection_kwargs)
-
-
 def ensure_community_price_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass('public.stations');")
@@ -3448,6 +3431,11 @@ def on_startup() -> None:
             ensure_auth_schema(conn)
     finally:
         conn.close()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    close_connection_pool()
 
 
 @app.get("/")

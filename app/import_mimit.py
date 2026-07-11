@@ -12,15 +12,9 @@ import shutil
 import certifi
 
 import pandas as pd
-import psycopg2
 
+from app.db import get_connection
 
-DB_NAME = os.getenv("DB_NAME", "fuelnear")
-DB_USER = os.getenv("DB_USER", "matteo")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -50,30 +44,6 @@ def safe_download_log_url(url: str) -> str:
 
 def get_download_backoff_seconds(attempt: int) -> int:
     return min(120, 10 * (2 ** max(0, attempt - 1)))
-
-
-def get_connection():
-    if DATABASE_URL:
-        parsed = urlparse(DATABASE_URL)
-        return psycopg2.connect(
-            dbname=parsed.path.lstrip("/"),
-            user=parsed.username,
-            password=parsed.password,
-            host=parsed.hostname,
-            port=parsed.port,
-        )
-
-    connection_kwargs = {
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "host": DB_HOST,
-        "port": DB_PORT,
-    }
-
-    if DB_PASSWORD:
-        connection_kwargs["password"] = DB_PASSWORD
-
-    return psycopg2.connect(**connection_kwargs)
 
 
 def ensure_core_schema(conn) -> None:
