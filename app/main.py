@@ -7,6 +7,7 @@ import secrets
 from math import cos, isfinite, radians
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 import re
 from urllib.parse import urlparse
@@ -95,6 +96,34 @@ async def api_error_handler(_request: Request, exc: APIError) -> JSONResponse:
             "detail": exc.message,
         },
         headers=exc.headers,
+    )
+
+
+def log_internal_exception(area: str, exc: BaseException, **context: Any) -> str:
+    request_id = secrets.token_hex(8)
+    pgcode = getattr(exc, "pgcode", None)
+    diag = getattr(exc, "diag", None)
+    table = getattr(diag, "table_name", None)
+    constraint = getattr(diag, "constraint_name", None)
+    context_parts = " ".join(
+        f"{key}={value}"
+        for key, value in context.items()
+        if value is not None
+    )
+    print(
+        f"[ERROR] request_id={request_id} area={area} "
+        f"type={exc.__class__.__name__} pgcode={pgcode} "
+        f"table={table} constraint={constraint} {context_parts}"
+    )
+    traceback.print_exception(type(exc), exc, exc.__traceback__)
+    return request_id
+
+
+def safe_internal_http_error(area: str, exc: BaseException, client_message: str) -> HTTPException:
+    request_id = log_internal_exception(area, exc)
+    return HTTPException(
+        status_code=500,
+        detail=f"{client_message}. request_id={request_id}",
     )
 
 
@@ -3160,16 +3189,25 @@ def admin_update_mimit(
         raise
     except Exception as exc:
         error_message = str(exc)
-        print(f"[MIMIT] Update finished with failure. run_id={run_id} type={exc.__class__.__name__}")
+        request_id = log_internal_exception("mimit_update", exc, run_id=run_id)
+        print(f"[MIMIT] Update finished with failure. run_id={run_id} request_id={request_id}")
 
         if run_id is not None:
             try:
                 with conn:
                     fail_mimit_import_run(conn, run_id, error_message)
             except Exception as persist_error:
-                print(f"[MIMIT] Failed to persist import failure. error={persist_error}")
+                persist_request_id = log_internal_exception(
+                    "mimit_update_persist_failure",
+                    persist_error,
+                    run_id=run_id,
+                )
+                print(
+                    "[MIMIT] Failed to persist import failure. "
+                    f"run_id={run_id} request_id={persist_request_id}"
+                )
 
-        raise HTTPException(status_code=500, detail=f"MIMIT update failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"MIMIT update failed. request_id={request_id}")
     finally:
         if not handed_off_to_background:
             if lock_acquired:
@@ -3268,10 +3306,10 @@ def get_mimit_status() -> dict[str, Any]:
             "stations_csv": last_success["stations_csv"] if last_success else None,
             "prices_csv": last_success["prices_csv"] if last_success else None,
             "source_file_timestamp": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
-            "last_error": last_failed["error_message"] if last_failed else None,
+            "last_error": "Last MIMIT update failed" if last_failed else None,
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"MIMIT status failed: {exc}")
+        raise safe_internal_http_error("mimit_status", exc, "MIMIT status failed")
     finally:
         conn.close()
 
@@ -3347,8 +3385,9 @@ def debug_mimit_status(_: None = Depends(require_admin_update_token)) -> dict[st
             "max_fuel_prices_reported_at": max_reported_at["max_reported_at"].isoformat() if max_reported_at and max_reported_at["max_reported_at"] else None,
         }
     except Exception as exc:
-        print(f"[MIMIT] Debug status failed. error={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="MIMIT debug status failed")
+        request_id = log_internal_exception("mimit_debug_status", exc)
+        print(f"[MIMIT] Debug status failed. request_id={request_id}")
+        raise HTTPException(status_code=500, detail=f"MIMIT debug status failed. request_id={request_id}")
     finally:
         conn.close()
 
@@ -3405,8 +3444,9 @@ def admin_mimit_lock_check(_: None = Depends(require_admin_update_token)) -> dic
             "orphaned_run_marked_failed": orphaned_run_marked_failed,
         }
     except Exception as exc:
-        print(f"[MIMIT] Lock check failed. type={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="MIMIT lock check failed")
+        request_id = log_internal_exception("mimit_lock_check", exc)
+        print(f"[MIMIT] Lock check failed. request_id={request_id}")
+        raise HTTPException(status_code=500, detail=f"MIMIT lock check failed. request_id={request_id}")
     finally:
         if probe_lock_acquired:
             try:
@@ -3662,7 +3702,7 @@ def admin_mimit_diagnostics(
             "nearby_endpoint_equivalent": serialize_datetime_fields([dict(row) for row in nearby_endpoint_equivalent], price_datetime_fields),
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"MIMIT diagnostics failed: {exc}")
+        raise safe_internal_http_error("mimit_diagnostics", exc, "MIMIT diagnostics failed")
     finally:
         conn.close()
 
@@ -3777,8 +3817,19 @@ def admin_test_push(
                     payload=payload.payload,
                 )
             except APNsConfigurationError as exc:
-                print(f"[APNS] send failed token hash prefix={token_log_id} type={exc.__class__.__name__}")
-                raise HTTPException(status_code=500, detail=str(exc))
+                request_id = log_internal_exception(
+                    "admin_test_push_apns_configuration",
+                    exc,
+                    token_hash_prefix=token_log_id,
+                )
+                print(
+                    "[APNS] send failed "
+                    f"token hash prefix={token_log_id} request_id={request_id}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"APNs test push failed. request_id={request_id}",
+                )
 
             if result["success"]:
                 sent_success_count += 1
@@ -3831,8 +3882,9 @@ def admin_test_push(
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"[APNS] test push failed type={exc.__class__.__name__}")
-        raise HTTPException(status_code=500, detail="APNs test push failed")
+        request_id = log_internal_exception("admin_test_push", exc)
+        print(f"[APNS] test push failed request_id={request_id}")
+        raise HTTPException(status_code=500, detail=f"APNs test push failed. request_id={request_id}")
     finally:
         conn.close()
 
@@ -3874,7 +3926,11 @@ def admin_process_price_notifications(
             "result": result,
         }
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        request_id = log_internal_exception("process_price_notifications_invalid_request", exc, run_id=run_id)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid price notification processing request. request_id={request_id}",
+        )
     except Exception as exc:
         print(
             f"[PRICE_NOTIFICATIONS] Manual processing failed. run_id={run_id} "
@@ -4270,9 +4326,10 @@ def refresh_login_session(payload: RefreshRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        request_id = log_internal_exception("auth_refresh_invalid_request", exc)
+        raise HTTPException(status_code=400, detail=f"Invalid refresh request. request_id={request_id}")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Refresh failed: {exc}")
+        raise safe_internal_http_error("auth_refresh", exc, "Refresh failed")
     finally:
         conn.close()
 
@@ -5050,7 +5107,7 @@ def list_stations(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any
             "items": [dict(row) for row in stations],
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+        raise safe_internal_http_error("stations_list", exc, "Stations request failed")
 
 
 @app.get("/stations/search")
@@ -5103,7 +5160,7 @@ def search_stations(
             "items": [dict(row) for row in stations],
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+        raise safe_internal_http_error("stations_search", exc, "Station search failed")
 
 
 # Nearby stations endpoint
@@ -5220,7 +5277,7 @@ def get_nearby_stations(
             "items": serialize_datetime_fields([dict(row) for row in stations], ["reported_at", "last_reported_at"]),
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+        raise safe_internal_http_error("stations_nearby", exc, "Nearby stations request failed")
 
 
 @app.get("/stations/{station_id}/community-prices")
@@ -5421,7 +5478,7 @@ def get_station_detail(station_id: int) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+        raise safe_internal_http_error("station_detail", exc, "Station detail request failed")
 
 
 @app.get("/stations/{station_id}/prices")
@@ -5472,7 +5529,7 @@ def get_station_prices(station_id: int) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+        raise safe_internal_http_error("station_prices", exc, "Station prices request failed")
 
 
 # --- Add entrypoint for running with uvicorn ---
