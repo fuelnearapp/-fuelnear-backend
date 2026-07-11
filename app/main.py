@@ -52,6 +52,7 @@ ACCESS_TOKEN_TTL_HOURS = int(os.getenv("ACCESS_TOKEN_TTL_HOURS", "24"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
 EMAIL_VERIFICATION_TTL_HOURS = int(os.getenv("EMAIL_VERIFICATION_TTL_HOURS", "24"))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
+REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
@@ -770,146 +771,215 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
     }
 
 
+def process_pending_referral(conn, referral: dict[str, Any], reward_days: int) -> dict[str, Any]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT is_active, is_email_verified
+            FROM users
+            WHERE id = %s
+            FOR UPDATE;
+            """,
+            (referral["referrer_user_id"],),
+        )
+        referrer = cur.fetchone()
+        if referrer is None or not referrer["is_active"] or not referrer["is_email_verified"]:
+            cur.execute(
+                """
+                UPDATE referrals
+                SET status_reason = 'referrer_not_verified',
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'pending';
+                """,
+                (referral["id"],),
+            )
+            return {"status": "skipped", "reason": "referrer_not_verified"}
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS reward_count
+            FROM rewards
+            WHERE user_id = %s
+              AND reward_type = 'plus_days'
+              AND status = 'granted'
+              AND granted_at >= (
+                  DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Rome')
+                  AT TIME ZONE 'Europe/Rome'
+              )
+              AND granted_at < (
+                  (DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Rome') + INTERVAL '1 month')
+                  AT TIME ZONE 'Europe/Rome'
+              );
+            """,
+            (referral["referrer_user_id"],),
+        )
+        monthly_reward_count = int(cur.fetchone()["reward_count"])
+        if monthly_reward_count >= REFERRAL_MONTHLY_REWARD_LIMIT:
+            cur.execute(
+                """
+                UPDATE referrals
+                SET status_reason = 'monthly_limit',
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'pending';
+                """,
+                (referral["id"],),
+            )
+            return {"status": "skipped", "reason": "monthly_limit"}
+
+        cur.execute(
+            """
+            UPDATE referrals
+            SET status = 'valid',
+                status_reason = 'reward_granted',
+                validated_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'pending'
+            RETURNING id, referrer_user_id, referred_user_id, referral_code_used,
+                      status, status_reason, validated_at, created_at, updated_at;
+            """,
+            (referral["id"],),
+        )
+        validated_referral = cur.fetchone()
+
+    if not validated_referral:
+        return {"status": "skipped", "reason": "no_longer_pending"}
+
+    reward_result = grant_plus_days_reward(
+        conn,
+        validated_referral["referrer_user_id"],
+        validated_referral["id"],
+        reward_days,
+    )
+    return {
+        "status": "processed",
+        "rewarded": not reward_result["already_granted"],
+        "item": {
+            "referral": serialize_datetime_fields(
+                [dict(validated_referral)],
+                ["validated_at", "created_at", "updated_at"],
+            )[0],
+            "reward": reward_result["reward"],
+            "subscription": reward_result["subscription"],
+            "already_granted": reward_result["already_granted"],
+        },
+    }
+
+
 def process_pending_referrals(conn, min_age_days: int = 7, reward_days: int = 7) -> dict[str, Any]:
     if min_age_days <= 0:
         raise ValueError("min_age_days must be greater than zero")
 
+    started_at = time.monotonic()
     processed: list[dict[str, Any]] = []
+    scanned_count = 0
     rewarded_count = 0
+    skipped_count = 0
+    failed_count = 0
+    batch_count = 0
     skipped_referrer_not_verified = 0
     skipped_monthly_limit = 0
+    last_created_at: datetime | None = None
+    last_referral_id = 0
 
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT
-                r.id,
-                r.referrer_user_id,
-                r.referred_user_id,
-                r.referral_code_used,
-                r.status,
-                r.created_at,
-                u.is_active AS referred_user_is_active,
-                u.is_email_verified AS referred_user_is_email_verified
-            FROM referrals r
-            JOIN users u ON u.id = r.referred_user_id
-            WHERE r.status = 'pending'
-              AND r.created_at <= NOW() - (%s * INTERVAL '1 day')
-              AND u.is_active = TRUE
-              AND u.is_email_verified = TRUE
-            ORDER BY r.created_at ASC;
-            """,
-            (min_age_days,),
-        )
-        pending_referrals = cur.fetchall()
+    try:
+        while True:
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            r.id,
+                            r.referrer_user_id,
+                            r.referred_user_id,
+                            r.referral_code_used,
+                            r.status,
+                            r.created_at
+                        FROM referrals r
+                        JOIN users referred_user ON referred_user.id = r.referred_user_id
+                        WHERE r.status = 'pending'
+                          AND r.created_at <= NOW() - (%s * INTERVAL '1 day')
+                          AND referred_user.is_active = TRUE
+                          AND referred_user.is_email_verified = TRUE
+                          AND (
+                              %s::timestamptz IS NULL
+                              OR (r.created_at, r.id) > (%s::timestamptz, %s)
+                          )
+                        ORDER BY r.created_at ASC, r.id ASC
+                        LIMIT %s
+                        FOR UPDATE OF r SKIP LOCKED;
+                        """,
+                        (
+                            min_age_days,
+                            last_created_at,
+                            last_created_at,
+                            last_referral_id,
+                            REFERRAL_PROCESS_BATCH_SIZE,
+                        ),
+                    )
+                    batch = cur.fetchall()
 
-    for referral in pending_referrals:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT is_active, is_email_verified
-                FROM users
-                WHERE id = %s
-                FOR UPDATE;
-                """,
-                (referral["referrer_user_id"],),
-            )
-            referrer = cur.fetchone()
-            if referrer is None or not referrer["is_active"] or not referrer["is_email_verified"]:
-                skipped_referrer_not_verified += 1
-                cur.execute(
-                    """
-                    UPDATE referrals
-                    SET status_reason = 'referrer_not_verified',
-                        updated_at = NOW()
-                    WHERE id = %s
-                      AND status = 'pending';
-                    """,
-                    (referral["id"],),
+                if not batch:
+                    break
+
+                batch_count += 1
+                scanned_count += len(batch)
+                ordered_batch = sorted(
+                    batch,
+                    key=lambda row: (row["referrer_user_id"], row["created_at"], row["id"]),
                 )
-                print("[REFERRAL] skip reason=referrer_not_verified")
-                continue
+                for referral in ordered_batch:
+                    with conn.cursor() as savepoint_cur:
+                        savepoint_cur.execute("SAVEPOINT referral_item")
 
-            cur.execute(
-                """
-                SELECT COUNT(*) AS reward_count
-                FROM rewards
-                WHERE user_id = %s
-                  AND reward_type = 'plus_days'
-                  AND status = 'granted'
-                  AND granted_at >= (
-                      DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Rome')
-                      AT TIME ZONE 'Europe/Rome'
-                  )
-                  AND granted_at < (
-                      (DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Rome') + INTERVAL '1 month')
-                      AT TIME ZONE 'Europe/Rome'
-                  );
-                """,
-                (referral["referrer_user_id"],),
-            )
-            monthly_reward_count = int(cur.fetchone()["reward_count"])
-            if monthly_reward_count >= REFERRAL_MONTHLY_REWARD_LIMIT:
-                skipped_monthly_limit += 1
-                cur.execute(
-                    """
-                    UPDATE referrals
-                    SET status_reason = 'monthly_limit',
-                        updated_at = NOW()
-                    WHERE id = %s
-                      AND status = 'pending';
-                    """,
-                    (referral["id"],),
-                )
-                print("[REFERRAL] skip reason=monthly_limit")
-                continue
+                    try:
+                        outcome = process_pending_referral(conn, dict(referral), reward_days)
+                    except Exception as exc:
+                        with conn.cursor() as savepoint_cur:
+                            savepoint_cur.execute("ROLLBACK TO SAVEPOINT referral_item")
+                            savepoint_cur.execute("RELEASE SAVEPOINT referral_item")
+                        failed_count += 1
+                        print(f"[REFERRAL] item failed type={exc.__class__.__name__}")
+                        continue
 
-            cur.execute(
-                """
-                UPDATE referrals
-                SET status = 'valid',
-                    status_reason = 'reward_granted',
-                    validated_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = %s
-                  AND status = 'pending'
-                RETURNING id, referrer_user_id, referred_user_id, referral_code_used,
-                          status, status_reason, validated_at, created_at, updated_at;
-                """,
-                (referral["id"],),
-            )
-            validated_referral = cur.fetchone()
+                    with conn.cursor() as savepoint_cur:
+                        savepoint_cur.execute("RELEASE SAVEPOINT referral_item")
 
-        if not validated_referral:
-            continue
+                    if outcome["status"] == "processed":
+                        processed.append(outcome["item"])
+                        if outcome["rewarded"]:
+                            rewarded_count += 1
+                        continue
 
-        reward_result = grant_plus_days_reward(
-            conn,
-            validated_referral["referrer_user_id"],
-            validated_referral["id"],
-            reward_days,
-        )
-        if not reward_result["already_granted"]:
-            rewarded_count += 1
-        processed.append(
-            {
-                "referral": serialize_datetime_fields([dict(validated_referral)], ["validated_at", "created_at", "updated_at"])[0],
-                "reward": reward_result["reward"],
-                "subscription": reward_result["subscription"],
-                "already_granted": reward_result["already_granted"],
-            }
+                    skipped_count += 1
+                    reason = outcome.get("reason")
+                    if reason == "referrer_not_verified":
+                        skipped_referrer_not_verified += 1
+                    elif reason == "monthly_limit":
+                        skipped_monthly_limit += 1
+                    print(f"[REFERRAL] skip reason={reason or 'unknown'}")
+
+            last_created_at = batch[-1]["created_at"]
+            last_referral_id = int(batch[-1]["id"])
+    finally:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        print(
+            f"[REFERRAL] scanned_count={scanned_count} "
+            f"processed_count={len(processed)} rewarded_count={rewarded_count} "
+            f"skipped_count={skipped_count} failed_count={failed_count} "
+            f"batch_count={batch_count} duration_ms={duration_ms}"
         )
 
-    processed_count = len(processed)
-    print(
-        f"[REFERRAL] processed_count={processed_count} "
-        f"rewarded_count={rewarded_count} "
-        f"skipped_referrer_not_verified={skipped_referrer_not_verified} "
-        f"skipped_monthly_limit={skipped_monthly_limit}"
-    )
     return {
-        "processed_count": processed_count,
+        "scanned_count": scanned_count,
+        "processed_count": len(processed),
         "rewarded_count": rewarded_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "batch_count": batch_count,
+        "duration_ms": duration_ms,
         "skipped_referrer_not_verified": skipped_referrer_not_verified,
         "skipped_monthly_limit": skipped_monthly_limit,
         "items": processed,
@@ -2018,7 +2088,8 @@ def ensure_auth_schema(conn) -> None:
             CREATE TABLE IF NOT EXISTS referrals (
                 id BIGSERIAL PRIMARY KEY,
                 referrer_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                referred_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                referred_user_id BIGINT NULL,
+                referred_user_deleted BOOLEAN NOT NULL DEFAULT FALSE,
                 referral_code_used TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 status_reason TEXT NULL DEFAULT 'awaiting_eligibility',
@@ -2039,6 +2110,34 @@ def ensure_auth_schema(conn) -> None:
         )
         cur.execute(
             """
+            ALTER TABLE referrals
+            ADD COLUMN IF NOT EXISTS referred_user_deleted BOOLEAN NOT NULL DEFAULT FALSE;
+            """
+        )
+        cur.execute("ALTER TABLE referrals ALTER COLUMN referred_user_id DROP NOT NULL;")
+        cur.execute("ALTER TABLE referrals DROP CONSTRAINT IF EXISTS referrals_referred_user_id_fkey;")
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'fk_referrals_referred_user_id'
+                      AND conrelid = 'referrals'::regclass
+                ) THEN
+                    ALTER TABLE referrals
+                    ADD CONSTRAINT fk_referrals_referred_user_id
+                    FOREIGN KEY (referred_user_id)
+                    REFERENCES users(id)
+                    ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
+            """
+        )
+        cur.execute(
+            """
             UPDATE referrals
             SET status = 'invalid',
                 status_reason = CASE
@@ -2054,7 +2153,7 @@ def ensure_auth_schema(conn) -> None:
             UPDATE referrals
             SET status_reason = 'reward_granted'
             WHERE status = 'valid'
-              AND status_reason IS DISTINCT FROM 'reward_granted';
+              AND (status_reason IS NULL OR status_reason = 'awaiting_eligibility');
             """
         )
         cur.execute(
@@ -2101,6 +2200,37 @@ def ensure_auth_schema(conn) -> None:
             """
             COMMENT ON COLUMN referrals.status_reason IS
             'Internal non-personal reason describing the current referral state';
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION preserve_valid_referral_history_on_user_delete()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                DELETE FROM referrals
+                WHERE referred_user_id = OLD.id
+                  AND status IN ('pending', 'invalid');
+
+                UPDATE referrals
+                SET referred_user_id = NULL,
+                    referred_user_deleted = TRUE,
+                    status_reason = 'referred_user_deleted',
+                    updated_at = NOW()
+                WHERE referred_user_id = OLD.id
+                  AND status = 'valid';
+
+                RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql;
+            """
+        )
+        cur.execute("DROP TRIGGER IF EXISTS preserve_referral_history_before_user_delete ON users;")
+        cur.execute(
+            """
+            CREATE TRIGGER preserve_referral_history_before_user_delete
+            BEFORE DELETE ON users
+            FOR EACH ROW
+            EXECUTE FUNCTION preserve_valid_referral_history_on_user_delete();
             """
         )
         cur.execute(
@@ -3298,21 +3428,30 @@ def admin_mimit_diagnostics(
 
 @app.post("/admin/process-referrals")
 def admin_process_referrals(_: None = Depends(require_admin_update_token)) -> dict[str, Any]:
-    conn = get_connection()
+    conn = None
     try:
-        with conn:
-            result = process_pending_referrals(conn, min_age_days=7, reward_days=7)
+        conn = get_connection()
+        result = process_pending_referrals(conn, min_age_days=7, reward_days=7)
         return {
             "status": "ok",
             "message": "Referral processing completed",
             "result": result,
         }
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        print(f"[REFERRAL] processing rejected type={exc.__class__.__name__}")
+        raise HTTPException(status_code=400, detail="Invalid referral processing request")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Referral processing failed: {exc}")
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        print(
+            f"[REFERRAL] processing failed type={exc.__class__.__name__} "
+            f"pgcode={pgcode} table={table} constraint={constraint}"
+        )
+        raise HTTPException(status_code=500, detail="Referral processing failed")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.post("/admin/test-push")
@@ -4478,6 +4617,7 @@ def get_current_user_referrals(authorization: str | None = Header(default=None, 
                         r.referral_code_used,
                         r.status,
                         r.status_reason,
+                        r.referred_user_deleted,
                         r.validated_at,
                         r.created_at,
                         r.updated_at
