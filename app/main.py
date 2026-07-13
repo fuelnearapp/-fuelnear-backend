@@ -3375,11 +3375,11 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                         """
                         UPDATE sent_price_notifications
                         SET status = %s,
-                            sent_at = CASE WHEN %s = 'sent' THEN NOW() ELSE NULL END,
+                            sent_at = CASE WHEN %s::text = 'sent' THEN NOW() ELSE NULL END,
                             send_attempts = send_attempts + %s,
-                            last_error_temporary = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
-                            last_status_code = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
-                            last_reason = CASE WHEN %s = 'sent' THEN NULL ELSE %s END,
+                            last_error_temporary = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::boolean END,
+                            last_status_code = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::integer END,
+                            last_reason = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::text END,
                             updated_at = NOW()
                         WHERE id = %s;
                         """,
