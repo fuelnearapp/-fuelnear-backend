@@ -23,6 +23,7 @@ from app.auth_utils import PBKDF2_ALGORITHM
 POSTGRES_PROCESS = None
 POSTGRES_TMPDIR = None
 main = None
+db = None
 
 
 def find_free_port() -> int:
@@ -101,7 +102,7 @@ def install_import_stubs() -> None:
 
 
 def setUpModule() -> None:
-    global POSTGRES_PROCESS, POSTGRES_TMPDIR, main
+    global POSTGRES_PROCESS, POSTGRES_TMPDIR, main, db
 
     POSTGRES_TMPDIR = tempfile.mkdtemp(prefix="fuelnear-auth-tests-", dir="/private/tmp")
     data_dir = os.path.join(POSTGRES_TMPDIR, "data")
@@ -146,6 +147,7 @@ def setUpModule() -> None:
     imported_db.DB_POOL_MAX_CONNECTIONS = int(os.environ["DB_POOL_MAX_CONNECTIONS"])
 
     main = imported_main
+    db = imported_db
     with main.get_connection() as conn:
         main.ensure_auth_schema(conn)
         main.ensure_auth_provider_schema(conn)
@@ -667,6 +669,51 @@ class AuthTestCase(unittest.TestCase):
             results = list(executor.map(lambda _: hit_limit(), range(5)))
         self.assertEqual(results.count("ok"), 2)
         self.assertEqual(results.count("RATE_LIMITED"), 3)
+
+    def test_38_health_liveness_is_lightweight(self):
+        self.assertEqual(main.health_check(), {"status": "ok"})
+
+    def test_39_readiness_db_available_returns_200_payload(self):
+        self.assertEqual(main.readiness_check(), {"status": "ready"})
+
+    def test_40_readiness_db_unavailable_returns_503(self):
+        original_get_connection = main.get_connection
+
+        def unavailable_connection():
+            raise psycopg2.OperationalError("database unavailable")
+
+        main.get_connection = unavailable_connection
+        try:
+            with self.assertRaises(main.HTTPException) as cm:
+                main.readiness_check()
+        finally:
+            main.get_connection = original_get_connection
+
+        self.assertEqual(cm.exception.status_code, 503)
+        self.assertNotIn("database unavailable", str(cm.exception.detail))
+
+    def test_41_readiness_pool_exhausted_returns_503(self):
+        original_get_connection = main.get_connection
+
+        def exhausted_pool():
+            raise main.DatabasePoolExhausted("pool exhausted")
+
+        main.get_connection = exhausted_pool
+        try:
+            with self.assertRaises(main.HTTPException) as cm:
+                main.readiness_check()
+        finally:
+            main.get_connection = original_get_connection
+
+        self.assertEqual(cm.exception.status_code, 503)
+        self.assertNotIn("pool exhausted", str(cm.exception.detail))
+
+    def test_42_readiness_returns_connection_to_pool(self):
+        pool = db.get_connection_pool()
+        used_before = len(getattr(pool, "_used", {}))
+        main.readiness_check()
+        used_after = len(getattr(pool, "_used", {}))
+        self.assertEqual(used_after, used_before)
 
 
 if __name__ == "__main__":

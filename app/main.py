@@ -86,6 +86,7 @@ AUTH_VERIFY_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_VERIFY_RATE_WINDOW_
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
+READINESS_DB_TIMEOUT_MS = max(100, int(os.getenv("READINESS_DB_TIMEOUT_MS", "1000")))
 ACCESS_LOG_MODE = os.getenv("FUELNEAR_ACCESS_LOG_MODE", "redacted").strip().lower()
 REDACTED_ACCESS_LOG_ENABLED = ACCESS_LOG_MODE in {"redacted", "safe", "production", "1", "true", "yes"}
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
@@ -3446,6 +3447,46 @@ def read_root() -> dict[str, str]:
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness_check() -> dict[str, str]:
+    started_at = time.monotonic()
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = %s;", (READINESS_DB_TIMEOUT_MS,))
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+                cur.execute("SELECT to_regclass('public.users');")
+                users_table = cur.fetchone()[0]
+                if users_table is None:
+                    raise RuntimeError("Required schema is not ready")
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        print(
+            "[HEALTH] readiness_db_ok=true "
+            f"readiness_pool_available=true duration_ms={duration_ms}"
+        )
+        return {"status": "ready"}
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        pool_available = not isinstance(exc, DatabasePoolExhausted)
+        request_id = secrets.token_hex(8)
+        print(
+            "[HEALTH] readiness_db_ok=false "
+            f"readiness_pool_available={str(pool_available).lower()} "
+            f"duration_ms={duration_ms} request_id={request_id} type={exc.__class__.__name__}"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service temporarily unavailable. request_id={request_id}",
+        )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def run_mimit_update_background(conn, run_id: int) -> None:
