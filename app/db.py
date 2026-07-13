@@ -40,6 +40,11 @@ class PooledConnection:
         return getattr(self._raw_connection, name)
 
     def __enter__(self):
+        if self._returned:
+            self._raw_connection = self._owner_pool.getconn()
+            self._returned = False
+            if DB_POOL_LOG_CONNECTIONS:
+                print("[DB] db_connection_acquired=true")
         self._raw_connection.__enter__()
         return self
 

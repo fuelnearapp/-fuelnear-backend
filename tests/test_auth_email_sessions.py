@@ -138,6 +138,12 @@ def setUpModule() -> None:
 
     install_import_stubs()
     import app.main as imported_main
+    import app.db as imported_db
+
+    imported_db.close_connection_pool()
+    imported_db.DATABASE_URL = os.environ["DATABASE_URL"]
+    imported_db.DB_POOL_MIN_CONNECTIONS = int(os.environ["DB_POOL_MIN_CONNECTIONS"])
+    imported_db.DB_POOL_MAX_CONNECTIONS = int(os.environ["DB_POOL_MAX_CONNECTIONS"])
 
     main = imported_main
     with main.get_connection() as conn:
