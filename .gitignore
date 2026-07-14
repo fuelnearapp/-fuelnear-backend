@@ -1,5 +1,37 @@
+# Python environments and bytecode
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Local configuration and secrets
 .env
+.env.*
+!.env.example
+
+# Test, coverage, and static-analysis artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Local databases, logs, and temporary files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Operating-system metadata
 .DS_Store
