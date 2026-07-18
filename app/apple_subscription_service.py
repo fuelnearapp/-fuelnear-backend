@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from psycopg2.extras import RealDictCursor
+
+from app.db import get_connection
+
+
+APPLE_TRANSACTION_COLUMNS = """
+    id,
+    user_id,
+    product_id,
+    transaction_id,
+    original_transaction_id,
+    purchase_date,
+    expires_date,
+    environment,
+    ownership_type,
+    transaction_reason,
+    revocation_date,
+    revocation_reason,
+    app_account_token,
+    signed_date,
+    storefront,
+    offer_type,
+    created_at,
+    updated_at
+"""
+
+
+def _required_identifier(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} is required")
+    return value.strip()
+
+
+def _required_user_id(user_id: int) -> int:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be a positive integer")
+    return user_id
+
+
+def _reference_date(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(value, datetime):
+        raise ValueError("reference_date must be a datetime")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def get_transaction(transaction_id: str) -> dict[str, Any] | None:
+    normalized_transaction_id = _required_identifier(transaction_id, "transaction_id")
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT {APPLE_TRANSACTION_COLUMNS}
+                FROM apple_transactions
+                WHERE transaction_id = %s
+                LIMIT 1;
+                """,
+                (normalized_transaction_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_latest_transaction(original_transaction_id: str) -> dict[str, Any] | None:
+    normalized_original_transaction_id = _required_identifier(
+        original_transaction_id,
+        "original_transaction_id",
+    )
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT {APPLE_TRANSACTION_COLUMNS}
+                FROM apple_transactions
+                WHERE original_transaction_id = %s
+                ORDER BY COALESCE(signed_date, purchase_date) DESC,
+                         purchase_date DESC,
+                         id DESC
+                LIMIT 1;
+                """,
+                (normalized_original_transaction_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_transactions_for_user(user_id: int) -> list[dict[str, Any]]:
+    normalized_user_id = _required_user_id(user_id)
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT {APPLE_TRANSACTION_COLUMNS}
+                FROM apple_transactions
+                WHERE user_id = %s
+                ORDER BY COALESCE(signed_date, purchase_date) DESC,
+                         purchase_date DESC,
+                         id DESC;
+                """,
+                (normalized_user_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def is_subscription_active(
+    original_transaction_id: str,
+    reference_date: datetime | None = None,
+) -> bool:
+    latest_transaction = get_latest_transaction(original_transaction_id)
+    if latest_transaction is None or latest_transaction["revocation_date"] is not None:
+        return False
+
+    expires_date = latest_transaction["expires_date"]
+    return expires_date is None or expires_date > _reference_date(reference_date)
+
+
+def get_active_subscription_for_user(
+    user_id: int,
+    reference_date: datetime | None = None,
+) -> dict[str, Any] | None:
+    normalized_user_id = _required_user_id(user_id)
+    normalized_reference_date = _reference_date(reference_date)
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                WITH latest_transactions AS (
+                    SELECT DISTINCT ON (original_transaction_id)
+                        {APPLE_TRANSACTION_COLUMNS}
+                    FROM apple_transactions
+                    WHERE user_id = %s
+                    ORDER BY original_transaction_id,
+                             COALESCE(signed_date, purchase_date) DESC,
+                             purchase_date DESC,
+                             id DESC
+                )
+                SELECT {APPLE_TRANSACTION_COLUMNS}
+                FROM latest_transactions
+                WHERE revocation_date IS NULL
+                  AND (expires_date IS NULL OR expires_date > %s)
+                ORDER BY (expires_date IS NULL) DESC,
+                         expires_date DESC NULLS FIRST,
+                         COALESCE(signed_date, purchase_date) DESC,
+                         id DESC
+                LIMIT 1;
+                """,
+                (normalized_user_id, normalized_reference_date),
+            )
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
+    finally:
+        conn.close()

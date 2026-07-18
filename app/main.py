@@ -2821,6 +2821,30 @@ def ensure_auth_schema(conn) -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS apple_transactions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL,
+                transaction_id TEXT NOT NULL UNIQUE,
+                original_transaction_id TEXT NOT NULL,
+                purchase_date TIMESTAMPTZ NOT NULL,
+                expires_date TIMESTAMPTZ NULL,
+                environment TEXT NOT NULL,
+                ownership_type TEXT NULL,
+                transaction_reason TEXT NULL,
+                revocation_date TIMESTAMPTZ NULL,
+                revocation_reason TEXT NULL,
+                app_account_token UUID NULL,
+                signed_date TIMESTAMPTZ NULL,
+                storefront TEXT NULL,
+                offer_type INTEGER NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
             UPDATE user_subscriptions
             SET status = 'expired',
                 updated_at = NOW()
@@ -2881,6 +2905,30 @@ def ensure_auth_schema(conn) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_subscriptions_one_active
             ON user_subscriptions(user_id)
             WHERE status = 'active';
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_apple_transactions_original_transaction_id
+            ON apple_transactions(original_transaction_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_apple_transactions_user_id
+            ON apple_transactions(user_id);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_apple_transactions_expires_date
+            ON apple_transactions(expires_date);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_apple_transactions_user_original_transaction
+            ON apple_transactions(user_id, original_transaction_id);
             """
         )
         ensure_auth_rate_limit_schema(conn)
