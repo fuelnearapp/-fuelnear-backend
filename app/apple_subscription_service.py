@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
@@ -42,6 +43,12 @@ def _required_user_id(user_id: int) -> int:
     return user_id
 
 
+def _required_app_account_token(app_account_token: UUID) -> UUID:
+    if not isinstance(app_account_token, UUID):
+        raise ValueError("app_account_token must be a UUID")
+    return app_account_token
+
+
 def _reference_date(value: datetime | None) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
@@ -68,6 +75,26 @@ def get_transaction(transaction_id: str) -> dict[str, Any] | None:
             )
             row = cur.fetchone()
             return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def get_user_id_by_app_account_token(app_account_token: UUID) -> int | None:
+    normalized_app_account_token = _required_app_account_token(app_account_token)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM users
+                WHERE app_account_token = %s
+                LIMIT 1;
+                """,
+                (str(normalized_app_account_token),),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row is not None else None
     finally:
         conn.close()
 

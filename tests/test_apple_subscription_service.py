@@ -7,6 +7,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from uuid import uuid4
 
 import psycopg2
 
@@ -68,7 +69,9 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
 
         with cls.connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("CREATE TABLE users (id BIGSERIAL PRIMARY KEY);")
+                cur.execute(
+                    "CREATE TABLE users (id BIGSERIAL PRIMARY KEY, app_account_token UUID UNIQUE);"
+                )
                 cur.execute(
                     """
                     CREATE TABLE apple_transactions (
@@ -167,6 +170,22 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
         transaction = service.get_transaction("tx-1")
         self.assertIsNotNone(transaction)
         self.assertEqual(transaction["transaction_id"], "tx-1")
+
+    def test_get_user_id_by_app_account_token(self):
+        app_account_token = uuid4()
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (app_account_token) VALUES (%s) RETURNING id;",
+                    (str(app_account_token),),
+                )
+                user_id = int(cur.fetchone()[0])
+
+        self.assertEqual(
+            service.get_user_id_by_app_account_token(app_account_token),
+            user_id,
+        )
+        self.assertIsNone(service.get_user_id_by_app_account_token(uuid4()))
 
     def test_get_latest_transaction(self):
         user_id = self.create_user()

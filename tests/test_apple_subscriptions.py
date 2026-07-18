@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from uuid import uuid4
 
 import psycopg2
 
@@ -149,6 +151,19 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
                 cur.execute("SELECT COUNT(*) FROM apple_transactions;")
                 return int(cur.fetchone()[0])
 
+    def transaction_row(self, transaction_id: str) -> tuple:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT signed_date, revocation_date, revocation_reason
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction_id,),
+                )
+                return cur.fetchone()
+
     def test_supported_product_id_is_valid(self):
         transaction = self.transaction(self.create_user())
         self.assertEqual(validate_apple_transaction(transaction), transaction)
@@ -163,6 +178,16 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
         self.assertTrue(result.created)
         self.assertEqual(self.row_count(), 1)
 
+    def test_new_transaction_accepts_app_account_token_uuid(self):
+        app_account_token = uuid4()
+        result = self.save(
+            self.transaction(
+                self.create_user(),
+                app_account_token=app_account_token,
+            )
+        )
+        self.assertEqual(str(result.row["app_account_token"]), str(app_account_token))
+
     def test_same_transaction_id_is_idempotent(self):
         user_id = self.create_user()
         transaction = self.transaction(user_id)
@@ -172,6 +197,116 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
         self.assertFalse(second.created)
         self.assertEqual(first.row["id"], second.row["id"])
         self.assertEqual(self.row_count(), 1)
+
+    def test_newer_duplicate_updates_revocation_fields(self):
+        user_id = self.create_user()
+        signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(user_id, signed_date=signed_date)
+        self.save(transaction)
+
+        revocation_date = signed_date + timedelta(hours=1)
+        result = self.save(
+            replace(
+                transaction,
+                signed_date=revocation_date,
+                revocation_date=revocation_date,
+                revocation_reason="1",
+            )
+        )
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.row["revocation_date"], revocation_date)
+        self.assertEqual(result.row["revocation_reason"], "1")
+        self.assertEqual(self.row_count(), 1)
+
+    def test_older_duplicate_does_not_overwrite_newer_revocation(self):
+        user_id = self.create_user()
+        signed_date = datetime.now(timezone.utc)
+        revocation_date = signed_date + timedelta(hours=1)
+        transaction = self.transaction(
+            user_id,
+            signed_date=revocation_date,
+            revocation_date=revocation_date,
+            revocation_reason="1",
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(
+                transaction,
+                signed_date=signed_date,
+                revocation_date=None,
+                revocation_reason=None,
+            )
+        )
+
+        self.assertEqual(result.row["revocation_date"], revocation_date)
+        self.assertEqual(result.row["revocation_reason"], "1")
+
+    def test_newer_refund_reversed_clears_revocation(self):
+        user_id = self.create_user()
+        signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(
+            user_id,
+            signed_date=signed_date,
+            revocation_date=signed_date,
+            revocation_reason="1",
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(
+                transaction,
+                signed_date=signed_date + timedelta(hours=1),
+                revocation_date=None,
+                revocation_reason=None,
+            )
+        )
+
+        self.assertIsNone(result.row["revocation_date"])
+        self.assertIsNone(result.row["revocation_reason"])
+
+    def test_concurrent_duplicate_transaction_creates_one_row(self):
+        transaction = self.transaction(
+            self.create_user(),
+            signed_date=datetime.now(timezone.utc),
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(self.save, (transaction, transaction)))
+
+        self.assertEqual(sorted(result.created for result in results), [False, True])
+        self.assertEqual(self.row_count(), 1)
+
+    def test_concurrent_out_of_order_events_preserve_newest_revocation(self):
+        user_id = self.create_user()
+        initial_signed_date = datetime.now(timezone.utc)
+        initial = self.transaction(user_id, signed_date=initial_signed_date)
+        self.save(initial)
+
+        older_event = replace(
+            initial,
+            signed_date=initial_signed_date + timedelta(hours=1),
+            revocation_date=None,
+            revocation_reason=None,
+        )
+        revocation_date = initial_signed_date + timedelta(hours=2)
+        newer_event = replace(
+            initial,
+            signed_date=revocation_date,
+            revocation_date=revocation_date,
+            revocation_reason="1",
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(self.save, (newer_event, older_event)))
+
+        signed_date, stored_revocation_date, revocation_reason = self.transaction_row(
+            initial.transaction_id
+        )
+        self.assertEqual(signed_date, revocation_date)
+        self.assertEqual(stored_revocation_date, revocation_date)
+        self.assertEqual(revocation_reason, "1")
 
     def test_multiple_transactions_share_original_for_same_user(self):
         user_id = self.create_user()

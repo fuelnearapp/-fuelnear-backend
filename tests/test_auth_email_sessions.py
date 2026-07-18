@@ -14,6 +14,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import psycopg2
 
@@ -714,6 +715,102 @@ class AuthTestCase(unittest.TestCase):
         main.readiness_check()
         used_after = len(getattr(pool, "_used", {}))
         self.assertEqual(used_after, used_before)
+
+    def test_43_new_user_receives_app_account_token(self):
+        response = self.register()
+        response_token = response["user"]["app_account_token"]
+
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT app_account_token FROM users WHERE email = %s;",
+                    ("user@example.com",),
+                )
+                stored_token = cur.fetchone()[0]
+
+        self.assertEqual(str(UUID(response_token)), response_token)
+        self.assertEqual(str(stored_token), response_token)
+
+    def test_44_schema_backfills_existing_user_without_token(self):
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE users ALTER COLUMN app_account_token DROP NOT NULL;")
+                cur.execute("ALTER TABLE users ALTER COLUMN app_account_token DROP DEFAULT;")
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        app_account_token,
+                        email,
+                        password_hash,
+                        display_name,
+                        referral_code
+                    )
+                    VALUES (NULL, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        "legacy@example.com",
+                        main.hash_password(self.password),
+                        "Legacy User",
+                        "LEGACY01",
+                    ),
+                )
+                user_id = cur.fetchone()[0]
+
+            main.ensure_auth_schema(conn)
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT app_account_token FROM users WHERE id = %s;",
+                    (user_id,),
+                )
+                token = cur.fetchone()[0]
+
+        self.assertIsNotNone(token)
+        self.assertEqual(str(UUID(str(token))), str(token))
+
+    def test_45_app_account_token_is_unique(self):
+        first = self.register(email="first@example.com")["user"]["app_account_token"]
+        self.register(email="second@example.com")
+
+        with self.assertRaises(psycopg2.errors.UniqueViolation):
+            with main.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE users SET app_account_token = %s WHERE email = %s;",
+                        (first, "second@example.com"),
+                    )
+
+    def test_46_client_cannot_choose_app_account_token(self):
+        requested_token = str(uuid4())
+        payload = main.RegisterRequest(
+            email="user@example.com",
+            password=self.password,
+            app_account_token=requested_token,
+        )
+        response = main.register_user(payload, FakeRequest(path="/auth/register"))
+
+        self.assertNotEqual(response["user"]["app_account_token"], requested_token)
+        self.assertNotIn("app_account_token", main.RegisterRequest.model_fields)
+
+    def test_47_profile_exposes_stable_app_account_token(self):
+        registration = self.register()
+        original_token = registration["user"]["app_account_token"]
+        self.verify_user_directly()
+        login = self.login()
+
+        profile = main.get_current_user_profile(
+            f"Bearer {login['session']['access_token']}"
+        )
+        with main.get_connection() as conn:
+            main.ensure_auth_schema(conn)
+        second_profile = main.get_current_user_profile(
+            f"Bearer {login['session']['access_token']}"
+        )
+
+        self.assertEqual(login["user"]["app_account_token"], original_token)
+        self.assertEqual(profile["user"]["app_account_token"], original_token)
+        self.assertEqual(second_profile["user"]["app_account_token"], original_token)
 
 
 if __name__ == "__main__":

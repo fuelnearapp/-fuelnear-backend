@@ -21,8 +21,15 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depe
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
+from app import (
+    apple_jws_verifier,
+    apple_notification_processor,
+    apple_notification_verifier,
+    apple_purchase_processor,
+    apple_subscriptions,
+)
 from app.import_mimit import update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
 from app.email_service import email_delivery_is_configured, send_verification_email
@@ -90,6 +97,10 @@ READINESS_DB_TIMEOUT_MS = max(100, int(os.getenv("READINESS_DB_TIMEOUT_MS", "100
 ACCESS_LOG_MODE = os.getenv("FUELNEAR_ACCESS_LOG_MODE", "redacted").strip().lower()
 REDACTED_ACCESS_LOG_ENABLED = ACCESS_LOG_MODE in {"redacted", "safe", "production", "1", "true", "yes"}
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or os.getenv("APPLE_BUNDLE_ID") or "").strip()
+APPLE_NOTIFICATION_MAX_BODY_BYTES = max(
+    1024,
+    int(os.getenv("APPLE_NOTIFICATION_MAX_BODY_BYTES", str(256 * 1024))),
+)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
     client_id.strip()
@@ -102,6 +113,106 @@ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 app = FastAPI(title="FuelNear Backend")
+
+
+class AppleNotificationBodyTooLarge(RuntimeError):
+    pass
+
+
+class AppleNotificationRequestGuardMiddleware:
+    def __init__(self, app_instance: Any, max_body_bytes: int):
+        self.app = app_instance
+        self.max_body_bytes = max_body_bytes
+
+    async def _send_error(self, scope, receive, send, status_code: int, error_code: str, message: str):
+        response = JSONResponse(
+            status_code=status_code,
+            content={
+                "error_code": error_code,
+                "message": message,
+                "detail": message,
+            },
+        )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/apple/notifications"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            await self._send_error(
+                scope,
+                receive,
+                send,
+                415,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Content-Type must be application/json",
+            )
+            return
+
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                await self._send_error(
+                    scope,
+                    receive,
+                    send,
+                    400,
+                    "INVALID_REQUEST",
+                    "Invalid request",
+                )
+                return
+            if declared_size < 0 or declared_size > self.max_body_bytes:
+                await self._send_error(
+                    scope,
+                    receive,
+                    send,
+                    413,
+                    "REQUEST_TOO_LARGE",
+                    "Request body is too large",
+                )
+                return
+
+        received_size = 0
+
+        async def limited_receive():
+            nonlocal received_size
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_size += len(message.get("body", b""))
+                if received_size > self.max_body_bytes:
+                    raise AppleNotificationBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except AppleNotificationBodyTooLarge:
+            await self._send_error(
+                scope,
+                receive,
+                send,
+                413,
+                "REQUEST_TOO_LARGE",
+                "Request body is too large",
+            )
+
+
+app.add_middleware(
+    AppleNotificationRequestGuardMiddleware,
+    max_body_bytes=APPLE_NOTIFICATION_MAX_BODY_BYTES,
+)
 
 if REDACTED_ACCESS_LOG_ENABLED:
     logging.getLogger("uvicorn.access").disabled = True
@@ -203,6 +314,7 @@ AUTH_VALIDATION_PATHS = {
     "/auth/verify-email",
     "/auth/resend-verification-email",
     "/user/referral-code",
+    "/user/subscription/apple/verify",
 }
 
 
@@ -302,6 +414,38 @@ class GoogleAuthRequest(BaseModel):
     display_name: str | None = None
     referral_code: str | None = None
     device_info: str | None = None
+
+
+class AppleSubscriptionVerifyRequest(BaseModel):
+    signed_transaction: str
+
+    @field_validator("signed_transaction")
+    @classmethod
+    def validate_signed_transaction(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("signed_transaction must not be empty")
+        return normalized
+
+
+class AppleSubscriptionVerifyResponse(BaseModel):
+    transaction_id: str
+    original_transaction_id: str
+    product_id: str
+    created: bool
+    is_plus: bool
+    expires_at: datetime | None
+    changed: bool
+
+
+class AppleNotificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signedPayload: str
+
+
+class AppleNotificationResponse(BaseModel):
+    status: str
 
 
 class ApplyReferralCodeRequest(BaseModel):
@@ -417,6 +561,15 @@ def notification_preferences_log(message: str) -> None:
 
 def user_location_log(message: str) -> None:
     print(f"[USER_LOCATION] {message}")
+
+
+def apple_notification_log(event: str, **context: Any) -> None:
+    safe_context = " ".join(
+        f"{key}={re.sub(r'[^a-zA-Z0-9_.:-]', '_', str(value))[:128]}"
+        for key, value in context.items()
+        if value is not None
+    )
+    print(f"[APPLE_NOTIFICATION] event={event} {safe_context}".rstrip())
 
 
 def user_location_max_age_delta() -> timedelta:
@@ -852,11 +1005,26 @@ def get_active_plus_status(conn, user_id: int) -> dict[str, Any]:
     }
 
 
+def get_user_app_account_token(conn, user_id: int) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT app_account_token FROM users WHERE id = %s LIMIT 1;",
+            (user_id,),
+        )
+        row = cur.fetchone()
+
+    if row is None or row[0] is None:
+        raise RuntimeError("User app account token is unavailable")
+
+    return str(row[0])
+
+
 def build_user_payload(conn, user_row: dict[str, Any]) -> dict[str, Any]:
     plus_info = get_active_plus_status(conn, user_row["id"])
 
     payload = {
         "id": user_row["id"],
+        "app_account_token": get_user_app_account_token(conn, user_row["id"]),
         "email": user_row["email"],
         "display_name": user_row["display_name"],
         "referral_code": user_row["referral_code"],
@@ -2556,6 +2724,7 @@ def ensure_auth_schema(conn) -> None:
             """
             CREATE TABLE IF NOT EXISTS users (
                 id BIGSERIAL PRIMARY KEY,
+                app_account_token UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT,
                 display_name TEXT NOT NULL,
@@ -2572,6 +2741,20 @@ def ensure_auth_schema(conn) -> None:
             """
             ALTER TABLE users
             ALTER COLUMN password_hash DROP NOT NULL;
+            """
+        )
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS app_account_token UUID NULL;")
+        cur.execute(
+            "ALTER TABLE users ALTER COLUMN app_account_token SET DEFAULT gen_random_uuid();"
+        )
+        cur.execute(
+            "UPDATE users SET app_account_token = gen_random_uuid() WHERE app_account_token IS NULL;"
+        )
+        cur.execute("ALTER TABLE users ALTER COLUMN app_account_token SET NOT NULL;")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_users_app_account_token
+            ON users(app_account_token);
             """
         )
 
@@ -5618,6 +5801,240 @@ def get_current_user_subscription(authorization: str | None = Header(default=Non
         }
     finally:
         conn.close()
+
+
+@app.post(
+    "/user/subscription/apple/verify",
+    response_model=AppleSubscriptionVerifyResponse,
+)
+def verify_current_user_apple_subscription(
+    payload: AppleSubscriptionVerifyRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> AppleSubscriptionVerifyResponse:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = user_payload["id"]
+    expected_app_account_token = user_payload.get("app_account_token")
+    if not expected_app_account_token:
+        raise APIError(
+            403,
+            "APPLE_APP_ACCOUNT_TOKEN_INVALID",
+            "Apple subscription could not be verified",
+        )
+
+    try:
+        verified = apple_jws_verifier.verify_apple_signed_transaction(
+            signed_transaction=payload.signed_transaction,
+            expected_app_account_token=expected_app_account_token,
+        )
+        transaction = apple_subscriptions.AppleTransaction(
+            user_id=user_id,
+            product_id=verified.product_id,
+            transaction_id=verified.transaction_id,
+            original_transaction_id=verified.original_transaction_id,
+            purchase_date=verified.purchase_date,
+            expires_date=verified.expires_date,
+            environment=verified.environment,
+            ownership_type=verified.ownership_type,
+            transaction_reason=verified.transaction_reason,
+            revocation_date=verified.revocation_date,
+            revocation_reason=verified.revocation_reason,
+            app_account_token=verified.app_account_token,
+            signed_date=verified.signed_date,
+            storefront=verified.storefront,
+            offer_type=verified.offer_type,
+        )
+        result = apple_purchase_processor.process_apple_transaction(transaction)
+        return AppleSubscriptionVerifyResponse(
+            transaction_id=result.transaction_id,
+            original_transaction_id=result.original_transaction_id,
+            product_id=verified.product_id,
+            created=result.created,
+            is_plus=result.is_plus,
+            expires_at=result.expires_at,
+            changed=result.changed,
+        )
+    except apple_jws_verifier.AppleJWSAppAccountTokenError:
+        raise APIError(
+            403,
+            "APPLE_APP_ACCOUNT_TOKEN_INVALID",
+            "Apple subscription could not be verified",
+        )
+    except apple_jws_verifier.AppleJWSVerificationUnavailableError:
+        raise APIError(
+            503,
+            "APPLE_VERIFICATION_UNAVAILABLE",
+            "Apple subscription verification is temporarily unavailable",
+        )
+    except (
+        apple_jws_verifier.AppleJWSInvalidError,
+        apple_jws_verifier.AppleJWSPayloadError,
+        apple_subscriptions.AppleTransactionValidationError,
+    ):
+        raise APIError(
+            400,
+            "APPLE_TRANSACTION_INVALID",
+            "Apple transaction is invalid",
+        )
+    except (
+        apple_subscriptions.AppleOriginalTransactionOwnershipConflict,
+        apple_subscriptions.AppleTransactionIdentityConflict,
+    ):
+        raise APIError(
+            409,
+            "APPLE_TRANSACTION_OWNERSHIP_CONFLICT",
+            "Apple transaction is already associated with another account",
+        )
+    except Exception as exc:
+        request_id = log_internal_exception("apple_subscription_verify", exc, user_id=user_id)
+        raise APIError(
+            500,
+            "SERVER_ERROR",
+            f"Apple subscription verification failed. request_id={request_id}",
+        )
+
+
+@app.post(
+    "/apple/notifications",
+    response_model=AppleNotificationResponse,
+    summary="Receive an App Store Server Notification V2",
+    description=(
+        "Verifies an Apple-signed App Store Server Notification V2 and passes "
+        "the verified notification to the subscription processor."
+    ),
+    responses={
+        400: {"description": "The signed notification is invalid."},
+        413: {"description": "The request body exceeds the configured limit."},
+        415: {"description": "Content-Type must be application/json."},
+        409: {"description": "The transaction ownership conflicts with existing data."},
+        422: {"description": "The request body is missing or malformed."},
+        500: {"description": "The notification could not be processed temporarily."},
+    },
+)
+def receive_apple_notification(
+    payload: AppleNotificationRequest,
+) -> AppleNotificationResponse:
+    signed_payload = payload.signedPayload.strip()
+    if not signed_payload:
+        raise APIError(
+            400,
+            "APPLE_NOTIFICATION_INVALID",
+            "Apple notification payload is invalid",
+        )
+
+    verified = None
+    started_at = time.monotonic()
+    try:
+        verified = apple_notification_verifier.verify_app_store_notification(
+            signed_payload
+        )
+        apple_notification_log(
+            "verified",
+            notification_uuid=verified.notification_uuid,
+            notification_type=verified.notification_type,
+            subtype=verified.subtype,
+            environment=verified.environment,
+        )
+        result = apple_notification_processor.process_app_store_notification(
+            verified
+        )
+        apple_notification_log(
+            "processed",
+            notification_uuid=verified.notification_uuid,
+            notification_type=verified.notification_type,
+            subtype=verified.subtype,
+            environment=verified.environment,
+            handled=str(result.handled).lower(),
+            action=result.action,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        return AppleNotificationResponse(status="ok")
+    except (
+        apple_notification_verifier.AppleNotificationInvalidError,
+        apple_notification_verifier.AppleNotificationPayloadError,
+    ) as exc:
+        apple_notification_log(
+            "verification_failed",
+            error_type=exc.__class__.__name__,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            400,
+            "APPLE_NOTIFICATION_INVALID",
+            "Apple notification payload is invalid",
+        )
+    except (
+        apple_notification_verifier.AppleNotificationConfigurationError,
+        apple_notification_verifier.AppleNotificationCertificatesError,
+        apple_notification_verifier.AppleNotificationVerificationUnavailableError,
+    ) as exc:
+        request_id = log_internal_exception(
+            "apple_notification_unavailable",
+            exc,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            500,
+            "APPLE_NOTIFICATION_UNAVAILABLE",
+            f"Apple notification processing is unavailable. request_id={request_id}",
+        )
+    except apple_notification_processor.AppleNotificationTransactionInsufficient as exc:
+        apple_notification_log(
+            "processing_rejected",
+            notification_uuid=(verified.notification_uuid if verified else None),
+            notification_type=(verified.notification_type if verified else None),
+            error_type=exc.__class__.__name__,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            400,
+            "APPLE_NOTIFICATION_INVALID",
+            "Apple notification payload is invalid",
+        )
+    except apple_notification_processor.AppleNotificationOwnershipConflict as exc:
+        apple_notification_log(
+            "processing_rejected",
+            notification_uuid=(verified.notification_uuid if verified else None),
+            notification_type=(verified.notification_type if verified else None),
+            error_type=exc.__class__.__name__,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            409,
+            "APPLE_NOTIFICATION_OWNERSHIP_CONFLICT",
+            "Apple notification ownership conflicts with existing data",
+        )
+    except apple_notification_processor.AppleNotificationProcessorError as exc:
+        request_id = log_internal_exception(
+            "apple_notification_processing",
+            exc,
+            notification_uuid=(
+                re.sub(r"[^a-zA-Z0-9_.:-]", "_", verified.notification_uuid)[:128]
+                if verified
+                else None
+            ),
+            notification_type=(
+                re.sub(r"[^a-zA-Z0-9_.:-]", "_", verified.notification_type)[:128]
+                if verified
+                else None
+            ),
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            500,
+            "APPLE_NOTIFICATION_PROCESSING_FAILED",
+            f"Apple notification processing failed. request_id={request_id}",
+        )
+    except Exception as exc:
+        request_id = log_internal_exception(
+            "apple_notification_unexpected",
+            exc,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        raise APIError(
+            500,
+            "SERVER_ERROR",
+            f"Apple notification processing failed. request_id={request_id}",
+        )
 
 
 @app.get("/stations")

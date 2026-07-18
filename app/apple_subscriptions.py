@@ -147,9 +147,65 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                 if (
                     existing_transaction["user_id"] != normalized.user_id
                     or existing_transaction["original_transaction_id"] != normalized.original_transaction_id
+                    or (
+                        normalized.app_account_token is not None
+                        and existing_transaction["app_account_token"] is not None
+                        and str(existing_transaction["app_account_token"])
+                        != str(normalized.app_account_token)
+                    )
                 ):
                     raise AppleTransactionIdentityConflict(
                         "transaction_id is already associated with a different Apple subscription"
+                    )
+
+                existing_signed_date = existing_transaction["signed_date"]
+                if normalized.signed_date is not None and (
+                    existing_signed_date is None
+                    or normalized.signed_date > existing_signed_date
+                ):
+                    cur.execute(
+                        """
+                        UPDATE apple_transactions
+                        SET product_id = %s,
+                            purchase_date = %s,
+                            expires_date = COALESCE(%s, expires_date),
+                            environment = %s,
+                            ownership_type = COALESCE(%s, ownership_type),
+                            transaction_reason = COALESCE(%s, transaction_reason),
+                            revocation_date = %s,
+                            revocation_reason = %s,
+                            app_account_token = COALESCE(%s, app_account_token),
+                            signed_date = %s,
+                            storefront = COALESCE(%s, storefront),
+                            offer_type = COALESCE(%s, offer_type),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING *;
+                        """,
+                        (
+                            normalized.product_id,
+                            normalized.purchase_date,
+                            normalized.expires_date,
+                            normalized.environment,
+                            normalized.ownership_type,
+                            normalized.transaction_reason,
+                            normalized.revocation_date,
+                            normalized.revocation_reason,
+                            (
+                                str(normalized.app_account_token)
+                                if normalized.app_account_token is not None
+                                else None
+                            ),
+                            normalized.signed_date,
+                            normalized.storefront,
+                            normalized.offer_type,
+                            existing_transaction["id"],
+                        ),
+                    )
+                    updated_transaction = cur.fetchone()
+                    return AppleTransactionSaveResult(
+                        created=False,
+                        row=dict(updated_transaction),
                     )
                 return AppleTransactionSaveResult(created=False, row=dict(existing_transaction))
 
@@ -204,7 +260,11 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     normalized.transaction_reason,
                     normalized.revocation_date,
                     normalized.revocation_reason,
-                    normalized.app_account_token,
+                    (
+                        str(normalized.app_account_token)
+                        if normalized.app_account_token is not None
+                        else None
+                    ),
                     normalized.signed_date,
                     normalized.storefront,
                     normalized.offer_type,
