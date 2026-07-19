@@ -161,10 +161,13 @@ def is_subscription_active(
 def get_active_subscription_for_user(
     user_id: int,
     reference_date: datetime | None = None,
+    *,
+    connection: Any | None = None,
 ) -> dict[str, Any] | None:
     normalized_user_id = _required_user_id(user_id)
     normalized_reference_date = _reference_date(reference_date)
-    conn = get_connection()
+    conn = connection if connection is not None else get_connection()
+    owns_connection = connection is None
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -194,4 +197,5 @@ def get_active_subscription_for_user(
             row = cur.fetchone()
             return dict(row) if row is not None else None
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()

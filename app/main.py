@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -609,18 +610,18 @@ def auth_rate_limit_log(message: str) -> None:
 
 
 def get_request_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for", "")
-    if forwarded_for:
-        first_hop = forwarded_for.split(",", 1)[0].strip()
-        if first_hop:
-            return first_hop
-
     real_ip = request.headers.get("x-real-ip", "").strip()
     if real_ip:
-        return real_ip
+        try:
+            return ipaddress.ip_address(real_ip).compressed
+        except ValueError:
+            pass
 
     if request.client and request.client.host:
-        return request.client.host
+        try:
+            return ipaddress.ip_address(request.client.host).compressed
+        except ValueError:
+            pass
 
     return "unknown"
 
@@ -1572,10 +1573,11 @@ def verify_email_token(conn, credential: str, email: str | None = None) -> dict[
             FROM email_verification_tokens evt
             JOIN users u ON u.id = evt.user_id
             WHERE {hash_column} = %s
+              AND (%s IS NULL OR u.email = %s)
             LIMIT 1
             FOR UPDATE;
             """,
-            (credential_hash,),
+            (credential_hash, email, email),
         )
         token_row = cur.fetchone()
         if token_row is None:
@@ -2252,6 +2254,16 @@ def set_mimit_update_run_id(run_id: int) -> None:
 
     with _mimit_state_lock:
         _mimit_update_run_id = run_id
+
+
+def rollback_mimit_transaction(conn, context: str) -> None:
+    try:
+        conn.rollback()
+    except Exception as exc:
+        print(
+            f"[MIMIT] Transaction rollback failed. context={context} "
+            f"type={exc.__class__.__name__}"
+        )
 
 
 def release_mimit_update_lock(conn) -> None:
@@ -3725,8 +3737,8 @@ def run_mimit_update_background(conn, run_id: int) -> None:
     try:
         print(f"[MIMIT] Background update started. run_id={run_id}")
         result = update_mimit_data(download=True)
-        with conn:
-            finish_mimit_import_run(conn, run_id, result)
+        finish_mimit_import_run(conn, run_id, result)
+        conn.commit()
 
         try:
             notification_summary = process_price_notifications_for_run(run_id)
@@ -3747,15 +3759,17 @@ def run_mimit_update_background(conn, run_id: int) -> None:
             f"duration_seconds={duration_seconds}"
         )
     except Exception as exc:
+        rollback_mimit_transaction(conn, "background_update")
         duration_seconds = int(time.monotonic() - started_at)
         print(
             f"[MIMIT] Background update failed. run_id={run_id} "
             f"duration_seconds={duration_seconds} type={exc.__class__.__name__}"
         )
         try:
-            with conn:
-                fail_mimit_import_run(conn, run_id, str(exc))
+            fail_mimit_import_run(conn, run_id, str(exc))
+            conn.commit()
         except Exception as persist_error:
+            rollback_mimit_transaction(conn, "persist_background_failure")
             print(
                 f"[MIMIT] Failed to persist background import failure. run_id={run_id} "
                 f"type={persist_error.__class__.__name__}"
@@ -3798,10 +3812,10 @@ def admin_update_mimit(
                 "stale": runtime_state["stale"],
             }
 
-        with conn:
-            ensure_mimit_import_schema(conn)
-            orphaned_runs = fail_orphaned_mimit_import_runs(conn)
-            run_id = create_mimit_import_run(conn)
+        ensure_mimit_import_schema(conn)
+        orphaned_runs = fail_orphaned_mimit_import_runs(conn)
+        run_id = create_mimit_import_run(conn)
+        conn.commit()
         set_mimit_update_run_id(run_id)
 
         if orphaned_runs:
@@ -3820,15 +3834,17 @@ def admin_update_mimit(
     except HTTPException:
         raise
     except Exception as exc:
+        rollback_mimit_transaction(conn, "schedule_update")
         error_message = str(exc)
         request_id = log_internal_exception("mimit_update", exc, run_id=run_id)
         print(f"[MIMIT] Update finished with failure. run_id={run_id} request_id={request_id}")
 
         if run_id is not None:
             try:
-                with conn:
-                    fail_mimit_import_run(conn, run_id, error_message)
+                fail_mimit_import_run(conn, run_id, error_message)
+                conn.commit()
             except Exception as persist_error:
+                rollback_mimit_transaction(conn, "persist_schedule_failure")
                 persist_request_id = log_internal_exception(
                     "mimit_update_persist_failure",
                     persist_error,
@@ -4720,6 +4736,8 @@ def verify_email(payload: EmailVerificationRequest, request: Request) -> dict[st
         raise APIError(400, "VERIFICATION_CODE_INVALID", "Verification code or token is required")
     if payload.code is not None and not re.fullmatch(r"\d{6}", credential):
         raise APIError(400, "VERIFICATION_CODE_INVALID", "Verification code must contain 6 digits")
+    if payload.code is not None and email is None:
+        raise APIError(400, "VERIFICATION_CODE_INVALID", "Email is required for verification codes")
     conn = None
     try:
         conn = get_connection()

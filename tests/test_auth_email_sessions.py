@@ -171,8 +171,8 @@ def tearDownModule() -> None:
 
 
 class FakeRequest:
-    def __init__(self, ip: str = "127.0.0.1", path: str = "/"):
-        self.headers = {}
+    def __init__(self, ip: str = "127.0.0.1", path: str = "/", headers=None):
+        self.headers = headers or {}
         self.client = SimpleNamespace(host=ip)
         self.url = SimpleNamespace(path=path)
 
@@ -414,6 +414,83 @@ class AuthTestCase(unittest.TestCase):
         with self.assertRaises(main.APIError) as cm2:
             main.resend_email_verification(payload, FakeRequest(path="/auth/resend-verification-email"))
         self.assert_api_error(cm2, "RATE_LIMITED", 429)
+
+    def test_short_verification_code_requires_email_context(self):
+        self.register()
+        code = self.get_latest_verification_code()
+
+        with self.assertRaises(main.APIError) as cm:
+            main.verify_email(
+                main.EmailVerificationRequest(code=code),
+                FakeRequest(path="/auth/verify-email"),
+            )
+
+        self.assert_api_error(cm, "VERIFICATION_CODE_INVALID", 400)
+        self.assertFalse(self.get_user()["is_email_verified"])
+
+    def test_short_verification_code_is_bound_to_matching_email(self):
+        self.register(email="first@example.com")
+        first_code = self.get_latest_verification_code("first@example.com")
+        self.register(email="second@example.com")
+
+        with self.assertRaises(main.APIError) as cm:
+            self.verify_code(first_code, email="second@example.com")
+
+        self.assert_api_error(cm, "VERIFICATION_CODE_INVALID", 400)
+        self.assertFalse(self.get_user("first@example.com")["is_email_verified"])
+        self.assertFalse(self.get_user("second@example.com")["is_email_verified"])
+
+    def test_legacy_long_verification_token_remains_usable_without_email(self):
+        self.register()
+        conn = main.get_connection()
+        try:
+            with conn:
+                verification = main.create_email_verification_token(
+                    conn,
+                    self.get_user()["id"],
+                )
+        finally:
+            conn.close()
+
+        response = main.verify_email(
+            main.EmailVerificationRequest(token=verification["token"]),
+            FakeRequest(path="/auth/verify-email"),
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertTrue(self.get_user()["is_email_verified"])
+
+    def test_rate_limit_uses_railway_real_ip_not_client_forwarded_for(self):
+        request_a = FakeRequest(
+            ip="100.64.0.1",
+            path="/auth/login",
+            headers={
+                "x-real-ip": "203.0.113.10",
+                "x-forwarded-for": "198.51.100.1",
+            },
+        )
+        request_b = FakeRequest(
+            ip="100.64.0.1",
+            path="/auth/login",
+            headers={
+                "x-real-ip": "203.0.113.10",
+                "x-forwarded-for": "198.51.100.2",
+            },
+        )
+        main.AUTH_LOGIN_RATE_LIMIT = 1
+        payload = main.LoginRequest(
+            email="missing@example.com",
+            password=self.password,
+            device_info=None,
+        )
+
+        with self.assertRaises(main.APIError) as first:
+            main.login_user(payload, request_a)
+        self.assert_api_error(first, "INVALID_CREDENTIALS", 401)
+
+        with self.assertRaises(main.APIError) as second:
+            main.login_user(payload, request_b)
+        self.assert_api_error(second, "RATE_LIMITED", 429)
 
     def test_14_login_valid_after_verification_creates_session(self):
         self.register()

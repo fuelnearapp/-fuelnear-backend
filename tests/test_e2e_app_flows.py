@@ -259,6 +259,18 @@ class ImmediateBackgroundTasks:
         func(*args, **kwargs)
 
 
+class DeferredBackgroundTasks:
+    def __init__(self):
+        self.tasks = []
+
+    def add_task(self, func, *args, **kwargs):
+        self.tasks.append((func, args, kwargs))
+
+    def run(self):
+        for func, args, kwargs in self.tasks:
+            func(*args, **kwargs)
+
+
 class FuelNearE2ETestCase(unittest.TestCase):
     password = "CorrectHorse123"
     scenario_count = 8
@@ -629,6 +641,37 @@ class FuelNearE2ETestCase(unittest.TestCase):
         main.on_shutdown()
         main.on_startup()
         self.assertIsNotNone(db.get_connection_pool())
+
+    def test_06b_mimit_advisory_lock_connection_stays_checked_out_until_background_finishes(self):
+        background_tasks = DeferredBackgroundTasks()
+        original_update = main.update_mimit_data
+        main.update_mimit_data = self.fake_mimit_update
+        try:
+            response = main.admin_update_mimit(background_tasks, None)
+            self.assertTrue(response["started"])
+            self.assertEqual(len(background_tasks.tasks), 1)
+
+            lock_connection = background_tasks.tasks[0][1][0]
+            self.assertFalse(lock_connection._returned)
+
+            other_connection = main.get_connection()
+            try:
+                self.assertIsNot(
+                    other_connection._raw_connection,
+                    lock_connection._raw_connection,
+                )
+            finally:
+                other_connection.close()
+
+            background_tasks.run()
+            self.assertTrue(lock_connection._returned)
+            self.assertFalse(main.get_mimit_runtime_state()["update_in_progress"])
+        finally:
+            if background_tasks.tasks:
+                lock_connection = background_tasks.tasks[0][1][0]
+                if not lock_connection._returned:
+                    background_tasks.run()
+            main.update_mimit_data = original_update
 
     def test_07_concurrent_realistic_operations_do_not_duplicate_or_exhaust_pool(self):
         user_a = self.signup_verified_login("a@example.com")

@@ -8,12 +8,14 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 import app.apple_subscription_reconciler as reconciler
 import app.apple_subscription_service as service
+import app.apple_subscriptions as repository
 
 
 def find_free_port() -> int:
@@ -208,6 +210,65 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                 row = cur.fetchone()
                 return dict(row) if row else None
 
+    def make_apple_transaction(
+        self,
+        user_id: int,
+        *,
+        transaction_id: str,
+        original_transaction_id: str,
+        signed_date: datetime,
+        expires_at: datetime,
+        revoked_at: datetime | None = None,
+    ) -> repository.AppleTransaction:
+        return repository.AppleTransaction(
+            user_id=user_id,
+            product_id="MB.FuelNear.plus.monthly",
+            transaction_id=transaction_id,
+            original_transaction_id=original_transaction_id,
+            purchase_date=signed_date - timedelta(days=30),
+            expires_date=expires_at,
+            environment="Sandbox",
+            revocation_date=revoked_at,
+            signed_date=signed_date,
+        )
+
+    def save_and_reconcile(
+        self,
+        transaction: repository.AppleTransaction,
+        reference: datetime,
+    ):
+        conn = self.connect()
+        try:
+            repository.save_apple_transaction(conn, transaction)
+        finally:
+            conn.close()
+        return reconciler.reconcile_apple_entitlement(
+            transaction.user_id,
+            reference,
+        )
+
+    def count_apple_transactions(self, user_id: int) -> int:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM apple_transactions WHERE user_id = %s;",
+                    (user_id,),
+                )
+                return int(cur.fetchone()[0])
+
+    def count_active_entitlements(self, user_id: int) -> int:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM user_subscriptions
+                    WHERE user_id = %s AND status = 'active';
+                    """,
+                    (user_id,),
+                )
+                return int(cur.fetchone()[0])
+
     def test_apple_active_without_previous_entitlement(self):
         user_id = self.create_user()
         reference = datetime.now(timezone.utc)
@@ -323,6 +384,178 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                 active_count = int(cur.fetchone()[0])
         self.assertEqual(active_count, 1)
         self.assertEqual(sum(result.changed for result in results), 1)
+
+    def test_ledger_is_read_with_same_connection_after_user_lock(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        self.insert_apple_transaction(user_id, reference + timedelta(days=30))
+        original_get_active = service.get_active_subscription_for_user
+        observed_connection = None
+
+        def assert_locked_then_read(requested_user_id, requested_reference, *, connection=None):
+            nonlocal observed_connection
+            observed_connection = connection
+            self.assertIsNotNone(connection)
+
+            probe = self.connect()
+            try:
+                with probe.cursor() as cur:
+                    with self.assertRaises(psycopg2.errors.LockNotAvailable):
+                        cur.execute(
+                            "SELECT id FROM users WHERE id = %s FOR UPDATE NOWAIT;",
+                            (user_id,),
+                        )
+                probe.rollback()
+            finally:
+                probe.close()
+
+            return original_get_active(
+                requested_user_id,
+                requested_reference,
+                connection=connection,
+            )
+
+        with patch.object(
+            service,
+            "get_active_subscription_for_user",
+            side_effect=assert_locked_then_read,
+        ):
+            result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        self.assertIsNotNone(observed_connection)
+        self.assertTrue(result.apple_active)
+
+    def test_concurrent_did_renew_and_refund_use_latest_ledger_state(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        renewal = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"transaction-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=1),
+            expires_at=reference + timedelta(days=30),
+        )
+        refund = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"transaction-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=2),
+            expires_at=reference + timedelta(days=30),
+            revoked_at=reference + timedelta(seconds=2),
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(self.save_and_reconcile, transaction, reference)
+                for transaction in (renewal, refund)
+            ]
+            [future.result(timeout=10) for future in futures]
+
+        self.assertIsNone(service.get_active_subscription_for_user(user_id, reference))
+        self.assertEqual(self.count_active_entitlements(user_id), 0)
+        self.assertEqual(self.count_apple_transactions(user_id), 1)
+
+    def test_concurrent_refund_and_refund_reversed_restore_latest_state(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        transaction_id = f"transaction-{user_id}"
+        base = self.make_apple_transaction(
+            user_id,
+            transaction_id=transaction_id,
+            original_transaction_id=original_id,
+            signed_date=reference,
+            expires_at=reference + timedelta(days=30),
+        )
+        self.save_and_reconcile(base, reference)
+        refund = self.make_apple_transaction(
+            user_id,
+            transaction_id=transaction_id,
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=1),
+            expires_at=reference + timedelta(days=30),
+            revoked_at=reference + timedelta(seconds=1),
+        )
+        refund_reversed = self.make_apple_transaction(
+            user_id,
+            transaction_id=transaction_id,
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=2),
+            expires_at=reference + timedelta(days=30),
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(self.save_and_reconcile, transaction, reference)
+                for transaction in (refund, refund_reversed)
+            ]
+            [future.result(timeout=10) for future in futures]
+
+        active = service.get_active_subscription_for_user(user_id, reference)
+        self.assertIsNotNone(active)
+        self.assertIsNone(active["revocation_date"])
+        self.assertEqual(self.count_active_entitlements(user_id), 1)
+        self.assertEqual(self.count_apple_transactions(user_id), 1)
+
+    def test_concurrent_did_renew_events_preserve_latest_expiration(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        first_renewal = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"renewal-a-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=1),
+            expires_at=reference + timedelta(days=30),
+        )
+        second_renewal = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"renewal-b-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=2),
+            expires_at=reference + timedelta(days=60),
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(self.save_and_reconcile, transaction, reference)
+                for transaction in (first_renewal, second_renewal)
+            ]
+            [future.result(timeout=10) for future in futures]
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(entitlement["expires_at"], reference + timedelta(days=60))
+        self.assertEqual(self.count_active_entitlements(user_id), 1)
+        self.assertEqual(self.count_apple_transactions(user_id), 2)
+
+    def test_out_of_order_notifications_reconcile_from_latest_signed_state(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        newer = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"newer-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=2),
+            expires_at=reference + timedelta(days=60),
+        )
+        older = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"older-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=1),
+            expires_at=reference + timedelta(days=30),
+        )
+
+        self.save_and_reconcile(newer, reference)
+        self.save_and_reconcile(older, reference)
+
+        active = service.get_active_subscription_for_user(user_id, reference)
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(active["transaction_id"], newer.transaction_id)
+        self.assertEqual(entitlement["expires_at"], newer.expires_date)
+        self.assertEqual(self.count_apple_transactions(user_id), 2)
 
 
 if __name__ == "__main__":

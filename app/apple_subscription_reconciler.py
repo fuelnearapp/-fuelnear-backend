@@ -50,17 +50,6 @@ def reconcile_apple_entitlement(
         raise ValueError("user_id must be a positive integer")
 
     normalized_reference_date = _reference_date(reference_date)
-    apple_subscription = apple_subscription_service.get_active_subscription_for_user(
-        user_id,
-        normalized_reference_date,
-    )
-    apple_active = apple_subscription is not None
-    apple_expires_at = apple_subscription["expires_date"] if apple_subscription else None
-    if apple_active and apple_expires_at is None:
-        raise AppleEntitlementMissingExpiration(
-            "An active Apple subscription requires expires_date for entitlement reconciliation"
-        )
-
     conn = get_connection()
     try:
         with conn:
@@ -68,6 +57,22 @@ def reconcile_apple_entitlement(
                 cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE;", (user_id,))
                 if cur.fetchone() is None:
                     raise AppleEntitlementUserNotFound("User not found")
+
+                apple_subscription = apple_subscription_service.get_active_subscription_for_user(
+                    user_id,
+                    normalized_reference_date,
+                    connection=conn,
+                )
+                apple_active = apple_subscription is not None
+                apple_expires_at = (
+                    apple_subscription["expires_date"]
+                    if apple_subscription
+                    else None
+                )
+                if apple_active and apple_expires_at is None:
+                    raise AppleEntitlementMissingExpiration(
+                        "An active Apple subscription requires expires_date for entitlement reconciliation"
+                    )
 
                 cur.execute(
                     """
