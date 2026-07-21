@@ -101,9 +101,9 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 return_value={"user_id": 7},
             ),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
-                return_value=7,
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
+                return_value=processor.guest_subscriptions.AppleSubscriptionOwner("user", 7),
             ),
             patch.object(
                 processor.apple_purchase_processor,
@@ -172,8 +172,8 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 return_value=None,
             ),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
                 return_value=None,
             ),
             patch.object(
@@ -195,8 +195,8 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 return_value={"user_id": 4},
             ),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
                 return_value=None,
             ),
             patch.object(
@@ -214,9 +214,9 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
             patch.object(processor.apple_subscription_service, "get_transaction", return_value=None),
             patch.object(processor.apple_subscription_service, "get_latest_transaction", return_value=None),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
-                return_value=5,
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
+                return_value=processor.guest_subscriptions.AppleSubscriptionOwner("user", 5),
             ) as token_lookup,
             patch.object(
                 processor.apple_purchase_processor,
@@ -233,8 +233,8 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
             patch.object(processor.apple_subscription_service, "get_transaction", return_value=None),
             patch.object(processor.apple_subscription_service, "get_latest_transaction", return_value=None),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
                 return_value=None,
             ),
         ):
@@ -254,9 +254,9 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 return_value={"user_id": 2},
             ),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
-                return_value=1,
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
+                return_value=processor.guest_subscriptions.AppleSubscriptionOwner("user", 1),
             ),
         ):
             with self.assertRaises(processor.AppleNotificationOwnershipConflict):
@@ -276,9 +276,9 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 return_value={"user_id": 7},
             ),
             patch.object(
-                processor.apple_subscription_service,
-                "get_user_id_by_app_account_token",
-                return_value=7,
+                processor.guest_subscriptions,
+                "resolve_owner_by_app_account_token",
+                return_value=processor.guest_subscriptions.AppleSubscriptionOwner("user", 7),
             ),
             patch.object(
                 processor.apple_purchase_processor,

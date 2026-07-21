@@ -80,7 +80,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                     """
                     CREATE TABLE apple_transactions (
                         id BIGSERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        user_id BIGINT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        guest_id BIGINT NULL,
                         product_id TEXT NOT NULL,
                         transaction_id TEXT NOT NULL UNIQUE,
                         original_transaction_id TEXT NOT NULL,

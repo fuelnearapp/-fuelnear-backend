@@ -37,12 +37,13 @@ class AppleTransactionIdentityConflict(AppleSubscriptionRepositoryError):
 
 @dataclass(frozen=True, slots=True)
 class AppleTransaction:
-    user_id: int
+    user_id: int | None
     product_id: str
     transaction_id: str
     original_transaction_id: str
     purchase_date: datetime
     environment: str
+    guest_id: int | None = None
     expires_date: datetime | None = None
     ownership_type: str | None = None
     transaction_reason: str | None = None
@@ -57,6 +58,7 @@ class AppleTransaction:
 @dataclass(frozen=True, slots=True)
 class AppleTransactionSaveResult:
     created: bool
+    changed: bool
     row: dict[str, Any]
 
 
@@ -82,8 +84,22 @@ def _validate_optional_datetime(value: datetime | None, field_name: str) -> None
 def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransaction:
     if not isinstance(transaction, AppleTransaction):
         raise AppleTransactionValidationError("transaction must be an AppleTransaction")
-    if isinstance(transaction.user_id, bool) or not isinstance(transaction.user_id, int) or transaction.user_id <= 0:
+    if transaction.user_id is not None and (
+        isinstance(transaction.user_id, bool)
+        or not isinstance(transaction.user_id, int)
+        or transaction.user_id <= 0
+    ):
         raise AppleTransactionValidationError("user_id must be a positive integer")
+    if transaction.guest_id is not None and (
+        isinstance(transaction.guest_id, bool)
+        or not isinstance(transaction.guest_id, int)
+        or transaction.guest_id <= 0
+    ):
+        raise AppleTransactionValidationError("guest_id must be a positive integer")
+    if (transaction.user_id is None) == (transaction.guest_id is None):
+        raise AppleTransactionValidationError(
+            "Apple transaction must have exactly one owner"
+        )
 
     product_id = _normalize_required_text(transaction.product_id, "product_id")
     if product_id not in SUPPORTED_APPLE_PRODUCT_IDS:
@@ -128,6 +144,21 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
 
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if normalized.guest_id is not None:
+                cur.execute(
+                    """
+                    SELECT claimed_user_id
+                    FROM guest_identities
+                    WHERE id = %s
+                    FOR UPDATE;
+                    """,
+                    (normalized.guest_id,),
+                )
+                guest_owner = cur.fetchone()
+                if guest_owner is None or guest_owner["claimed_user_id"] is not None:
+                    raise AppleTransactionIdentityConflict(
+                        "Guest Apple subscription ownership is no longer active"
+                    )
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));",
                 (normalized.original_transaction_id,),
@@ -146,6 +177,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
             if existing_transaction is not None:
                 if (
                     existing_transaction["user_id"] != normalized.user_id
+                    or existing_transaction.get("guest_id") != normalized.guest_id
                     or existing_transaction["original_transaction_id"] != normalized.original_transaction_id
                     or (
                         normalized.app_account_token is not None
@@ -205,20 +237,32 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     updated_transaction = cur.fetchone()
                     return AppleTransactionSaveResult(
                         created=False,
+                        changed=True,
                         row=dict(updated_transaction),
                     )
-                return AppleTransactionSaveResult(created=False, row=dict(existing_transaction))
+                return AppleTransactionSaveResult(
+                    created=False,
+                    changed=False,
+                    row=dict(existing_transaction),
+                )
 
             cur.execute(
                 """
-                SELECT user_id
+                SELECT user_id, guest_id
                 FROM apple_transactions
                 WHERE original_transaction_id = %s
-                  AND user_id <> %s
+                  AND NOT (
+                      user_id IS NOT DISTINCT FROM %s
+                      AND guest_id IS NOT DISTINCT FROM %s
+                  )
                 LIMIT 1
                 FOR UPDATE;
                 """,
-                (normalized.original_transaction_id, normalized.user_id),
+                (
+                    normalized.original_transaction_id,
+                    normalized.user_id,
+                    normalized.guest_id,
+                ),
             )
             existing_owner = cur.fetchone()
             if existing_owner is not None:
@@ -230,6 +274,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                 """
                 INSERT INTO apple_transactions (
                     user_id,
+                    guest_id,
                     product_id,
                     transaction_id,
                     original_transaction_id,
@@ -245,11 +290,12 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     storefront,
                     offer_type
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *;
                 """,
                 (
                     normalized.user_id,
+                    normalized.guest_id,
                     normalized.product_id,
                     normalized.transaction_id,
                     normalized.original_transaction_id,
@@ -275,7 +321,11 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
     if inserted_transaction is None:
         raise AppleSubscriptionRepositoryError("Apple transaction insert returned no row")
 
-    return AppleTransactionSaveResult(created=True, row=dict(inserted_transaction))
+    return AppleTransactionSaveResult(
+        created=True,
+        changed=True,
+        row=dict(inserted_transaction),
+    )
 
 
 def save_apple_transaction_with_managed_connection(

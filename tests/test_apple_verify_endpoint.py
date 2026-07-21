@@ -52,6 +52,13 @@ class AppleSubscriptionVerifyEndpointTestCase(unittest.TestCase):
             expires_at=self.now + timedelta(days=30),
             changed=True,
         )
+        token_lookup_patcher = patch.object(
+            main.guest_subscriptions,
+            "get_allowed_app_account_tokens_for_user",
+            return_value=[str(self.app_account_token)],
+        )
+        token_lookup_patcher.start()
+        self.addCleanup(token_lookup_patcher.stop)
 
     def authenticated_user(self) -> dict:
         return {
@@ -240,8 +247,12 @@ class AppleSubscriptionVerifyEndpointTestCase(unittest.TestCase):
     @patch.object(main, "get_current_user_from_token")
     def test_missing_user_app_account_token_returns_403(self, auth_mock, verify_mock):
         auth_mock.return_value = {"id": 42, "app_account_token": None}
-
-        response = self.post()
+        with patch.object(
+            main.guest_subscriptions,
+            "get_allowed_app_account_tokens_for_user",
+            return_value=[],
+        ):
+            response = self.post()
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(

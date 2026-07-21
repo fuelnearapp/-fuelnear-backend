@@ -12,6 +12,7 @@ from app.db import get_connection
 APPLE_TRANSACTION_COLUMNS = """
     id,
     user_id,
+    guest_id,
     product_id,
     transaction_id,
     original_transaction_id,

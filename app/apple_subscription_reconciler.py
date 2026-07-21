@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from psycopg2.extras import RealDictCursor
 
@@ -45,14 +47,17 @@ def _reference_date(value: datetime | None) -> datetime:
 def reconcile_apple_entitlement(
     user_id: int,
     reference_date: datetime | None = None,
+    *,
+    connection: Any | None = None,
 ) -> AppleEntitlementReconciliationResult:
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
         raise ValueError("user_id must be a positive integer")
 
     normalized_reference_date = _reference_date(reference_date)
-    conn = get_connection()
+    conn = connection if connection is not None else get_connection()
+    owns_connection = connection is None
     try:
-        with conn:
+        with (conn if owns_connection else nullcontext(conn)):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE;", (user_id,))
                 if cur.fetchone() is None:
@@ -238,4 +243,5 @@ def reconcile_apple_entitlement(
                     changed=changed,
                 )
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()

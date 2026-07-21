@@ -30,6 +30,7 @@ from app import (
     apple_notification_verifier,
     apple_purchase_processor,
     apple_subscriptions,
+    guest_subscriptions,
 )
 from app.import_mimit import update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
@@ -91,6 +92,11 @@ AUTH_RESEND_RATE_LIMIT = max(1, int(os.getenv("AUTH_RESEND_RATE_LIMIT", "3")))
 AUTH_RESEND_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_RESEND_RATE_WINDOW_SECONDS", str(60 * 60))))
 AUTH_VERIFY_RATE_LIMIT = max(1, int(os.getenv("AUTH_VERIFY_RATE_LIMIT", "10")))
 AUTH_VERIFY_RATE_WINDOW_SECONDS = max(1, int(os.getenv("AUTH_VERIFY_RATE_WINDOW_SECONDS", str(10 * 60))))
+AUTH_GUEST_RATE_LIMIT = max(1, int(os.getenv("AUTH_GUEST_RATE_LIMIT", "10")))
+AUTH_GUEST_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("AUTH_GUEST_RATE_WINDOW_SECONDS", str(60 * 60))),
+)
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
@@ -316,6 +322,8 @@ AUTH_VALIDATION_PATHS = {
     "/auth/resend-verification-email",
     "/user/referral-code",
     "/user/subscription/apple/verify",
+    "/guest/subscription/apple/verify",
+    "/user/subscription/claim-guest",
 }
 
 
@@ -434,6 +442,42 @@ class AppleSubscriptionVerifyResponse(BaseModel):
     original_transaction_id: str
     product_id: str
     created: bool
+    is_plus: bool
+    expires_at: datetime | None
+    changed: bool
+
+
+class GuestSessionResponse(BaseModel):
+    guest_access_token: str
+    token_type: str = "bearer"
+    app_account_token: str
+    expires_at: datetime
+    created: bool
+
+
+class GuestSubscriptionResponse(BaseModel):
+    is_plus: bool
+    product_id: str | None
+    expires_at: datetime | None
+    status: str
+
+
+class GuestClaimRequest(BaseModel):
+    guest_access_token: str
+
+    @field_validator("guest_access_token")
+    @classmethod
+    def validate_guest_access_token(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("guest_access_token must not be empty")
+        return normalized
+
+
+class GuestClaimResponse(BaseModel):
+    status: str = "ok"
+    claimed: bool
+    transferred_transactions: int
     is_plus: bool
     expires_at: datetime | None
     changed: bool
@@ -1817,6 +1861,16 @@ def extract_bearer_token(authorization: str | None) -> str:
     return parts[1].strip()
 
 
+def get_guest_from_token(authorization: str | None, *, touch: bool = True) -> dict[str, Any]:
+    guest_token = extract_bearer_token(authorization)
+    try:
+        return guest_subscriptions.get_guest_by_token(guest_token, touch=touch)
+    except guest_subscriptions.GuestAlreadyClaimed:
+        raise APIError(401, "GUEST_SESSION_REVOKED", "Guest session is no longer active")
+    except guest_subscriptions.GuestSessionInvalid:
+        raise APIError(401, "GUEST_SESSION_INVALID", "Invalid or expired guest session")
+
+
 
 def get_current_user_from_token(authorization: str | None) -> dict[str, Any]:
     access_token = extract_bearer_token(authorization)
@@ -3038,6 +3092,7 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
+        guest_subscriptions.ensure_guest_subscription_schema(conn)
         cur.execute(
             """
             UPDATE user_subscriptions
@@ -4599,6 +4654,49 @@ def admin_process_price_notifications(
 # === AUTH ENDPOINTS ===
 
 
+@app.post("/auth/guest", response_model=GuestSessionResponse)
+def create_or_restore_guest_session(
+    request: Request,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> GuestSessionResponse:
+    try:
+        if authorization is not None:
+            guest_token = extract_bearer_token(authorization)
+            session = guest_subscriptions.reuse_guest_session(guest_token)
+        else:
+            client_ip = get_request_ip(request)
+            check_auth_rate_limit(
+                "/auth/guest",
+                build_rate_limit_bucket(client_ip),
+                limit=AUTH_GUEST_RATE_LIMIT,
+                window_seconds=AUTH_GUEST_RATE_WINDOW_SECONDS,
+            )
+            session = guest_subscriptions.create_guest_session()
+        print(
+            "[AUTH][GUEST] session_ready=true "
+            f"created={str(session.created).lower()} guest_id={session.guest_id}"
+        )
+        return GuestSessionResponse(
+            guest_access_token=session.access_token,
+            app_account_token=str(session.app_account_token),
+            expires_at=session.expires_at,
+            created=session.created,
+        )
+    except guest_subscriptions.GuestAlreadyClaimed:
+        raise APIError(401, "GUEST_SESSION_REVOKED", "Guest session is no longer active")
+    except guest_subscriptions.GuestSessionInvalid:
+        raise APIError(401, "GUEST_SESSION_INVALID", "Invalid or expired guest session")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        request_id = log_internal_exception("guest_session", exc)
+        raise APIError(
+            500,
+            "GUEST_SESSION_UNAVAILABLE",
+            f"Guest session is temporarily unavailable. request_id={request_id}",
+        )
+
+
 @app.post("/auth/register")
 def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
     client_ip = get_request_ip(request)
@@ -5821,31 +5919,38 @@ def get_current_user_subscription(authorization: str | None = Header(default=Non
         conn.close()
 
 
-@app.post(
-    "/user/subscription/apple/verify",
-    response_model=AppleSubscriptionVerifyResponse,
-)
-def verify_current_user_apple_subscription(
+def _verify_and_process_apple_subscription(
     payload: AppleSubscriptionVerifyRequest,
-    authorization: str | None = Header(default=None, alias="Authorization"),
+    *,
+    expected_app_account_tokens: list[Any],
+    user_id: int | None = None,
+    guest_id: int | None = None,
 ) -> AppleSubscriptionVerifyResponse:
-    user_payload = get_current_user_from_token(authorization)
-    user_id = user_payload["id"]
-    expected_app_account_token = user_payload.get("app_account_token")
-    if not expected_app_account_token:
+    if not expected_app_account_tokens:
         raise APIError(
             403,
             "APPLE_APP_ACCOUNT_TOKEN_INVALID",
             "Apple subscription could not be verified",
         )
-
     try:
-        verified = apple_jws_verifier.verify_apple_signed_transaction(
-            signed_transaction=payload.signed_transaction,
-            expected_app_account_token=expected_app_account_token,
-        )
+        verified = None
+        for expected_app_account_token in expected_app_account_tokens:
+            try:
+                verified = apple_jws_verifier.verify_apple_signed_transaction(
+                    signed_transaction=payload.signed_transaction,
+                    expected_app_account_token=expected_app_account_token,
+                )
+                break
+            except apple_jws_verifier.AppleJWSAppAccountTokenError:
+                continue
+        if verified is None:
+            raise apple_jws_verifier.AppleJWSAppAccountTokenMismatchError(
+                "Apple transaction appAccountToken does not match the current owner"
+            )
+
         transaction = apple_subscriptions.AppleTransaction(
             user_id=user_id,
+            guest_id=guest_id,
             product_id=verified.product_id,
             transaction_id=verified.transaction_id,
             original_transaction_id=verified.original_transaction_id,
@@ -5903,11 +6008,106 @@ def verify_current_user_apple_subscription(
             "Apple transaction is already associated with another account",
         )
     except Exception as exc:
-        request_id = log_internal_exception("apple_subscription_verify", exc, user_id=user_id)
+        request_id = log_internal_exception(
+            "apple_subscription_verify",
+            exc,
+            owner_type="user" if user_id is not None else "guest",
+        )
         raise APIError(
             500,
             "SERVER_ERROR",
             f"Apple subscription verification failed. request_id={request_id}",
+        )
+
+
+@app.post(
+    "/user/subscription/apple/verify",
+    response_model=AppleSubscriptionVerifyResponse,
+)
+def verify_current_user_apple_subscription(
+    payload: AppleSubscriptionVerifyRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> AppleSubscriptionVerifyResponse:
+    user_payload = get_current_user_from_token(authorization)
+    user_id = int(user_payload["id"])
+    expected_tokens = guest_subscriptions.get_allowed_app_account_tokens_for_user(user_id)
+    return _verify_and_process_apple_subscription(
+        payload,
+        expected_app_account_tokens=expected_tokens,
+        user_id=user_id,
+    )
+
+
+@app.post(
+    "/guest/subscription/apple/verify",
+    response_model=AppleSubscriptionVerifyResponse,
+)
+def verify_guest_apple_subscription(
+    payload: AppleSubscriptionVerifyRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> AppleSubscriptionVerifyResponse:
+    guest = get_guest_from_token(authorization)
+    return _verify_and_process_apple_subscription(
+        payload,
+        expected_app_account_tokens=[guest["app_account_token"]],
+        guest_id=int(guest["guest_id"]),
+    )
+
+
+@app.get("/guest/subscription", response_model=GuestSubscriptionResponse)
+def get_guest_subscription(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> GuestSubscriptionResponse:
+    guest = get_guest_from_token(authorization)
+    status = guest_subscriptions.get_guest_subscription_status(int(guest["guest_id"]))
+    return GuestSubscriptionResponse(
+        is_plus=status.is_plus,
+        product_id=status.product_id,
+        expires_at=status.expires_at,
+        status=status.status,
+    )
+
+
+@app.post("/user/subscription/claim-guest", response_model=GuestClaimResponse)
+def claim_guest_subscription_for_current_user(
+    payload: GuestClaimRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> GuestClaimResponse:
+    user = get_current_user_from_token(authorization)
+    try:
+        result = guest_subscriptions.claim_guest_subscription(
+            int(user["id"]),
+            payload.guest_access_token,
+        )
+        print(
+            "[APPLE_GUEST] claim_success=true "
+            f"claimed={str(result.claimed).lower()} transferred={result.transferred_transactions}"
+        )
+        return GuestClaimResponse(
+            claimed=result.claimed,
+            transferred_transactions=result.transferred_transactions,
+            is_plus=result.is_plus,
+            expires_at=result.expires_at,
+            changed=result.changed,
+        )
+    except guest_subscriptions.GuestSessionInvalid:
+        raise APIError(401, "GUEST_SESSION_INVALID", "Invalid or expired guest session")
+    except guest_subscriptions.GuestAlreadyClaimed:
+        raise APIError(409, "GUEST_ALREADY_CLAIMED", "Guest subscription has already been claimed")
+    except guest_subscriptions.GuestSubscriptionNotFound:
+        raise APIError(400, "GUEST_SUBSCRIPTION_NOT_FOUND", "No guest subscription was found")
+    except guest_subscriptions.GuestOwnershipConflict:
+        raise APIError(
+            409,
+            "APPLE_TRANSACTION_OWNERSHIP_CONFLICT",
+            "Apple transaction is already associated with another owner",
+        )
+    except Exception as exc:
+        request_id = log_internal_exception("guest_subscription_claim", exc)
+        raise APIError(
+            500,
+            "SERVER_ERROR",
+            f"Guest subscription claim failed. request_id={request_id}",
         )
 
 
