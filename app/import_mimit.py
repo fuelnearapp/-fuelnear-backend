@@ -2,8 +2,12 @@ import csv
 import os
 import socket
 import time
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -103,84 +107,239 @@ def ensure_core_schema(conn) -> None:
         )
 
 
-def normalize_fuel_type(raw_fuel: str) -> str:
-    value = raw_fuel.strip().lower()
-
-    # Normalizzazione diretta (match esatti)
-    mapping = {
-        "benzina": "benzina",
-        "super": "benzina",
-        "super senza piombo": "benzina",
-        "gasolio": "diesel",
-        "diesel": "diesel",
-        "gpl": "gpl",
-        "lpg": "gpl",
-        "metano": "metano",
-        "gnc": "metano",
-        "cng": "metano",
-        "l-gnc": "metano",
-        "lng": "metano",
-        "gnl": "metano",
+SUPPORTED_FUEL_TYPES = frozenset(
+    {
+        "benzina",
+        "benzina_premium",
+        "diesel",
+        "diesel_premium",
+        "hvo",
+        "gpl",
+        "metano",
     }
+)
 
-    if value in mapping:
-        return mapping[value]
+# The order within each tuple is also the canonical preference used when two
+# observations have the same MIMIT timestamp.
+MIMIT_FUEL_NAMES_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "benzina": (
+        "benzina",
+        "super",
+        "super senza piombo",
+    ),
+    "benzina_premium": (
+        "blue super",
+        "benzina speciale",
+        "benzina speciale 98 ottani",
+        "benzina wr 100",
+        "benzina shell v power",
+        "benzina energy 98 ottani",
+        "benzina plus 98",
+        "v-power",
+        "verde speciale",
+        "f101",
+        "f-101",
+        "hiq perform b100 ottani",
+        "benzina 100 ottani",
+        "benzina 102 ottani",
+    ),
+    "diesel": (
+        "gasolio",
+        "diesel",
+        "gasolio alpino",
+        "gasolio gelo",
+        "gasolio artico",
+    ),
+    "diesel_premium": (
+        "blue diesel",
+        "supreme diesel",
+        "hi-q diesel",
+        "hiq perform+",
+        "gasolio speciale",
+        "gasolio premium",
+        "diesel shell v power",
+        "v-power diesel",
+        "excellium diesel",
+        "gasolio oro diesel",
+        "gasolio prestazionale",
+        "gasolio plus",
+        "blu diesel alpino",
+        "s-diesel",
+        "dieselmax",
+        "e-diesel",
+        "gp diesel",
+        "gasolio energy d",
+    ),
+    "gpl": (
+        "gpl",
+        "lpg",
+    ),
+    "metano": (
+        "metano",
+        "gnc",
+        "cng",
+        "l-gnc",
+        "lng",
+        "gnl",
+    ),
+}
 
-    # HVO (diesel sintetico)
+MIMIT_FUEL_TYPE_BY_NAME = {
+    raw_name: fuel_type
+    for fuel_type, raw_names in MIMIT_FUEL_NAMES_BY_TYPE.items()
+    for raw_name in raw_names
+}
+MIMIT_CANONICAL_NAME_PRIORITY = {
+    (fuel_type, raw_name): priority
+    for fuel_type, raw_names in MIMIT_FUEL_NAMES_BY_TYPE.items()
+    for priority, raw_name in enumerate(raw_names)
+}
+
+
+@dataclass(frozen=True)
+class NormalizedMimitPrice:
+    mimit_id: int
+    raw_fuel: str
+    fuel_type: str
+    price: float
+    is_self_service: bool
+    reported_at: datetime
+
+
+@dataclass
+class PriceSelectionDiagnostics:
+    input_rows: int = 0
+    candidate_rows: int = 0
+    selected_rows: int = 0
+    duplicate_rows_removed: int = 0
+    collision_groups: int = 0
+    skipped_missing_station: int = 0
+    skipped_invalid_price: int = 0
+    unknown_fuel_rows: int = 0
+    unknown_fuel_names: Counter[str] = field(default_factory=Counter)
+
+
+def normalize_mimit_fuel_name(raw_fuel: object) -> str:
+    return " ".join(str(raw_fuel).strip().casefold().split())
+
+
+def normalize_fuel_type(raw_fuel: str) -> str | None:
+    value = normalize_mimit_fuel_name(raw_fuel)
+    mapped = MIMIT_FUEL_TYPE_BY_NAME.get(value)
+    if mapped is not None:
+        return mapped
+
+    # HVO is a fuel family marker, not a generic diesel marketing term.
     if "hvo" in value:
         return "hvo"
 
-    # --- Catch carburanti commerciali senza keyword standard ---
-    if "v-power" in value or "verde speciale" in value:
-        return "benzina_premium"
+    # Unknown commercial names are deliberately excluded instead of being
+    # published as standard petrol or diesel.
+    return None
 
-    if "hiq" in value or "perform" in value:
-        return "diesel_premium"
 
-    if "f101" in value or "f-101" in value:
-        return "benzina_premium"
+def get_canonical_fuel_priority(raw_fuel: str, fuel_type: str) -> int:
+    normalized_name = normalize_mimit_fuel_name(raw_fuel)
+    if fuel_type == "hvo":
+        return 0 if normalized_name == "hvo" else 100
+    return MIMIT_CANONICAL_NAME_PRIORITY.get((fuel_type, normalized_name), 100)
 
-    # Benzina e varianti commerciali
-    if "benzina" in value or "super" in value:
-        if (
-            "100" in value
-            or "98" in value
-            or "ottani" in value
-            or "premium" in value
-            or "v-power" in value
-            or "plus" in value
-            or "verde speciale" in value
-            or "f101" in value
-            or "f-101" in value
-        ):
-            return "benzina_premium"
-        return "benzina"
 
-    # Diesel / gasolio e varianti commerciali
-    if "diesel" in value or "gasolio" in value:
-        if (
-            "premium" in value
-            or "speciale" in value
-            or "+" in value
-            or "plus" in value
-            or "v-power" in value
-            or "excellium" in value
-            or "hiq" in value
-            or "perform" in value
-        ):
-            return "diesel_premium"
-        return "diesel"
+def _candidate_wins(candidate: NormalizedMimitPrice, current: NormalizedMimitPrice) -> bool:
+    if candidate.reported_at != current.reported_at:
+        return candidate.reported_at > current.reported_at
 
-    # GPL
-    if "gpl" in value or "lpg" in value:
-        return "gpl"
+    candidate_priority = get_canonical_fuel_priority(candidate.raw_fuel, candidate.fuel_type)
+    current_priority = get_canonical_fuel_priority(current.raw_fuel, current.fuel_type)
+    if candidate_priority != current_priority:
+        return candidate_priority < current_priority
 
-    # Metano
-    if any(x in value for x in ["metano", "gnc", "cng", "lng", "gnl"]):
-        return "metano"
+    # Stable final tie-break: normalized raw name, then price, then original name.
+    candidate_tie_break = (
+        normalize_mimit_fuel_name(candidate.raw_fuel),
+        candidate.price,
+        candidate.raw_fuel,
+    )
+    current_tie_break = (
+        normalize_mimit_fuel_name(current.raw_fuel),
+        current.price,
+        current.raw_fuel,
+    )
+    return candidate_tie_break < current_tie_break
 
-    # Fallback finale: restituisci il valore raw normalizzato, così possiamo intercettare eventuali nuovi casi
-    return value
+
+def select_deterministic_price_rows(
+    rows: Iterable[NormalizedMimitPrice],
+) -> list[NormalizedMimitPrice]:
+    selected: dict[tuple[int, str, bool], NormalizedMimitPrice] = {}
+    for row in rows:
+        key = (row.mimit_id, row.fuel_type, row.is_self_service)
+        current = selected.get(key)
+        if current is None or _candidate_wins(row, current):
+            selected[key] = row
+
+    return sorted(
+        selected.values(),
+        key=lambda row: (
+            row.mimit_id,
+            row.fuel_type,
+            row.is_self_service,
+            row.reported_at,
+            normalize_mimit_fuel_name(row.raw_fuel),
+            row.price,
+        ),
+    )
+
+
+def prepare_prices_for_import(
+    df_prices: pd.DataFrame,
+    station_id_map: dict[int, int],
+) -> tuple[list[NormalizedMimitPrice], PriceSelectionDiagnostics]:
+    diagnostics = PriceSelectionDiagnostics(input_rows=len(df_prices))
+    candidates: list[NormalizedMimitPrice] = []
+    group_counts: Counter[tuple[int, str, bool]] = Counter()
+
+    for _, row in df_prices.iterrows():
+        mimit_id = int(row["idImpianto"])
+        if mimit_id not in station_id_map:
+            diagnostics.skipped_missing_station += 1
+            continue
+
+        raw_fuel = str(row["descCarburante"]).strip()
+        fuel_type = normalize_fuel_type(raw_fuel)
+        if fuel_type is None:
+            diagnostics.unknown_fuel_rows += 1
+            diagnostics.unknown_fuel_names[raw_fuel or "<empty>"] += 1
+            continue
+
+        try:
+            price = float(row["prezzo"])
+        except (ValueError, TypeError):
+            diagnostics.skipped_invalid_price += 1
+            continue
+
+        is_self_service = str(row["isSelf"]).strip() == "1"
+        reported_at = pd.to_datetime(
+            str(row["dtComu"]).strip(),
+            format="%d/%m/%Y %H:%M:%S",
+        ).to_pydatetime()
+        candidate = NormalizedMimitPrice(
+            mimit_id=mimit_id,
+            raw_fuel=raw_fuel,
+            fuel_type=fuel_type,
+            price=price,
+            is_self_service=is_self_service,
+            reported_at=reported_at,
+        )
+        candidates.append(candidate)
+        group_counts[(mimit_id, fuel_type, is_self_service)] += 1
+
+    selected = select_deterministic_price_rows(candidates)
+    diagnostics.candidate_rows = len(candidates)
+    diagnostics.selected_rows = len(selected)
+    diagnostics.duplicate_rows_removed = len(candidates) - len(selected)
+    diagnostics.collision_groups = sum(count > 1 for count in group_counts.values())
+    return selected, diagnostics
 
 
 def download_file(url: str, destination: Path) -> dict[str, object]:
@@ -454,31 +613,10 @@ def clear_prices(conn) -> None:
 
 
 def import_prices(conn, df_prices: pd.DataFrame, station_id_map: dict[int, int]) -> int:
-    inserted_count = 0
+    selected_prices, diagnostics = prepare_prices_for_import(df_prices, station_id_map)
 
     with conn.cursor() as cur:
-        for _, row in df_prices.iterrows():
-            mimit_id = int(row["idImpianto"])
-
-            if mimit_id not in station_id_map:
-                continue
-
-            raw_fuel = str(row["descCarburante"]).strip()
-            fuel_type = normalize_fuel_type(raw_fuel)
-
-            try:
-                price = float(row["prezzo"])
-            except (ValueError, TypeError):
-                continue
-
-            is_self_service = str(row["isSelf"]).strip() == "1"
-            reported_at = pd.to_datetime(
-                str(row["dtComu"]).strip(),
-                format="%d/%m/%Y %H:%M:%S",
-            ).to_pydatetime()
-
-            station_id = station_id_map[mimit_id]
-
+        for item in selected_prices:
             cur.execute(
                 """
                 INSERT INTO fuel_prices (
@@ -487,17 +625,36 @@ def import_prices(conn, df_prices: pd.DataFrame, station_id_map: dict[int, int])
                 VALUES (%s, %s, %s, %s, %s, 'mimit');
                 """,
                 (
-                    station_id,
-                    fuel_type,
-                    price,
-                    is_self_service,
-                    reported_at,
+                    station_id_map[item.mimit_id],
+                    item.fuel_type,
+                    item.price,
+                    item.is_self_service,
+                    item.reported_at,
                 ),
             )
 
-            inserted_count += 1
+    unknown_names = ", ".join(
+        f"{name}={count}"
+        for name, count in sorted(
+            diagnostics.unknown_fuel_names.items(),
+            key=lambda item: (-item[1], item[0].casefold()),
+        )
+    )
+    print(
+        "[MIMIT] price_selection "
+        f"input_rows={diagnostics.input_rows} "
+        f"candidate_rows={diagnostics.candidate_rows} "
+        f"selected_rows={diagnostics.selected_rows} "
+        f"duplicate_rows_removed={diagnostics.duplicate_rows_removed} "
+        f"collision_groups={diagnostics.collision_groups} "
+        f"skipped_missing_station={diagnostics.skipped_missing_station} "
+        f"skipped_invalid_price={diagnostics.skipped_invalid_price} "
+        f"unknown_fuel_rows={diagnostics.unknown_fuel_rows}"
+    )
+    if unknown_names:
+        print(f"[MIMIT] unknown_fuel_names {unknown_names}")
 
-    return inserted_count
+    return diagnostics.selected_rows
 
 
 def import_local_mimit_files() -> dict[str, object]:
