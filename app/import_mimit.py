@@ -1,5 +1,8 @@
 import csv
+import json
+import logging
 import os
+import re
 import socket
 import time
 from collections import Counter
@@ -7,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -36,6 +39,19 @@ PREZZI_URL = os.getenv(
 MIMIT_DOWNLOAD_TIMEOUT_SECONDS = max(1, int(os.getenv("MIMIT_DOWNLOAD_TIMEOUT_SECONDS", "120")))
 MIMIT_DOWNLOAD_MAX_ATTEMPTS = max(1, int(os.getenv("MIMIT_DOWNLOAD_MAX_ATTEMPTS", "3")))
 MIMIT_RETRYABLE_HTTP_STATUSES = {502, 503, 504}
+MIMIT_MIN_FINAL_PRICE_ROWS = max(0, int(os.getenv("MIMIT_MIN_FINAL_PRICE_ROWS", "75000")))
+MIMIT_MAX_REPORTED_AGE_DAYS = max(0, int(os.getenv("MIMIT_MAX_REPORTED_AGE_DAYS", "2")))
+MIMIT_UNKNOWN_FUEL_WARNING_ROWS = max(
+    0,
+    int(os.getenv("MIMIT_UNKNOWN_FUEL_WARNING_ROWS", "100")),
+)
+KNOWN_UNKNOWN_MIMIT_FUEL_NAMES = frozenset(
+    {
+        "gasolio ecoplus",
+        "gasolio artico igloo",
+    }
+)
+LOGGER = logging.getLogger("fuelnear.mimit")
 
 
 def safe_download_log_url(url: str) -> str:
@@ -217,6 +233,11 @@ class PriceSelectionDiagnostics:
     skipped_invalid_price: int = 0
     unknown_fuel_rows: int = 0
     unknown_fuel_names: Counter[str] = field(default_factory=Counter)
+    unknown_fuel_station_ids: dict[str, set[int]] = field(default_factory=dict)
+    final_fuel_type_counts: Counter[str] = field(default_factory=Counter)
+    oldest_reported_at: datetime | None = None
+    newest_reported_at: datetime | None = None
+    final_duplicate_keys: int = 0
 
 
 def normalize_mimit_fuel_name(raw_fuel: object) -> str:
@@ -236,6 +257,178 @@ def normalize_fuel_type(raw_fuel: str) -> str | None:
     # Unknown commercial names are deliberately excluded instead of being
     # published as standard petrol or diesel.
     return None
+
+
+def read_mimit_extraction_date(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as source:
+            first_line = source.readline().strip()
+    except OSError:
+        return None
+
+    match = re.fullmatch(r"Estrazione del\s+(\d{4}-\d{2}-\d{2})", first_line)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def get_unknown_fuel_details(
+    diagnostics: PriceSelectionDiagnostics,
+) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for raw_name, count in diagnostics.unknown_fuel_names.items():
+        normalized_name = normalize_mimit_fuel_name(raw_name)
+        current = grouped.setdefault(
+            normalized_name,
+            {
+                "raw_name": raw_name,
+                "normalized_name": normalized_name,
+                "count": 0,
+                "example_station_ids": set(),
+                "known": normalized_name in KNOWN_UNKNOWN_MIMIT_FUEL_NAMES,
+            },
+        )
+        if (raw_name.casefold(), raw_name) < (
+            str(current["raw_name"]).casefold(),
+            str(current["raw_name"]),
+        ):
+            current["raw_name"] = raw_name
+        current["count"] = int(current["count"]) + count
+        current["example_station_ids"].update(
+            diagnostics.unknown_fuel_station_ids.get(normalized_name, set())
+        )
+
+    details: list[dict[str, object]] = []
+    for normalized_name in sorted(grouped):
+        item = grouped[normalized_name]
+        details.append(
+            {
+                "raw_name": item["raw_name"],
+                "normalized_name": normalized_name,
+                "count": item["count"],
+                "example_station_ids": sorted(item["example_station_ids"])[:5],
+                "known": item["known"],
+            }
+        )
+    return details
+
+
+def evaluate_mimit_import_warnings(
+    summary: dict[str, Any],
+    *,
+    minimum_final_rows: int = MIMIT_MIN_FINAL_PRICE_ROWS,
+    maximum_reported_age_days: int = MIMIT_MAX_REPORTED_AGE_DAYS,
+    unknown_fuel_warning_rows: int = MIMIT_UNKNOWN_FUEL_WARNING_ROWS,
+) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+
+    if int(summary.get("prices_csv") or 0) == 0:
+        warnings.append({"code": "zero_price_rows", "value": 0})
+    if int(summary.get("stations_imported") or 0) == 0:
+        warnings.append({"code": "zero_imported_stations", "value": 0})
+
+    final_rows = int(summary.get("final_rows") or 0)
+    if int(summary.get("prices_csv") or 0) > 0 and final_rows < minimum_final_rows:
+        warnings.append(
+            {
+                "code": "final_rows_below_threshold",
+                "value": final_rows,
+                "threshold": minimum_final_rows,
+            }
+        )
+
+    extraction_date_raw = summary.get("source_extraction_date")
+    newest_reported_at_raw = summary.get("newest_reported_at")
+    if isinstance(extraction_date_raw, str) and isinstance(newest_reported_at_raw, str):
+        try:
+            extraction_date = datetime.fromisoformat(extraction_date_raw).date()
+            newest_reported_date = datetime.fromisoformat(newest_reported_at_raw).date()
+            age_days = (extraction_date - newest_reported_date).days
+            if age_days > maximum_reported_age_days:
+                warnings.append(
+                    {
+                        "code": "stale_reported_at",
+                        "age_days": age_days,
+                        "threshold_days": maximum_reported_age_days,
+                    }
+                )
+        except ValueError:
+            pass
+
+    unknown_fuels = summary.get("unknown_fuels")
+    if isinstance(unknown_fuels, list):
+        new_names = sorted(
+            str(item.get("normalized_name"))
+            for item in unknown_fuels
+            if isinstance(item, dict) and item.get("known") is False
+        )
+        if new_names:
+            warnings.append({"code": "new_unknown_fuel_names", "names": new_names})
+
+    unknown_rows = int(summary.get("unknown_fuel_rows") or 0)
+    if unknown_rows > unknown_fuel_warning_rows:
+        warnings.append(
+            {
+                "code": "unknown_fuel_rows_increased",
+                "value": unknown_rows,
+                "threshold": unknown_fuel_warning_rows,
+            }
+        )
+
+    duplicate_keys = int(summary.get("final_duplicate_keys") or 0)
+    if duplicate_keys > 0:
+        warnings.append({"code": "final_duplicate_keys", "value": duplicate_keys})
+
+    return warnings
+
+
+def build_mimit_import_summary(
+    metrics: dict[str, Any],
+    *,
+    run_id: int | None,
+    status: str,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    summary = {
+        "run_id": run_id,
+        "status": status,
+        "source_extraction_date": metrics.get("source_extraction_date"),
+        "stations_csv": int(metrics.get("stations_csv") or 0),
+        "stations_imported": int(metrics.get("stations_imported") or 0),
+        "stations_excluded": int(metrics.get("stations_excluded") or 0),
+        "prices_csv": int(metrics.get("prices_csv") or 0),
+        "prices_for_importable_stations": int(
+            metrics.get("prices_for_importable_stations") or 0
+        ),
+        "candidate_rows": int(metrics.get("candidate_rows") or 0),
+        "final_rows": int(metrics.get("final_rows") or 0),
+        "duplicates_removed": int(metrics.get("duplicates_removed") or 0),
+        "final_duplicate_keys": int(metrics.get("final_duplicate_keys") or 0),
+        "unknown_fuel_rows": int(metrics.get("unknown_fuel_rows") or 0),
+        "unknown_fuels": metrics.get("unknown_fuels") or [],
+        "fuel_type_counts": metrics.get("fuel_type_counts") or {},
+        "oldest_reported_at": metrics.get("oldest_reported_at"),
+        "newest_reported_at": metrics.get("newest_reported_at"),
+        "duration_seconds": round(duration_seconds, 3),
+    }
+    if metrics.get("error_type"):
+        summary["error_type"] = metrics["error_type"]
+    summary["warnings"] = evaluate_mimit_import_warnings(summary)
+    return summary
+
+
+def log_mimit_import_summary(summary: dict[str, Any]) -> None:
+    for warning in summary.get("warnings", []):
+        LOGGER.warning(
+            "MIMIT_IMPORT_WARNING %s",
+            json.dumps(warning, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        )
+
+    serialized = json.dumps(summary, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if summary.get("status") == "success":
+        LOGGER.info("MIMIT_IMPORT_SUMMARY %s", serialized)
+    else:
+        LOGGER.error("MIMIT_IMPORT_SUMMARY %s", serialized)
 
 
 def get_canonical_fuel_priority(raw_fuel: str, fuel_type: str) -> int:
@@ -310,6 +503,10 @@ def prepare_prices_for_import(
         if fuel_type is None:
             diagnostics.unknown_fuel_rows += 1
             diagnostics.unknown_fuel_names[raw_fuel or "<empty>"] += 1
+            normalized_unknown = normalize_mimit_fuel_name(raw_fuel or "<empty>")
+            diagnostics.unknown_fuel_station_ids.setdefault(normalized_unknown, set()).add(
+                mimit_id
+            )
             continue
 
         try:
@@ -339,6 +536,14 @@ def prepare_prices_for_import(
     diagnostics.selected_rows = len(selected)
     diagnostics.duplicate_rows_removed = len(candidates) - len(selected)
     diagnostics.collision_groups = sum(count > 1 for count in group_counts.values())
+    diagnostics.final_fuel_type_counts.update(item.fuel_type for item in selected)
+    if selected:
+        diagnostics.oldest_reported_at = min(item.reported_at for item in selected)
+        diagnostics.newest_reported_at = max(item.reported_at for item in selected)
+    final_key_counts = Counter(
+        (item.mimit_id, item.fuel_type, item.is_self_service) for item in selected
+    )
+    diagnostics.final_duplicate_keys = sum(count > 1 for count in final_key_counts.values())
     return selected, diagnostics
 
 
@@ -612,8 +817,39 @@ def clear_prices(conn) -> None:
         cur.execute("DELETE FROM fuel_prices;")
 
 
-def import_prices(conn, df_prices: pd.DataFrame, station_id_map: dict[int, int]) -> int:
+def import_prices(
+    conn,
+    df_prices: pd.DataFrame,
+    station_id_map: dict[int, int],
+    monitoring_metrics: dict[str, Any] | None = None,
+) -> int:
     selected_prices, diagnostics = prepare_prices_for_import(df_prices, station_id_map)
+
+    if monitoring_metrics is not None:
+        monitoring_metrics.update(
+            {
+                "prices_for_importable_stations": (
+                    diagnostics.input_rows - diagnostics.skipped_missing_station
+                ),
+                "candidate_rows": diagnostics.candidate_rows,
+                "final_rows": diagnostics.selected_rows,
+                "duplicates_removed": diagnostics.duplicate_rows_removed,
+                "final_duplicate_keys": diagnostics.final_duplicate_keys,
+                "unknown_fuel_rows": diagnostics.unknown_fuel_rows,
+                "unknown_fuels": get_unknown_fuel_details(diagnostics),
+                "fuel_type_counts": dict(sorted(diagnostics.final_fuel_type_counts.items())),
+                "oldest_reported_at": (
+                    diagnostics.oldest_reported_at.isoformat()
+                    if diagnostics.oldest_reported_at
+                    else None
+                ),
+                "newest_reported_at": (
+                    diagnostics.newest_reported_at.isoformat()
+                    if diagnostics.newest_reported_at
+                    else None
+                ),
+            }
+        )
 
     with conn.cursor() as cur:
         for item in selected_prices:
@@ -657,8 +893,11 @@ def import_prices(conn, df_prices: pd.DataFrame, station_id_map: dict[int, int])
     return diagnostics.selected_rows
 
 
-def import_local_mimit_files() -> dict[str, object]:
+def import_local_mimit_files(
+    monitoring_metrics: dict[str, Any] | None = None,
+) -> dict[str, object]:
     conn = get_connection()
+    metrics = monitoring_metrics if monitoring_metrics is not None else {}
 
     try:
         print("Verifica/creazione schema database...")
@@ -668,12 +907,15 @@ def import_local_mimit_files() -> dict[str, object]:
         df_stations = load_stations_dataframe()
         if df_stations.empty:
             raise RuntimeError("Anagrafica CSV vuota o non valida")
+        metrics["stations_csv"] = len(df_stations)
         print(f"Stazioni lette dal CSV: {len(df_stations)}")
 
         print("Caricamento prezzi...")
         df_prices = load_prices_dataframe()
         if df_prices.empty:
             raise RuntimeError("Prezzi CSV vuoto o non valido")
+        metrics["prices_csv"] = len(df_prices)
+        metrics["source_extraction_date"] = read_mimit_extraction_date(PREZZI_PATH)
         print(f"Prezzi letti dal CSV: {len(df_prices)}")
         max_reported_at_csv = get_prices_csv_max_reported_at(df_prices)
         print(f"Max dtComu nel CSV prezzi: {max_reported_at_csv.isoformat() if max_reported_at_csv else None}")
@@ -682,13 +924,20 @@ def import_local_mimit_files() -> dict[str, object]:
         station_id_map = import_stations(conn, df_stations)
         if not station_id_map:
             raise RuntimeError("Nessuna stazione importata: import interrotto")
+        metrics["stations_imported"] = len(station_id_map)
+        metrics["stations_excluded"] = max(0, len(df_stations) - len(station_id_map))
         print(f"Stazioni importate/aggiornate: {len(station_id_map)}")
 
         print("Pulizia prezzi esistenti...")
         clear_prices(conn)
 
         print("Import prezzi nel database...")
-        imported_prices = import_prices(conn, df_prices, station_id_map)
+        imported_prices = import_prices(
+            conn,
+            df_prices,
+            station_id_map,
+            monitoring_metrics=metrics,
+        )
         if imported_prices == 0:
             raise RuntimeError("Nessun prezzo importato: import interrotto")
         print(f"Prezzi importati: {imported_prices}")
@@ -719,23 +968,52 @@ def import_local_mimit_files() -> dict[str, object]:
         conn.close()
 
 
-def update_mimit_data(download: bool = True) -> dict[str, object]:
+def update_mimit_data(
+    download: bool = True,
+    run_id: int | None = None,
+) -> dict[str, object]:
     result: dict[str, object] = {}
+    metrics: dict[str, Any] = {}
+    started_at = time.monotonic()
 
-    if download:
-        print("Download dei file MIMIT in corso...")
-        result["download"] = download_latest_mimit_files()
-        prezzi_download = result["download"].get("prezzi") if isinstance(result["download"], dict) else None
-        if isinstance(prezzi_download, dict):
-            print(
-                "[MIMIT] Dataset prezzi scaricato: "
-                f"last_modified={prezzi_download.get('last_modified')} "
-                f"size_bytes={prezzi_download.get('size_bytes')} "
-                f"path={prezzi_download.get('path')}"
+    try:
+        if download:
+            print("Download dei file MIMIT in corso...")
+            result["download"] = download_latest_mimit_files()
+            prezzi_download = (
+                result["download"].get("prezzi")
+                if isinstance(result["download"], dict)
+                else None
             )
-        print("Download completato.")
+            if isinstance(prezzi_download, dict):
+                print(
+                    "[MIMIT] Dataset prezzi scaricato: "
+                    f"last_modified={prezzi_download.get('last_modified')} "
+                    f"size_bytes={prezzi_download.get('size_bytes')} "
+                    f"path={prezzi_download.get('path')}"
+                )
+            print("Download completato.")
 
-    result["import"] = import_local_mimit_files()
+        result["import"] = import_local_mimit_files(monitoring_metrics=metrics)
+    except Exception as exc:
+        metrics["error_type"] = exc.__class__.__name__
+        summary = build_mimit_import_summary(
+            metrics,
+            run_id=run_id,
+            status="failed",
+            duration_seconds=time.monotonic() - started_at,
+        )
+        log_mimit_import_summary(summary)
+        raise
+
+    summary = build_mimit_import_summary(
+        metrics,
+        run_id=run_id,
+        status="success",
+        duration_seconds=time.monotonic() - started_at,
+    )
+    log_mimit_import_summary(summary)
+    result["monitoring"] = summary
     return result
 
 

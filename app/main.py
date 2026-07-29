@@ -3791,7 +3791,7 @@ def run_mimit_update_background(conn, run_id: int) -> None:
     started_at = time.monotonic()
     try:
         print(f"[MIMIT] Background update started. run_id={run_id}")
-        result = update_mimit_data(download=True)
+        result = update_mimit_data(download=True, run_id=run_id)
         finish_mimit_import_run(conn, run_id, result)
         conn.commit()
 
