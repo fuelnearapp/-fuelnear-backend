@@ -4009,7 +4009,11 @@ def get_mimit_status() -> dict[str, Any]:
             "stations_csv": last_success["stations_csv"] if last_success else None,
             "prices_csv": last_success["prices_csv"] if last_success else None,
             "source_file_timestamp": last_success["source_file_timestamp"].isoformat() if last_success and last_success["source_file_timestamp"] else None,
-            "last_error": "Last MIMIT update failed" if last_failed else None,
+            "last_error": (
+                "Last MIMIT update failed"
+                if last_run and last_run["status"] == "failed"
+                else None
+            ),
         }
     except Exception as exc:
         raise safe_internal_http_error("mimit_status", exc, "MIMIT status failed")
