@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hmac
 from pathlib import Path
@@ -18,6 +18,7 @@ from appstoreserverlibrary.signed_data_verifier import (
 from app.apple_config import (
     AppleSubscriptionsConfig,
     AppleSubscriptionsConfigurationError,
+    get_apple_subscription_accepted_environments,
     load_apple_subscriptions_config,
     validate_apple_subscriptions_config,
 )
@@ -87,8 +88,14 @@ class VerifiedAppleTransaction:
 
 
 VerifierFactory = Callable[..., SignedDataVerifier]
-_default_verifier: SignedDataVerifier | None = None
-_default_verifier_config: AppleSubscriptionsConfig | None = None
+VerifierCandidate = tuple[str | None, SignedDataVerifier]
+_ENVIRONMENT_FALLBACK_STATUSES = frozenset(
+    {
+        VerificationStatus.VERIFICATION_FAILURE,
+        VerificationStatus.INVALID_ENVIRONMENT,
+    }
+)
+_default_verifiers: dict[AppleSubscriptionsConfig, SignedDataVerifier] = {}
 _default_verifier_lock = threading.Lock()
 
 
@@ -178,13 +185,38 @@ def create_apple_signed_data_verifier(
 def _get_default_apple_signed_data_verifier(
     config: AppleSubscriptionsConfig,
 ) -> SignedDataVerifier:
-    global _default_verifier, _default_verifier_config
-    if _default_verifier is None or _default_verifier_config != config:
+    verifier = _default_verifiers.get(config)
+    if verifier is None:
         with _default_verifier_lock:
-            if _default_verifier is None or _default_verifier_config != config:
-                _default_verifier = create_apple_signed_data_verifier(config)
-                _default_verifier_config = config
-    return _default_verifier
+            verifier = _default_verifiers.get(config)
+            if verifier is None:
+                verifier = create_apple_signed_data_verifier(config)
+                _default_verifiers[config] = verifier
+    return verifier
+
+
+def _get_configured_verifier_candidates(
+    config: AppleSubscriptionsConfig,
+) -> list[VerifierCandidate]:
+    accepted_environments = get_apple_subscription_accepted_environments(config)
+    ordered_environments = [
+        environment
+        for environment in ("production", "sandbox")
+        if environment in accepted_environments
+    ]
+    return [
+        (
+            environment,
+            _get_default_apple_signed_data_verifier(
+                replace(
+                    config,
+                    environment=environment,
+                    accepted_environments=(environment,),
+                )
+            ),
+        )
+        for environment in ordered_environments
+    ]
 
 
 def _required_text(value: Any, field_name: str) -> str:
@@ -270,12 +302,18 @@ def verify_apple_signed_transaction(
     *,
     config: AppleSubscriptionsConfig | None = None,
     verifier: SignedDataVerifier | None = None,
+    verifiers: list[VerifierCandidate] | None = None,
 ) -> VerifiedAppleTransaction:
     if not isinstance(signed_transaction, str) or not signed_transaction.strip():
         raise AppleJWSInvalidError("Apple signed transaction is required")
 
+    if verifier is not None and verifiers is not None:
+        raise ValueError("verifier and verifiers cannot both be provided")
+
     if verifier is not None:
-        selected_verifier = verifier
+        verifier_candidates: list[VerifierCandidate] = [(None, verifier)]
+    elif verifiers is not None:
+        verifier_candidates = list(verifiers)
     else:
         try:
             validated_config = validate_apple_subscriptions_config(
@@ -285,21 +323,59 @@ def verify_apple_signed_transaction(
             raise AppleJWSConfigurationError(
                 "Apple subscriptions configuration is invalid"
             ) from exc
-        selected_verifier = _get_default_apple_signed_data_verifier(
-            validated_config
+        verifier_candidates = _get_configured_verifier_candidates(validated_config)
+
+    if not verifier_candidates:
+        raise AppleJWSConfigurationError(
+            "No Apple subscription verifier is configured"
         )
-    try:
-        payload = selected_verifier.verify_and_decode_signed_transaction(
-            signed_transaction.strip()
+
+    payload = None
+    last_verification_error: VerificationException | None = None
+    for expected_environment, selected_verifier in verifier_candidates:
+        try:
+            candidate_payload = selected_verifier.verify_and_decode_signed_transaction(
+                signed_transaction.strip()
+            )
+        except VerificationException as exc:
+            if exc.status == VerificationStatus.RETRYABLE_VERIFICATION_FAILURE:
+                raise AppleJWSVerificationUnavailableError(
+                    "Apple transaction verification is temporarily unavailable"
+                ) from exc
+            last_verification_error = exc
+            if exc.status not in _ENVIRONMENT_FALLBACK_STATUSES:
+                break
+            continue
+
+        candidate_environment = _optional_text_value(candidate_payload.environment)
+        normalized_candidate_environment = (
+            candidate_environment.strip().lower()
+            if isinstance(candidate_environment, str)
+            else ""
         )
-    except VerificationException as exc:
-        if exc.status == VerificationStatus.RETRYABLE_VERIFICATION_FAILURE:
-            raise AppleJWSVerificationUnavailableError(
-                "Apple transaction verification is temporarily unavailable"
-            ) from exc
-        raise AppleJWSInvalidError("Apple signed transaction is invalid") from exc
-    except Exception as exc:
-        raise AppleJWSInvalidError("Apple signed transaction could not be verified") from exc
+        if normalized_candidate_environment not in {"sandbox", "production"}:
+            last_verification_error = VerificationException(
+                VerificationStatus.INVALID_ENVIRONMENT
+            )
+            continue
+        if (
+            expected_environment is not None
+            and normalized_candidate_environment != expected_environment
+        ):
+            last_verification_error = VerificationException(
+                VerificationStatus.INVALID_ENVIRONMENT
+            )
+            continue
+
+        payload = candidate_payload
+        break
+
+    if payload is None:
+        if last_verification_error is not None:
+            raise AppleJWSInvalidError(
+                "Apple signed transaction is invalid"
+            ) from last_verification_error
+        raise AppleJWSInvalidError("Apple signed transaction could not be verified")
 
     product_id = _required_text(payload.productId, "productId")
     if product_id not in SUPPORTED_APPLE_PRODUCT_IDS:

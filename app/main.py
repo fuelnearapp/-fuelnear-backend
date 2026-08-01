@@ -5930,7 +5930,25 @@ def _verify_and_process_apple_subscription(
     user_id: int | None = None,
     guest_id: int | None = None,
 ) -> AppleSubscriptionVerifyResponse:
+    verification_request_id = secrets.token_hex(8)
+
+    def log_verification(
+        outcome: str,
+        *,
+        verifier_environment: str | None = None,
+        product_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        print(
+            "[APPLE_SUBSCRIPTION] "
+            f"request_id={verification_request_id} "
+            f"verifier={verifier_environment or 'none'} "
+            f"product_id={product_id or 'none'} "
+            f"outcome={outcome} error_code={error_code or 'none'}"
+        )
+
     if not expected_app_account_tokens:
+        log_verification("rejected", error_code="APPLE_APP_ACCOUNT_TOKEN_INVALID")
         raise APIError(
             403,
             "APPLE_APP_ACCOUNT_TOKEN_INVALID",
@@ -5951,6 +5969,12 @@ def _verify_and_process_apple_subscription(
             raise apple_jws_verifier.AppleJWSAppAccountTokenMismatchError(
                 "Apple transaction appAccountToken does not match the current owner"
             )
+
+        log_verification(
+            "verified",
+            verifier_environment=verified.environment.lower(),
+            product_id=verified.product_id,
+        )
 
         transaction = apple_subscriptions.AppleTransaction(
             user_id=user_id,
@@ -5981,12 +6005,14 @@ def _verify_and_process_apple_subscription(
             changed=result.changed,
         )
     except apple_jws_verifier.AppleJWSAppAccountTokenError:
+        log_verification("rejected", error_code="APPLE_APP_ACCOUNT_TOKEN_INVALID")
         raise APIError(
             403,
             "APPLE_APP_ACCOUNT_TOKEN_INVALID",
             "Apple subscription could not be verified",
         )
     except apple_jws_verifier.AppleJWSVerificationUnavailableError:
+        log_verification("failed", error_code="APPLE_VERIFICATION_UNAVAILABLE")
         raise APIError(
             503,
             "APPLE_VERIFICATION_UNAVAILABLE",
@@ -5997,6 +6023,7 @@ def _verify_and_process_apple_subscription(
         apple_jws_verifier.AppleJWSPayloadError,
         apple_subscriptions.AppleTransactionValidationError,
     ):
+        log_verification("rejected", error_code="APPLE_TRANSACTION_INVALID")
         raise APIError(
             400,
             "APPLE_TRANSACTION_INVALID",
@@ -6006,15 +6033,37 @@ def _verify_and_process_apple_subscription(
         apple_subscriptions.AppleOriginalTransactionOwnershipConflict,
         apple_subscriptions.AppleTransactionIdentityConflict,
     ):
+        log_verification(
+            "rejected",
+            error_code="APPLE_TRANSACTION_OWNERSHIP_CONFLICT",
+        )
         raise APIError(
             409,
             "APPLE_TRANSACTION_OWNERSHIP_CONFLICT",
             "Apple transaction is already associated with another account",
         )
+    except (
+        apple_jws_verifier.AppleJWSConfigurationError,
+        apple_jws_verifier.AppleRootCertificatesError,
+    ) as exc:
+        log_verification("failed", error_code="SERVER_ERROR")
+        request_id = log_internal_exception(
+            "apple_subscription_configuration",
+            exc,
+            verification_request_id=verification_request_id,
+            owner_type="user" if user_id is not None else "guest",
+        )
+        raise APIError(
+            500,
+            "SERVER_ERROR",
+            f"Apple subscription verification failed. request_id={request_id}",
+        )
     except Exception as exc:
+        log_verification("failed", error_code="SERVER_ERROR")
         request_id = log_internal_exception(
             "apple_subscription_verify",
             exc,
+            verification_request_id=verification_request_id,
             owner_type="user" if user_id is not None else "guest",
         )
         raise APIError(

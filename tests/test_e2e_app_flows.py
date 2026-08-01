@@ -11,6 +11,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import UUID
+from unittest.mock import patch
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -273,7 +275,7 @@ class DeferredBackgroundTasks:
 
 class FuelNearE2ETestCase(unittest.TestCase):
     password = "CorrectHorse123"
-    scenario_count = 8
+    scenario_count = 9
 
     def setUp(self) -> None:
         apns_pushes.clear()
@@ -758,6 +760,52 @@ class FuelNearE2ETestCase(unittest.TestCase):
         finally:
             main.verify_jwt_with_jwks = original_verify
         self.assert_api_error(nonce_invalid, "APPLE_NONCE_INVALID", 401)
+
+    def test_09_apple_verify_persists_and_subscription_get_returns_plus(self):
+        user = self.signup_verified_login("apple-plus@example.com")
+        authorization = self.auth_header(user)
+        now = datetime.now(timezone.utc)
+        verified = main.apple_jws_verifier.VerifiedAppleTransaction(
+            product_id="MB.FuelNear.plus.monthly",
+            transaction_id="e2e-apple-transaction",
+            original_transaction_id="e2e-apple-original",
+            purchase_date=now,
+            expires_date=now + timedelta(days=30),
+            environment="Sandbox",
+            ownership_type="PURCHASED",
+            transaction_reason="PURCHASE",
+            revocation_date=None,
+            revocation_reason=None,
+            app_account_token=UUID(user["user"]["app_account_token"]),
+            signed_date=now,
+            storefront="ITA",
+            offer_type=None,
+        )
+
+        with patch.object(
+            main.apple_jws_verifier,
+            "verify_apple_signed_transaction",
+            return_value=verified,
+        ):
+            response = main.verify_current_user_apple_subscription(
+                main.AppleSubscriptionVerifyRequest(
+                    signed_transaction="signed-sandbox-transaction"
+                ),
+                authorization,
+            )
+
+        subscription = main.get_current_user_subscription(authorization)
+
+        self.assertTrue(response.is_plus)
+        self.assertTrue(subscription["is_plus"])
+        self.assertEqual(subscription["active_subscription"]["source"], "apple_subscription")
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT environment FROM apple_transactions WHERE transaction_id = %s;",
+                ("e2e-apple-transaction",),
+            ),
+            "Sandbox",
+        )
 
     def reset_rate_limits(self) -> None:
         with main.get_connection() as conn:

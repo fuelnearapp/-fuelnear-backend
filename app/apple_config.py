@@ -20,6 +20,7 @@ class AppleSubscriptionsConfig:
     app_id: int | None
     root_certificates_path: Path | None
     enable_online_checks: bool
+    accepted_environments: tuple[str, ...] = ()
 
 
 def _optional_text(environ: Mapping[str, str], name: str) -> str | None:
@@ -54,12 +55,27 @@ def _parse_boolean(raw_value: str | None, *, default: bool) -> bool:
     )
 
 
+def _parse_accepted_environments(raw_value: str | None) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+
+    values: list[str] = []
+    for item in raw_value.split(","):
+        normalized = item.strip().lower()
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
 def load_apple_subscriptions_config(
     environ: Mapping[str, str] | None = None,
 ) -> AppleSubscriptionsConfig:
     source = os.environ if environ is None else environ
     bundle_id = _optional_text(source, "APPLE_SUBSCRIPTIONS_BUNDLE_ID") or ""
     environment = (_optional_text(source, "APPLE_SUBSCRIPTIONS_ENVIRONMENT") or "").lower()
+    accepted_environments = _parse_accepted_environments(
+        _optional_text(source, "APPLE_SUBSCRIPTIONS_ACCEPTED_ENVIRONMENTS")
+    )
     app_id = _parse_optional_app_id(_optional_text(source, "APPLE_APP_ID"))
     root_certificates_path_value = _optional_text(
         source,
@@ -79,6 +95,7 @@ def load_apple_subscriptions_config(
             _optional_text(source, "APPLE_ENABLE_ONLINE_CHECKS"),
             default=True,
         ),
+        accepted_environments=accepted_environments,
     )
 
 
@@ -93,6 +110,11 @@ def validate_apple_subscriptions_config(
     errors: list[str] = []
     bundle_id = config.bundle_id.strip() if isinstance(config.bundle_id, str) else ""
     environment = config.environment.strip().lower() if isinstance(config.environment, str) else ""
+    accepted_environments = tuple(
+        item.strip().lower()
+        for item in config.accepted_environments
+        if isinstance(item, str) and item.strip()
+    )
 
     if not bundle_id:
         errors.append("APPLE_SUBSCRIPTIONS_BUNDLE_ID is required")
@@ -101,6 +123,13 @@ def validate_apple_subscriptions_config(
     elif environment not in APPLE_SUBSCRIPTIONS_ENVIRONMENTS:
         errors.append(
             "APPLE_SUBSCRIPTIONS_ENVIRONMENT must be sandbox or production"
+        )
+    unsupported_environments = sorted(
+        set(accepted_environments) - APPLE_SUBSCRIPTIONS_ENVIRONMENTS
+    )
+    if unsupported_environments:
+        errors.append(
+            "APPLE_SUBSCRIPTIONS_ACCEPTED_ENVIRONMENTS must contain only sandbox or production"
         )
     if config.root_certificates_path is None:
         errors.append("APPLE_ROOT_CERTIFICATES_PATH is required")
@@ -112,7 +141,8 @@ def validate_apple_subscriptions_config(
         or config.app_id <= 0
     ):
         errors.append("APPLE_APP_ID must be a positive integer")
-    if environment == "production" and config.app_id is None:
+    effective_environments = accepted_environments or ((environment,) if environment else ())
+    if "production" in effective_environments and config.app_id is None:
         errors.append("APPLE_APP_ID is required in production")
     if not isinstance(config.enable_online_checks, bool):
         errors.append("APPLE_ENABLE_ONLINE_CHECKS must be true or false")
@@ -124,4 +154,12 @@ def validate_apple_subscriptions_config(
         config,
         bundle_id=bundle_id,
         environment=environment,
+        accepted_environments=accepted_environments,
     )
+
+
+def get_apple_subscription_accepted_environments(
+    config: AppleSubscriptionsConfig,
+) -> tuple[str, ...]:
+    validated = validate_apple_subscriptions_config(config)
+    return validated.accepted_environments or (validated.environment,)

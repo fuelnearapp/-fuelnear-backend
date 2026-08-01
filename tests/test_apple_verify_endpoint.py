@@ -12,8 +12,10 @@ from app.apple_jws_verifier import (
     AppleJWSAppAccountTokenMismatchError,
     AppleJWSAppAccountTokenMissingError,
     AppleJWSInvalidError,
+    AppleJWSConfigurationError,
     AppleJWSVerificationUnavailableError,
     AppleJWSUnsupportedProductError,
+    AppleRootCertificatesError,
     VerifiedAppleTransaction,
 )
 from app.apple_purchase_processor import ApplePurchaseProcessingResult
@@ -165,6 +167,7 @@ class AppleSubscriptionVerifyEndpointTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, status_code)
         self.assertEqual(response.json()["error_code"], error_code)
+        self.assertNotIn("private", response.text.lower())
         process_mock.assert_not_called()
 
     def test_invalid_jws_returns_400(self):
@@ -179,6 +182,20 @@ class AppleSubscriptionVerifyEndpointTestCase(unittest.TestCase):
             AppleJWSVerificationUnavailableError("temporary OCSP detail"),
             503,
             "APPLE_VERIFICATION_UNAVAILABLE",
+        )
+
+    def test_invalid_server_configuration_returns_safe_500(self):
+        self.assert_verifier_error(
+            AppleJWSConfigurationError("private configuration detail"),
+            500,
+            "SERVER_ERROR",
+        )
+
+    def test_missing_root_certificates_return_safe_500(self):
+        self.assert_verifier_error(
+            AppleRootCertificatesError("private certificate path"),
+            500,
+            "SERVER_ERROR",
         )
 
     def test_unsupported_product_returns_400(self):
