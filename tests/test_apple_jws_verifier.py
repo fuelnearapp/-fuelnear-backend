@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -10,9 +11,12 @@ from uuid import UUID, uuid4
 
 from appstoreserverlibrary.models.Environment import Environment
 from appstoreserverlibrary.signed_data_verifier import (
+    SignedDataVerifier,
     VerificationException,
     VerificationStatus,
 )
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 from app.apple_config import AppleSubscriptionsConfig
 import app.apple_jws_verifier as jws_verifier_module
@@ -29,6 +33,25 @@ from app.apple_jws_verifier import (
     load_apple_root_certificates,
     verify_apple_signed_transaction,
 )
+
+
+REPOSITORY_APPLE_CERTIFICATES = (
+    Path(__file__).resolve().parents[1] / "certs" / "apple"
+)
+EXPECTED_APPLE_ROOTS = {
+    "AppleIncRootCertificate.cer": (
+        "Apple Root CA",
+        "B0B1730ECBC7FF4505142C49F1295E6EDA6BCAED7E2C68C5BE91B5A11001F024",
+    ),
+    "AppleRootCA-G2.cer": (
+        "Apple Root CA - G2",
+        "C2B9B042DD57830E7D117DAC55AC8AE19407D38E41D88F3215BC3A890444A050",
+    ),
+    "AppleRootCA-G3.cer": (
+        "Apple Root CA - G3",
+        "63343ABFB89A6A03EBB57E9B3F5FA7BE7C4F5C756F3017B3A8C488C3653E9179",
+    ),
+}
 
 
 class FakeVerifier:
@@ -141,6 +164,81 @@ class AppleJWSVerifierTestCase(unittest.TestCase):
             certificates = load_apple_root_certificates(path)
 
         self.assertEqual(certificates, [b"first", b"second"])
+
+    def test_repository_contains_three_valid_official_apple_root_certificates(self):
+        certificate_paths = sorted(REPOSITORY_APPLE_CERTIFICATES.glob("*.cer"))
+
+        self.assertEqual(
+            [path.name for path in certificate_paths],
+            sorted(EXPECTED_APPLE_ROOTS),
+        )
+        loaded = load_apple_root_certificates(REPOSITORY_APPLE_CERTIFICATES)
+        self.assertEqual(len(loaded), 3)
+
+        for path, certificate_bytes in zip(certificate_paths, loaded):
+            with self.subTest(certificate=path.name):
+                self.assertTrue(certificate_bytes)
+                certificate = x509.load_der_x509_certificate(certificate_bytes)
+                common_name = certificate.subject.get_attributes_for_oid(
+                    NameOID.COMMON_NAME
+                )[0].value
+                expected_common_name, expected_fingerprint = EXPECTED_APPLE_ROOTS[
+                    path.name
+                ]
+                self.assertEqual(common_name, expected_common_name)
+                self.assertEqual(certificate.subject, certificate.issuer)
+                self.assertEqual(
+                    sha256(certificate_bytes).hexdigest().upper(),
+                    expected_fingerprint,
+                )
+
+    def test_unreadable_certificate_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            certificate = Path(directory) / "AppleRoot.cer"
+            certificate.write_bytes(b"certificate")
+            with patch.object(Path, "read_bytes", side_effect=PermissionError):
+                with self.assertRaises(AppleRootCertificatesError):
+                    load_apple_root_certificates(certificate)
+
+    def test_invalid_certificate_is_rejected_by_official_verifier(self):
+        verifier = SignedDataVerifier(
+            [b"not-a-der-certificate"],
+            False,
+            Environment.SANDBOX,
+            "MB.FuelNear",
+        )
+
+        with self.assertRaises(VerificationException) as context:
+            verifier._chain_verifier.verify_chain(
+                ["invalid", "invalid", "invalid"],
+                perform_online_checks=False,
+                effective_date=1_700_000_000,
+            )
+
+        self.assertEqual(
+            context.exception.status,
+            VerificationStatus.INVALID_CERTIFICATE,
+        )
+
+    def test_repository_certificates_build_sandbox_verifier(self):
+        verifier = create_apple_signed_data_verifier(
+            self.config(REPOSITORY_APPLE_CERTIFICATES)
+        )
+
+        self.assertEqual(verifier._environment, Environment.SANDBOX)
+        self.assertEqual(len(verifier._chain_verifier.root_certificates), 3)
+
+    def test_repository_certificates_build_production_verifier(self):
+        verifier = create_apple_signed_data_verifier(
+            self.config(
+                REPOSITORY_APPLE_CERTIFICATES,
+                environment="production",
+                app_id=123456789,
+            )
+        )
+
+        self.assertEqual(verifier._environment, Environment.PRODUCTION)
+        self.assertEqual(len(verifier._chain_verifier.root_certificates), 3)
 
     def test_missing_directory_or_certificates_is_rejected(self):
         with self.assertRaises(AppleRootCertificatesError):
