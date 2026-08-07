@@ -377,6 +377,56 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
         self.assertFalse(second.claimed)
         self.assertEqual(second.transferred_transactions, 0)
 
+    def test_09b_claim_keeps_existing_referral_component_separate(self):
+        guest = self.create_guest()
+        user_id = self.create_user()
+        transaction = self.transaction(guest)
+        apple_purchase_processor.process_apple_transaction(transaction)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO rewards (
+                        user_id, referral_id, reward_type, reward_value,
+                        status, granted_at
+                    )
+                    VALUES (%s, NULL, 'plus_days', '7', 'granted', NOW());
+                    """,
+                    (user_id,),
+                )
+
+        first = guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+        second = guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source, apple_expires_at, referral_expires_at
+                    FROM user_subscriptions
+                    WHERE user_id = %s AND status = 'active';
+                    """,
+                    (user_id,),
+                )
+                source, apple_expiry, referral_expiry = cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(*) FROM rewards WHERE user_id = %s;",
+                    (user_id,),
+                )
+                reward_count = int(cur.fetchone()[0])
+
+        self.assertTrue(first.claimed)
+        self.assertFalse(second.claimed)
+        self.assertEqual(reward_count, 1)
+        self.assertEqual(source, "combined")
+        self.assertEqual(apple_expiry, transaction.expires_date)
+        self.assertEqual(
+            referral_expiry,
+            transaction.expires_date + timedelta(days=7),
+        )
+        self.assertEqual(first.expires_at, referral_expiry)
+        self.assertEqual(second.expires_at, referral_expiry)
+
     def test_10_claim_with_wrong_guest_token_is_rejected(self):
         user_id = self.create_user()
         with self.assertRaises(guest_subscriptions.GuestSessionInvalid):

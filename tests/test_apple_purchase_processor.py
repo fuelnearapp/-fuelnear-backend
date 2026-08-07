@@ -115,12 +115,30 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
                         starts_at TIMESTAMPTZ NOT NULL,
                         expires_at TIMESTAMPTZ NOT NULL,
                         original_transaction_id TEXT NULL,
+                        apple_expires_at TIMESTAMPTZ NULL,
+                        referral_expires_at TIMESTAMPTZ NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     CREATE UNIQUE INDEX idx_user_subscriptions_one_active
                     ON user_subscriptions(user_id)
                     WHERE status = 'active';
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE rewards (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        referral_id BIGINT NULL,
+                        reward_type TEXT NOT NULL,
+                        reward_value TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        granted_at TIMESTAMPTZ NULL,
+                        expires_at TIMESTAMPTZ NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
                     """
                 )
 
@@ -145,7 +163,8 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "TRUNCATE user_subscriptions, apple_transactions, users RESTART IDENTITY CASCADE;"
+                    "TRUNCATE rewards, user_subscriptions, apple_transactions, "
+                    "users RESTART IDENTITY CASCADE;"
                 )
 
     def create_user(self) -> int:

@@ -31,6 +31,7 @@ from app import (
     apple_purchase_processor,
     apple_subscriptions,
     guest_subscriptions,
+    plus_entitlements,
 )
 from app.import_mimit import update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
@@ -1091,9 +1092,6 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
     if days <= 0:
         raise ValueError("Reward days must be greater than zero")
 
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(days=days)
-
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE;", (user_id,))
         if cur.fetchone() is None:
@@ -1101,31 +1099,19 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
 
         cur.execute(
             """
-            UPDATE user_subscriptions
-            SET status = 'expired',
-                updated_at = NOW()
-            WHERE user_id = %s
-              AND status = 'active'
-              AND expires_at <= NOW();
-            """,
-            (user_id,),
-        )
-        cur.execute(
-            """
-            SELECT id, user_id, source, status, starts_at, expires_at,
-                   original_transaction_id, created_at, updated_at
+            SELECT id
             FROM user_subscriptions
             WHERE user_id = %s
               AND status = 'active'
-              AND expires_at > NOW()
-            ORDER BY expires_at DESC
             LIMIT 1
-            FOR UPDATE;
             """,
             (user_id,),
         )
-        active_subscription = cur.fetchone()
-        print(f"[PLUS] subscription_active_found={str(active_subscription is not None).lower()}")
+        active_subscription_found = cur.fetchone() is not None
+        print(
+            "[PLUS] subscription_active_found="
+            f"{str(active_subscription_found).lower()}"
+        )
 
         cur.execute(
             """
@@ -1162,6 +1148,11 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
             if existing_reward is None:
                 raise RuntimeError("Referral reward conflict without existing reward")
 
+            components = plus_entitlements.reconcile_user_plus_entitlement(
+                conn,
+                user_id,
+                user_locked=True,
+            )
             print("[PLUS] subscription_extended=false")
             print("[PLUS] subscription_created=false")
             return {
@@ -1171,84 +1162,25 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
                 )[0],
                 "subscription": (
                     serialize_datetime_fields(
-                        [dict(active_subscription)],
+                        [dict(components.subscription)],
                         ["starts_at", "expires_at", "created_at", "updated_at"],
                     )[0]
-                    if active_subscription
+                    if components.subscription
                     else None
                 ),
                 "already_granted": True,
             }
 
-        if active_subscription:
-            new_expires_at = active_subscription["expires_at"] + timedelta(days=days)
-            cur.execute(
-                """
-                UPDATE user_subscriptions
-                SET expires_at = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                RETURNING id, user_id, source, status, starts_at, expires_at, original_transaction_id, created_at, updated_at;
-                """,
-                (new_expires_at, active_subscription["id"]),
-            )
-            subscription_row = cur.fetchone()
-            subscription_extended = True
-            subscription_created = False
-        else:
-            cur.execute(
-                """
-                INSERT INTO user_subscriptions (
-                    user_id,
-                    source,
-                    status,
-                    starts_at,
-                    expires_at,
-                    original_transaction_id,
-                    created_at,
-                    updated_at
-                )
-                VALUES (%s, 'referral_reward', 'active', %s, %s, NULL, NOW(), NOW())
-                ON CONFLICT (user_id) WHERE status = 'active' DO NOTHING
-                RETURNING id, user_id, source, status, starts_at, expires_at, original_transaction_id, created_at, updated_at;
-                """,
-                (user_id, now, expires_at),
-            )
-            subscription_row = cur.fetchone()
-            subscription_created = subscription_row is not None
-            subscription_extended = False
-
-            if subscription_row is None:
-                cur.execute(
-                    """
-                    SELECT id, user_id, source, status, starts_at, expires_at,
-                           original_transaction_id, created_at, updated_at
-                    FROM user_subscriptions
-                    WHERE user_id = %s
-                      AND status = 'active'
-                    LIMIT 1
-                    FOR UPDATE;
-                    """,
-                    (user_id,),
-                )
-                concurrent_subscription = cur.fetchone()
-                if concurrent_subscription is None:
-                    raise RuntimeError("Active subscription conflict without existing subscription")
-
-                concurrent_expires_at = max(concurrent_subscription["expires_at"], now) + timedelta(days=days)
-                cur.execute(
-                    """
-                    UPDATE user_subscriptions
-                    SET expires_at = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    RETURNING id, user_id, source, status, starts_at, expires_at,
-                              original_transaction_id, created_at, updated_at;
-                    """,
-                    (concurrent_expires_at, concurrent_subscription["id"]),
-                )
-                subscription_row = cur.fetchone()
-                subscription_extended = True
+        components = plus_entitlements.reconcile_user_plus_entitlement(
+            conn,
+            user_id,
+            user_locked=True,
+        )
+        subscription_row = components.subscription
+        if subscription_row is None:
+            raise RuntimeError("Referral reward did not produce a Plus entitlement")
+        subscription_created = not active_subscription_found
+        subscription_extended = active_subscription_found and components.changed
 
         print(f"[PLUS] subscription_extended={str(subscription_extended).lower()}")
         print(f"[PLUS] subscription_created={str(subscription_created).lower()}")
@@ -3068,6 +3000,7 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
+        plus_entitlements.ensure_plus_entitlement_schema(conn)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS apple_transactions (
@@ -3180,6 +3113,13 @@ def ensure_auth_schema(conn) -> None:
             CREATE INDEX IF NOT EXISTS idx_apple_transactions_user_original_transaction
             ON apple_transactions(user_id, original_transaction_id);
             """
+        )
+        backfilled_plus_entitlements = (
+            plus_entitlements.backfill_plus_entitlement_components(conn)
+        )
+        print(
+            "[PLUS] entitlement_components_backfilled="
+            f"{backfilled_plus_entitlements}"
         )
         ensure_auth_rate_limit_schema(conn)
         ensure_auth_provider_schema(conn)

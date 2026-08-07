@@ -7,7 +7,7 @@ from typing import Any
 
 from psycopg2.extras import RealDictCursor
 
-from app import apple_subscription_service
+from app import apple_subscription_service, plus_entitlements
 from app.db import get_connection
 
 
@@ -78,169 +78,18 @@ def reconcile_apple_entitlement(
                     raise AppleEntitlementMissingExpiration(
                         "An active Apple subscription requires expires_date for entitlement reconciliation"
                     )
-
-                cur.execute(
-                    """
-                    UPDATE user_subscriptions
-                    SET status = 'expired',
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                      AND status = 'active'
-                      AND expires_at <= %s;
-                    """,
-                    (user_id, normalized_reference_date),
+                components = plus_entitlements.reconcile_user_plus_entitlement(
+                    conn,
+                    user_id,
+                    normalized_reference_date,
+                    apple_subscription=(dict(apple_subscription) if apple_subscription else None),
+                    user_locked=True,
                 )
-                changed = cur.rowcount > 0
-
-                cur.execute(
-                    """
-                    SELECT id, source, status, starts_at, expires_at,
-                           original_transaction_id, created_at, updated_at
-                    FROM user_subscriptions
-                    WHERE user_id = %s
-                      AND status = 'active'
-                      AND expires_at > %s
-                    ORDER BY expires_at DESC, id DESC
-                    LIMIT 1
-                    FOR UPDATE;
-                    """,
-                    (user_id, normalized_reference_date),
-                )
-                active_entitlement = cur.fetchone()
-
-                if apple_active:
-                    if active_entitlement is None:
-                        starts_at = min(
-                            apple_subscription["purchase_date"],
-                            normalized_reference_date,
-                        )
-                        cur.execute(
-                            """
-                            INSERT INTO user_subscriptions (
-                                user_id,
-                                source,
-                                status,
-                                starts_at,
-                                expires_at,
-                                original_transaction_id,
-                                created_at,
-                                updated_at
-                            )
-                            VALUES (%s, %s, 'active', %s, %s, %s, NOW(), NOW())
-                            RETURNING expires_at;
-                            """,
-                            (
-                                user_id,
-                                APPLE_SUBSCRIPTION_SOURCE,
-                                starts_at,
-                                apple_expires_at,
-                                apple_subscription["original_transaction_id"],
-                            ),
-                        )
-                        entitlement_expires_at = cur.fetchone()["expires_at"]
-                        changed = True
-                    else:
-                        entitlement_expires_at = active_entitlement["expires_at"]
-                        if apple_expires_at > entitlement_expires_at:
-                            cur.execute(
-                                """
-                                UPDATE user_subscriptions
-                                SET expires_at = %s,
-                                    updated_at = NOW()
-                                WHERE id = %s
-                                RETURNING expires_at;
-                                """,
-                                (apple_expires_at, active_entitlement["id"]),
-                            )
-                            entitlement_expires_at = cur.fetchone()["expires_at"]
-                            changed = True
-
-                    return AppleEntitlementReconciliationResult(
-                        is_plus=True,
-                        expires_at=entitlement_expires_at,
-                        apple_active=True,
-                        changed=changed,
-                    )
-
-                if active_entitlement is not None and active_entitlement["source"] == APPLE_SUBSCRIPTION_SOURCE:
-                    referral_tail_expires_at = None
-                    original_transaction_id = active_entitlement["original_transaction_id"]
-                    if original_transaction_id:
-                        cur.execute(
-                            """
-                            SELECT expires_date
-                            FROM apple_transactions
-                            WHERE original_transaction_id = %s
-                            ORDER BY COALESCE(signed_date, purchase_date) DESC,
-                                     purchase_date DESC,
-                                     id DESC
-                            LIMIT 1;
-                            """,
-                            (original_transaction_id,),
-                        )
-                        latest_apple_transaction = cur.fetchone()
-                        apple_component_expires_at = (
-                            latest_apple_transaction["expires_date"]
-                            if latest_apple_transaction
-                            else None
-                        )
-                        if apple_component_expires_at is not None:
-                            referral_tail_start = max(
-                                apple_component_expires_at,
-                                normalized_reference_date,
-                            )
-                            if active_entitlement["expires_at"] > referral_tail_start:
-                                referral_tail_expires_at = (
-                                    normalized_reference_date
-                                    + (
-                                        active_entitlement["expires_at"]
-                                        - referral_tail_start
-                                    )
-                                )
-
-                    if referral_tail_expires_at is not None:
-                        cur.execute(
-                            """
-                            UPDATE user_subscriptions
-                            SET source = 'referral_reward',
-                                starts_at = %s,
-                                expires_at = %s,
-                                original_transaction_id = NULL,
-                                updated_at = NOW()
-                            WHERE id = %s;
-                            """,
-                            (
-                                normalized_reference_date,
-                                referral_tail_expires_at,
-                                active_entitlement["id"],
-                            ),
-                        )
-                        changed = True
-                        return AppleEntitlementReconciliationResult(
-                            is_plus=True,
-                            expires_at=referral_tail_expires_at,
-                            apple_active=False,
-                            changed=changed,
-                        )
-
-                    cur.execute(
-                        """
-                        UPDATE user_subscriptions
-                        SET status = 'expired',
-                            expires_at = LEAST(expires_at, %s),
-                            updated_at = NOW()
-                        WHERE id = %s;
-                        """,
-                        (normalized_reference_date, active_entitlement["id"]),
-                    )
-                    changed = True
-                    active_entitlement = None
-
                 return AppleEntitlementReconciliationResult(
-                    is_plus=active_entitlement is not None,
-                    expires_at=active_entitlement["expires_at"] if active_entitlement else None,
-                    apple_active=False,
-                    changed=changed,
+                    is_plus=components.is_plus,
+                    expires_at=components.expires_at,
+                    apple_active=components.apple_active,
+                    changed=components.changed,
                 )
     finally:
         if owns_connection:
