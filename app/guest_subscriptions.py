@@ -321,21 +321,14 @@ def get_guest_subscription_status(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                WITH latest_transactions AS (
-                    SELECT DISTINCT ON (original_transaction_id) *
-                    FROM apple_transactions
-                    WHERE guest_id = %s
-                    ORDER BY original_transaction_id,
-                             COALESCE(signed_date, purchase_date) DESC,
-                             purchase_date DESC,
-                             id DESC
-                )
                 SELECT *
-                FROM latest_transactions
+                FROM apple_transactions
+                WHERE guest_id = %s
                 ORDER BY (revocation_date IS NULL
                           AND (expires_date IS NULL OR expires_date > %s)) DESC,
+                         (expires_date IS NULL) DESC,
                          expires_date DESC NULLS FIRST,
-                         COALESCE(signed_date, purchase_date) DESC,
+                         purchase_date DESC,
                          id DESC
                 LIMIT 1;
                 """,

@@ -75,22 +75,14 @@ def _load_active_apple_subscription(
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            WITH latest_transactions AS (
-                SELECT DISTINCT ON (original_transaction_id) *
-                FROM apple_transactions
-                WHERE user_id = %s
-                ORDER BY original_transaction_id,
-                         COALESCE(signed_date, purchase_date) DESC,
-                         purchase_date DESC,
-                         id DESC
-            )
             SELECT *
-            FROM latest_transactions
-            WHERE revocation_date IS NULL
+            FROM apple_transactions
+            WHERE user_id = %s
+              AND revocation_date IS NULL
               AND expires_date IS NOT NULL
               AND expires_date > %s
             ORDER BY expires_date DESC,
-                     COALESCE(signed_date, purchase_date) DESC,
+                     purchase_date DESC,
                      id DESC
             LIMIT 1;
             """,
@@ -113,17 +105,13 @@ def _load_apple_intervals(
             WHERE user_id = %s
               AND expires_date IS NOT NULL
             ORDER BY original_transaction_id,
-                     COALESCE(signed_date, purchase_date) DESC,
-                     purchase_date DESC,
+                     purchase_date ASC,
+                     expires_date ASC,
                      id DESC;
             """,
             (user_id,),
         )
         rows = [dict(row) for row in cur.fetchall()]
-
-    latest_by_original: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        latest_by_original.setdefault(str(row["original_transaction_id"]), row)
 
     intervals: list[tuple[datetime, datetime]] = []
     for row in rows:
@@ -131,9 +119,6 @@ def _load_apple_intervals(
         end = row["expires_date"]
         if row["revocation_date"] is not None:
             end = min(end, row["revocation_date"])
-        latest = latest_by_original[str(row["original_transaction_id"])]
-        if latest["revocation_date"] is not None:
-            end = min(end, latest["revocation_date"])
         if end > start:
             intervals.append((start, end))
 

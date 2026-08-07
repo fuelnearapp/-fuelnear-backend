@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
@@ -293,6 +294,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
         original_transaction_id: str,
         signed_date: datetime,
         expires_at: datetime,
+        purchase_date: datetime | None = None,
         revoked_at: datetime | None = None,
     ) -> repository.AppleTransaction:
         return repository.AppleTransaction(
@@ -300,7 +302,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             product_id="MB.FuelNear.plus.monthly",
             transaction_id=transaction_id,
             original_transaction_id=original_transaction_id,
-            purchase_date=signed_date - timedelta(days=30),
+            purchase_date=purchase_date or signed_date - timedelta(days=30),
             expires_date=expires_at,
             environment="Sandbox",
             revocation_date=revoked_at,
@@ -553,6 +555,155 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             self.get_entitlement(user_id)["apple_expires_at"],
             renewal.expires_date,
         )
+
+    def test_late_refund_of_t1_cannot_obscure_active_t3_regression(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        t1_purchase = reference - timedelta(days=90)
+        t1_expiry = reference - timedelta(days=60)
+        t2_purchase = reference - timedelta(days=60)
+        t2_expiry = reference - timedelta(days=30)
+        t3_purchase = reference - timedelta(days=1)
+        t3_expiry = reference + timedelta(days=29)
+
+        t1 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t1-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=t1_purchase,
+            signed_date=t1_purchase,
+            expires_at=t1_expiry,
+        )
+        t2 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t2-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=t2_purchase,
+            signed_date=t2_purchase,
+            expires_at=t2_expiry,
+        )
+        t3 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t3-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=t3_purchase,
+            signed_date=t3_purchase,
+            expires_at=t3_expiry,
+        )
+        for transaction in (t1, t2, t3):
+            self.save_and_reconcile(transaction, reference)
+
+        late_refund_t1 = self.make_apple_transaction(
+            user_id,
+            transaction_id=t1.transaction_id,
+            original_transaction_id=original_id,
+            purchase_date=t1_purchase,
+            signed_date=reference + timedelta(days=1),
+            expires_at=t1_expiry,
+            revoked_at=reference,
+        )
+        result = self.save_and_reconcile(late_refund_t1, reference)
+
+        with self.connect() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT transaction_id, revocation_date
+                    FROM apple_transactions
+                    WHERE user_id = %s
+                    ORDER BY transaction_id;
+                    """,
+                    (user_id,),
+                )
+                rows = {row["transaction_id"]: dict(row) for row in cur.fetchall()}
+
+        self.assertIsNotNone(rows[t1.transaction_id]["revocation_date"])
+        self.assertIsNone(rows[t2.transaction_id]["revocation_date"])
+        self.assertIsNone(rows[t3.transaction_id]["revocation_date"])
+        self.assertTrue(result.apple_active)
+        self.assertEqual(result.expires_at, t3_expiry)
+        self.assertEqual(self.get_entitlement(user_id)["apple_expires_at"], t3_expiry)
+
+    def test_late_refund_of_t2_cannot_obscure_active_t3(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        t2 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t2-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=reference - timedelta(days=31),
+            signed_date=reference - timedelta(days=31),
+            expires_at=reference - timedelta(days=1),
+        )
+        t3 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t3-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=reference - timedelta(days=1),
+            signed_date=reference - timedelta(days=1),
+            expires_at=reference + timedelta(days=29),
+        )
+        self.save_and_reconcile(t2, reference)
+        self.save_and_reconcile(t3, reference)
+
+        late_refund_t2 = replace(
+            t2,
+            signed_date=reference + timedelta(days=1),
+            revocation_date=reference,
+            revocation_reason="1",
+        )
+        result = self.save_and_reconcile(late_refund_t2, reference)
+
+        self.assertTrue(result.apple_active)
+        self.assertEqual(result.expires_at, t3.expires_date)
+        self.assertEqual(
+            service.get_active_subscription_for_user(user_id, reference)["transaction_id"],
+            t3.transaction_id,
+        )
+
+    def test_concurrent_t3_renewal_and_late_t1_refund_keep_t3_active(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        t1 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t1-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=reference - timedelta(days=60),
+            signed_date=reference - timedelta(days=60),
+            expires_at=reference - timedelta(days=30),
+        )
+        self.save_and_reconcile(t1, reference)
+        t3 = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"t3-{user_id}",
+            original_transaction_id=original_id,
+            purchase_date=reference,
+            signed_date=reference,
+            expires_at=reference + timedelta(days=30),
+        )
+        late_refund_t1 = replace(
+            t1,
+            signed_date=reference + timedelta(days=1),
+            revocation_date=reference,
+            revocation_reason="1",
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(self.save_and_reconcile, transaction, reference)
+                for transaction in (t3, late_refund_t1)
+            ]
+            [future.result(timeout=10) for future in futures]
+
+        final = reconciler.reconcile_apple_entitlement(user_id, reference)
+        active = service.get_active_subscription_for_user(user_id, reference)
+        self.assertTrue(final.apple_active)
+        self.assertEqual(final.expires_at, t3.expires_date)
+        self.assertEqual(active["transaction_id"], t3.transaction_id)
+        self.assertEqual(self.count_apple_transactions(user_id), 2)
 
     def test_repeated_refund_is_idempotent_with_referral(self):
         user_id = self.create_user()
@@ -947,7 +1098,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
         self.assertEqual(self.count_active_entitlements(user_id), 1)
         self.assertEqual(self.count_apple_transactions(user_id), 2)
 
-    def test_out_of_order_notifications_reconcile_from_latest_signed_state(self):
+    def test_out_of_order_notifications_reconcile_from_transaction_chronology(self):
         user_id = self.create_user()
         reference = datetime.now(timezone.utc)
         original_id = f"original-{user_id}"
@@ -955,14 +1106,14 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             user_id,
             transaction_id=f"newer-{user_id}",
             original_transaction_id=original_id,
-            signed_date=reference + timedelta(seconds=2),
+            signed_date=reference + timedelta(seconds=1),
             expires_at=reference + timedelta(days=60),
         )
         older = self.make_apple_transaction(
             user_id,
             transaction_id=f"older-{user_id}",
             original_transaction_id=original_id,
-            signed_date=reference + timedelta(seconds=1),
+            signed_date=reference + timedelta(seconds=2),
             expires_at=reference + timedelta(days=30),
         )
 

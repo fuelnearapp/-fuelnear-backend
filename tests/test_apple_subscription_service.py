@@ -202,6 +202,30 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
         latest = service.get_latest_transaction("original-1")
         self.assertEqual(latest["transaction_id"], "tx-2")
 
+    def test_get_latest_transaction_uses_period_chronology_not_signed_date(self):
+        user_id = self.create_user()
+        now = datetime.now(timezone.utc)
+        self.insert_transaction(
+            user_id,
+            "tx-old-period",
+            "original-1",
+            now - timedelta(days=60),
+            now - timedelta(days=30),
+            signed_date=now + timedelta(days=1),
+        )
+        self.insert_transaction(
+            user_id,
+            "tx-current-period",
+            "original-1",
+            now - timedelta(days=1),
+            now + timedelta(days=29),
+            signed_date=now,
+        )
+
+        latest = service.get_latest_transaction("original-1")
+
+        self.assertEqual(latest["transaction_id"], "tx-current-period")
+
     def test_get_transactions_for_user(self):
         user_id = self.create_user()
         now = datetime.now(timezone.utc)
@@ -237,6 +261,55 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
         )
         self.assertFalse(service.is_subscription_active("original-1", now))
         self.assertIsNone(service.get_active_subscription_for_user(user_id))
+
+    def test_revoked_historical_transaction_does_not_hide_active_renewal(self):
+        user_id = self.create_user()
+        now = datetime.now(timezone.utc)
+        self.insert_transaction(
+            user_id,
+            "tx-refunded",
+            "original-1",
+            now - timedelta(days=60),
+            now - timedelta(days=30),
+            revocation_date=now,
+            signed_date=now + timedelta(days=1),
+        )
+        self.insert_transaction(
+            user_id,
+            "tx-renewal",
+            "original-1",
+            now - timedelta(days=1),
+            now + timedelta(days=29),
+            signed_date=now - timedelta(days=1),
+        )
+
+        self.assertTrue(service.is_subscription_active("original-1", now))
+        active = service.get_active_subscription_for_user(user_id, now)
+        self.assertEqual(active["transaction_id"], "tx-renewal")
+
+    def test_refund_of_longest_period_falls_back_to_other_valid_transaction(self):
+        user_id = self.create_user()
+        now = datetime.now(timezone.utc)
+        self.insert_transaction(
+            user_id,
+            "tx-fallback",
+            "original-1",
+            now - timedelta(days=5),
+            now + timedelta(days=10),
+        )
+        self.insert_transaction(
+            user_id,
+            "tx-refunded-current",
+            "original-1",
+            now - timedelta(days=1),
+            now + timedelta(days=30),
+            revocation_date=now,
+            signed_date=now + timedelta(days=1),
+        )
+
+        active = service.get_active_subscription_for_user(user_id, now)
+
+        self.assertEqual(active["transaction_id"], "tx-fallback")
 
     def test_user_without_subscriptions(self):
         user_id = self.create_user()

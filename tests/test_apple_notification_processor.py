@@ -144,6 +144,7 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         apple_transaction = process_mock.call_args.args[0]
         self.assertEqual(apple_transaction.revocation_date, self.now)
         self.assertEqual(apple_transaction.revocation_reason, "1")
+        self.assertEqual(apple_transaction.signed_date, notification.signed_date)
 
     def test_revoke_is_processed(self):
         result, _ = self.process_with_owner(self.notification("REVOKE"))

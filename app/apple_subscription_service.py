@@ -113,7 +113,8 @@ def get_latest_transaction(original_transaction_id: str) -> dict[str, Any] | Non
                 SELECT {APPLE_TRANSACTION_COLUMNS}
                 FROM apple_transactions
                 WHERE original_transaction_id = %s
-                ORDER BY COALESCE(signed_date, purchase_date) DESC,
+                ORDER BY (expires_date IS NULL) DESC,
+                         expires_date DESC NULLS FIRST,
                          purchase_date DESC,
                          id DESC
                 LIMIT 1;
@@ -136,7 +137,8 @@ def get_transactions_for_user(user_id: int) -> list[dict[str, Any]]:
                 SELECT {APPLE_TRANSACTION_COLUMNS}
                 FROM apple_transactions
                 WHERE user_id = %s
-                ORDER BY COALESCE(signed_date, purchase_date) DESC,
+                ORDER BY (expires_date IS NULL) DESC,
+                         expires_date DESC NULLS FIRST,
                          purchase_date DESC,
                          id DESC;
                 """,
@@ -151,12 +153,28 @@ def is_subscription_active(
     original_transaction_id: str,
     reference_date: datetime | None = None,
 ) -> bool:
-    latest_transaction = get_latest_transaction(original_transaction_id)
-    if latest_transaction is None or latest_transaction["revocation_date"] is not None:
-        return False
-
-    expires_date = latest_transaction["expires_date"]
-    return expires_date is None or expires_date > _reference_date(reference_date)
+    normalized_original_transaction_id = _required_identifier(
+        original_transaction_id,
+        "original_transaction_id",
+    )
+    normalized_reference_date = _reference_date(reference_date)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM apple_transactions
+                WHERE original_transaction_id = %s
+                  AND revocation_date IS NULL
+                  AND (expires_date IS NULL OR expires_date > %s)
+                LIMIT 1;
+                """,
+                (normalized_original_transaction_id, normalized_reference_date),
+            )
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def get_active_subscription_for_user(
@@ -173,23 +191,14 @@ def get_active_subscription_for_user(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 f"""
-                WITH latest_transactions AS (
-                    SELECT DISTINCT ON (original_transaction_id)
-                        {APPLE_TRANSACTION_COLUMNS}
-                    FROM apple_transactions
-                    WHERE user_id = %s
-                    ORDER BY original_transaction_id,
-                             COALESCE(signed_date, purchase_date) DESC,
-                             purchase_date DESC,
-                             id DESC
-                )
                 SELECT {APPLE_TRANSACTION_COLUMNS}
-                FROM latest_transactions
-                WHERE revocation_date IS NULL
+                FROM apple_transactions
+                WHERE user_id = %s
+                  AND revocation_date IS NULL
                   AND (expires_date IS NULL OR expires_date > %s)
                 ORDER BY (expires_date IS NULL) DESC,
                          expires_date DESC NULLS FIRST,
-                         COALESCE(signed_date, purchase_date) DESC,
+                         purchase_date DESC,
                          id DESC
                 LIMIT 1;
                 """,
