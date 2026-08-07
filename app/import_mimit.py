@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -238,6 +239,14 @@ class PriceSelectionDiagnostics:
     oldest_reported_at: datetime | None = None
     newest_reported_at: datetime | None = None
     final_duplicate_keys: int = 0
+
+
+class MimitCandidateDatasetRejected(RuntimeError):
+    pass
+
+
+class MimitDatabaseWriteValidationError(RuntimeError):
+    pass
 
 
 def normalize_mimit_fuel_name(raw_fuel: object) -> str:
@@ -512,6 +521,9 @@ def prepare_prices_for_import(
         try:
             price = float(row["prezzo"])
         except (ValueError, TypeError):
+            diagnostics.skipped_invalid_price += 1
+            continue
+        if not math.isfinite(price) or price <= 0:
             diagnostics.skipped_invalid_price += 1
             continue
 
@@ -817,39 +829,108 @@ def clear_prices(conn) -> None:
         cur.execute("DELETE FROM fuel_prices;")
 
 
+def update_price_import_metrics(
+    monitoring_metrics: dict[str, Any] | None,
+    diagnostics: PriceSelectionDiagnostics,
+) -> None:
+    if monitoring_metrics is None:
+        return
+
+    monitoring_metrics.update(
+        {
+            "prices_for_importable_stations": (
+                diagnostics.input_rows - diagnostics.skipped_missing_station
+            ),
+            "candidate_rows": diagnostics.candidate_rows,
+            "final_rows": diagnostics.selected_rows,
+            "duplicates_removed": diagnostics.duplicate_rows_removed,
+            "final_duplicate_keys": diagnostics.final_duplicate_keys,
+            "unknown_fuel_rows": diagnostics.unknown_fuel_rows,
+            "unknown_fuels": get_unknown_fuel_details(diagnostics),
+            "fuel_type_counts": dict(sorted(diagnostics.final_fuel_type_counts.items())),
+            "oldest_reported_at": (
+                diagnostics.oldest_reported_at.isoformat()
+                if diagnostics.oldest_reported_at
+                else None
+            ),
+            "newest_reported_at": (
+                diagnostics.newest_reported_at.isoformat()
+                if diagnostics.newest_reported_at
+                else None
+            ),
+        }
+    )
+
+
+def validate_candidate_price_count(
+    candidate_rows: int,
+    *,
+    minimum_rows: int | None = None,
+) -> None:
+    required_rows = (
+        MIMIT_MIN_FINAL_PRICE_ROWS if minimum_rows is None else minimum_rows
+    )
+    validation_passed = candidate_rows > 0 and candidate_rows >= required_rows
+    print(
+        "[MIMIT] candidate_validation "
+        f"prices={candidate_rows} minimum={required_rows} "
+        f"passed={str(validation_passed).lower()}"
+    )
+    if not validation_passed:
+        print(
+            "[MIMIT] candidate rejected "
+            f"prices={candidate_rows} minimum={required_rows} "
+            "existing dataset preserved"
+        )
+        raise MimitCandidateDatasetRejected(
+            "Candidate dataset rejected: "
+            f"final price rows {candidate_rows} below required minimum {required_rows}; "
+            "existing dataset preserved"
+        )
+
+
+def validate_post_write_price_count(
+    written_rows: int,
+    candidate_rows: int,
+    *,
+    minimum_rows: int | None = None,
+) -> None:
+    required_rows = (
+        MIMIT_MIN_FINAL_PRICE_ROWS if minimum_rows is None else minimum_rows
+    )
+    validation_passed = (
+        written_rows > 0
+        and written_rows >= required_rows
+        and written_rows == candidate_rows
+    )
+    print(
+        "[MIMIT] post_write_validation "
+        f"written_rows={written_rows} candidate_rows={candidate_rows} "
+        f"minimum={required_rows} passed={str(validation_passed).lower()}"
+    )
+    if not validation_passed:
+        raise MimitDatabaseWriteValidationError(
+            "Database write validation failed: "
+            f"wrote {written_rows} price rows for {candidate_rows} candidates "
+            f"with required minimum {required_rows}"
+        )
+
+
 def import_prices(
     conn,
     df_prices: pd.DataFrame,
     station_id_map: dict[int, int],
     monitoring_metrics: dict[str, Any] | None = None,
+    *,
+    prepared_prices: tuple[
+        list[NormalizedMimitPrice], PriceSelectionDiagnostics
+    ] | None = None,
 ) -> int:
-    selected_prices, diagnostics = prepare_prices_for_import(df_prices, station_id_map)
-
-    if monitoring_metrics is not None:
-        monitoring_metrics.update(
-            {
-                "prices_for_importable_stations": (
-                    diagnostics.input_rows - diagnostics.skipped_missing_station
-                ),
-                "candidate_rows": diagnostics.candidate_rows,
-                "final_rows": diagnostics.selected_rows,
-                "duplicates_removed": diagnostics.duplicate_rows_removed,
-                "final_duplicate_keys": diagnostics.final_duplicate_keys,
-                "unknown_fuel_rows": diagnostics.unknown_fuel_rows,
-                "unknown_fuels": get_unknown_fuel_details(diagnostics),
-                "fuel_type_counts": dict(sorted(diagnostics.final_fuel_type_counts.items())),
-                "oldest_reported_at": (
-                    diagnostics.oldest_reported_at.isoformat()
-                    if diagnostics.oldest_reported_at
-                    else None
-                ),
-                "newest_reported_at": (
-                    diagnostics.newest_reported_at.isoformat()
-                    if diagnostics.newest_reported_at
-                    else None
-                ),
-            }
-        )
+    selected_prices, diagnostics = prepared_prices or prepare_prices_for_import(
+        df_prices,
+        station_id_map,
+    )
+    update_price_import_metrics(monitoring_metrics, diagnostics)
 
     with conn.cursor() as cur:
         for item in selected_prices:
@@ -928,6 +1009,16 @@ def import_local_mimit_files(
         metrics["stations_excluded"] = max(0, len(df_stations) - len(station_id_map))
         print(f"Stazioni importate/aggiornate: {len(station_id_map)}")
 
+        print("Preparazione e validazione dataset prezzi candidato...")
+        prepared_prices = prepare_prices_for_import(df_prices, station_id_map)
+        candidate_final_price_rows = prepared_prices[1].selected_rows
+        update_price_import_metrics(metrics, prepared_prices[1])
+        validate_candidate_price_count(candidate_final_price_rows)
+
+        print(
+            "[MIMIT] replace_started "
+            f"candidate_rows={candidate_final_price_rows}"
+        )
         print("Pulizia prezzi esistenti...")
         clear_prices(conn)
 
@@ -937,14 +1028,17 @@ def import_local_mimit_files(
             df_prices,
             station_id_map,
             monitoring_metrics=metrics,
+            prepared_prices=prepared_prices,
         )
-        if imported_prices == 0:
-            raise RuntimeError("Nessun prezzo importato: import interrotto")
         print(f"Prezzi importati: {imported_prices}")
 
         with conn.cursor() as cur:
-            cur.execute("SELECT MAX(reported_at) FROM fuel_prices;")
-            max_reported_at_imported = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*), MAX(reported_at) FROM fuel_prices;")
+            post_write_count, max_reported_at_imported = cur.fetchone()
+        validate_post_write_price_count(
+            int(post_write_count),
+            candidate_final_price_rows,
+        )
         print(
             "Max reported_at importato in fuel_prices: "
             f"{max_reported_at_imported.isoformat() if max_reported_at_imported else None}"
@@ -961,8 +1055,12 @@ def import_local_mimit_files(
             "max_reported_at_csv": max_reported_at_csv.isoformat() if max_reported_at_csv else None,
             "max_reported_at_imported": max_reported_at_imported.isoformat() if max_reported_at_imported else None,
         }
-    except Exception:
+    except Exception as exc:
         conn.rollback()
+        print(
+            "[MIMIT] import_rollback "
+            f"reason={exc.__class__.__name__} previous_dataset_preserved=true"
+        )
         raise
     finally:
         conn.close()
