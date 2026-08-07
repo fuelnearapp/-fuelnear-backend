@@ -11,6 +11,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -198,6 +199,7 @@ class AuthTestCase(unittest.TestCase):
                 cur.execute(
                     """
                     TRUNCATE
+                        apple_token_revocations,
                         auth_rate_limits,
                         user_device_tokens,
                         user_auth_providers,
@@ -677,6 +679,367 @@ class AuthTestCase(unittest.TestCase):
             main.refresh_login_session(main.RefreshRequest(refresh_token=session["refresh_token"]))
         with self.assertRaises(main.APIError):
             main.get_current_user_profile(f"Bearer {session['access_token']}")
+
+    def create_linked_provider_user(
+        self,
+        provider: str,
+        *,
+        token_ciphertext: str | None = None,
+    ) -> tuple[int, dict]:
+        self.register()
+        self.verify_user_directly()
+        session = self.login()["session"]
+        user_id = self.get_user()["id"]
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_auth_providers (
+                        user_id, provider, provider_user_id, email,
+                        email_verified, apple_refresh_token_ciphertext,
+                        apple_token_updated_at
+                    )
+                    VALUES (%s, %s, %s, NULL, TRUE, %s,
+                            CASE WHEN %s IS NULL THEN NULL ELSE NOW() END);
+                    """,
+                    (
+                        user_id,
+                        provider,
+                        f"{provider}-subject",
+                        token_ciphertext,
+                        token_ciphertext,
+                    ),
+                )
+        return user_id, session
+
+    def test_30a_apple_delete_revokes_token_and_cleans_account(self):
+        user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                    "revoked",
+                    1,
+                ),
+            ) as revoke,
+        ):
+            response = main.delete_account(f"Bearer {session['access_token']}")
+
+        self.assertEqual(response["status"], "ok")
+        revoke.assert_called_once_with("refresh-token")
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users WHERE id = %s;", (user_id,))
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM user_auth_providers;")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM user_sessions;")
+                self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_30b_already_invalid_apple_token_still_deletes_account(self):
+        _user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                    "already_invalid",
+                    1,
+                ),
+            ),
+        ):
+            response = main.delete_account(f"Bearer {session['access_token']}")
+        self.assertEqual(response["status"], "ok")
+
+    def test_30c_temporary_apple_failure_queues_revoke_and_deletes_locally(self):
+        _user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                side_effect=main.apple_auth_service.AppleTokenRevocationTemporaryError(
+                    "temporary"
+                ),
+            ),
+        ):
+            response = main.delete_account(f"Bearer {session['access_token']}")
+
+        self.assertEqual(response["status"], "ok")
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users;")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT status FROM apple_token_revocations;")
+                self.assertEqual(cur.fetchone()[0], "pending")
+
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                    "revoked",
+                    1,
+                ),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+        self.assertEqual(summary["completed"], 1)
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM apple_token_revocations;")
+                self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_30d_email_and_google_accounts_do_not_call_apple_revoke(self):
+        self.register()
+        self.verify_user_directly()
+        email_session = self.login()["session"]
+        with patch.object(
+            main.apple_auth_service,
+            "revoke_apple_refresh_token",
+        ) as revoke:
+            main.delete_account(f"Bearer {email_session['access_token']}")
+        revoke.assert_not_called()
+
+        self.reset_database()
+        _user_id, google_session = self.create_linked_provider_user("google")
+        with patch.object(
+            main.apple_auth_service,
+            "revoke_apple_refresh_token",
+        ) as revoke:
+            main.delete_account(f"Bearer {google_session['access_token']}")
+        revoke.assert_not_called()
+
+    def test_30e_apple_plus_google_revokes_only_apple_and_deletes_all(self):
+        user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_auth_providers (
+                        user_id, provider, provider_user_id, email_verified
+                    )
+                    VALUES (%s, 'google', 'google-subject', TRUE);
+                    """,
+                    (user_id,),
+                )
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                    "revoked",
+                    1,
+                ),
+            ) as revoke,
+        ):
+            main.delete_account(f"Bearer {session['access_token']}")
+        revoke.assert_called_once()
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM user_auth_providers;")
+                self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_30f_legacy_apple_account_without_token_deletes_locally(self):
+        _user_id, session = self.create_linked_provider_user("apple")
+        with patch.object(
+            main.apple_auth_service,
+            "revoke_apple_refresh_token",
+        ) as revoke:
+            response = main.delete_account(f"Bearer {session['access_token']}")
+        self.assertEqual(response["status"], "ok")
+        revoke.assert_not_called()
+
+    def test_30g_repeated_delete_is_safe_and_does_not_revoke_twice(self):
+        _user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with (
+            patch.object(
+                main.apple_auth_service,
+                "decrypt_apple_refresh_token",
+                return_value="refresh-token",
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                    "revoked",
+                    1,
+                ),
+            ) as revoke,
+        ):
+            main.delete_account(f"Bearer {session['access_token']}")
+            with self.assertRaises(main.APIError):
+                main.delete_account(f"Bearer {session['access_token']}")
+        revoke.assert_called_once()
+
+    def test_30h_authorization_code_exchange_saves_refresh_token(self):
+        claims = {
+            "provider": "apple",
+            "provider_user_id": "apple-subject",
+            "email": "apple@example.com",
+            "email_verified": True,
+            "display_name": None,
+        }
+        with (
+            patch.object(main, "verify_apple_identity_token", return_value=claims),
+            patch.object(
+                main.apple_auth_service,
+                "exchange_apple_authorization_code",
+                return_value=main.apple_auth_service.AppleTokenExchangeResult(
+                    "refresh-token"
+                ),
+            ),
+            patch.object(
+                main.apple_auth_service,
+                "encrypt_apple_refresh_token",
+                return_value="encrypted-refresh-token",
+            ),
+        ):
+            response = main.apple_login(
+                main.AppleAuthRequest(
+                    identity_token="identity-token",
+                    authorization_code="authorization-code",
+                    raw_nonce="raw-nonce",
+                )
+            )
+
+        self.assertEqual(response["status"], "ok")
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT apple_refresh_token_ciphertext FROM user_auth_providers "
+                    "WHERE provider = 'apple';"
+                )
+                self.assertEqual(cur.fetchone()[0], "encrypted-refresh-token")
+
+    def test_30i_reused_authorization_code_keeps_existing_refresh_token(self):
+        user_id, _session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="existing-ciphertext",
+        )
+        claims = {
+            "provider": "apple",
+            "provider_user_id": "apple-subject",
+            "email": None,
+            "email_verified": False,
+            "display_name": None,
+        }
+        with (
+            patch.object(main, "verify_apple_identity_token", return_value=claims),
+            patch.object(
+                main.apple_auth_service,
+                "exchange_apple_authorization_code",
+                side_effect=main.apple_auth_service.AppleAuthorizationCodeInvalid(
+                    "used"
+                ),
+            ),
+        ):
+            response = main.apple_login(
+                main.AppleAuthRequest(
+                    identity_token="identity-token",
+                    authorization_code="used-code",
+                    raw_nonce="raw-nonce",
+                )
+            )
+        self.assertEqual(response["user"]["id"], user_id)
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT apple_refresh_token_ciphertext FROM user_auth_providers "
+                    "WHERE provider = 'apple';"
+                )
+                self.assertEqual(cur.fetchone()[0], "existing-ciphertext")
+
+    def test_30j_database_delete_error_rolls_back_local_cleanup(self):
+        user_id, session = self.create_linked_provider_user(
+            "apple",
+            token_ciphertext="encrypted-refresh-token",
+        )
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE OR REPLACE FUNCTION reject_test_user_delete()
+                    RETURNS TRIGGER AS $$
+                    BEGIN
+                        RAISE EXCEPTION 'test delete failure';
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER reject_test_user_delete_trigger
+                    BEFORE DELETE ON users
+                    FOR EACH ROW EXECUTE FUNCTION reject_test_user_delete();
+                    """
+                )
+        try:
+            with (
+                patch.object(
+                    main.apple_auth_service,
+                    "decrypt_apple_refresh_token",
+                    return_value="refresh-token",
+                ),
+                patch.object(
+                    main.apple_auth_service,
+                    "revoke_apple_refresh_token",
+                    return_value=main.apple_auth_service.AppleTokenRevocationResult(
+                        "revoked",
+                        1,
+                    ),
+                ),
+            ):
+                with self.assertRaises(main.HTTPException) as context:
+                    main.delete_account(f"Bearer {session['access_token']}")
+            self.assertEqual(context.exception.status_code, 500)
+            with main.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM users WHERE id = %s;", (user_id,))
+                    self.assertEqual(cur.fetchone()[0], 1)
+                    cur.execute("SELECT COUNT(*) FROM user_sessions WHERE user_id = %s;", (user_id,))
+                    self.assertEqual(cur.fetchone()[0], 1)
+        finally:
+            with main.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DROP TRIGGER IF EXISTS reject_test_user_delete_trigger ON users;")
+                    cur.execute("DROP FUNCTION IF EXISTS reject_test_user_delete();")
 
     def test_31_new_hash_uses_at_least_600k_iterations(self):
         hash_value = main.hash_password(self.password)

@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
-from attr import evolve
 from appstoreserverlibrary.models.AutoRenewStatus import AutoRenewStatus
 from appstoreserverlibrary.models.Data import Data
 from appstoreserverlibrary.models.Environment import Environment
@@ -74,14 +73,39 @@ class FakeVerifier:
         return self.renewal
 
 
+class EnvironmentVerifier(FakeVerifier):
+    def __init__(self, environment, notification, transaction=None, renewal=None):
+        super().__init__(notification, transaction=transaction, renewal=renewal)
+        self.environment = environment
+
+    def verify_and_decode_notification(self, value: str):
+        payload = super().verify_and_decode_notification(value)
+        if (
+            self.environment == Environment.PRODUCTION
+            and payload.data is not None
+            and payload.data.appAppleId is None
+        ):
+            raise VerificationException(VerificationStatus.INVALID_APP_IDENTIFIER)
+        if payload.data is None or payload.data.environment != self.environment:
+            raise VerificationException(VerificationStatus.INVALID_ENVIRONMENT)
+        return payload
+
+
 class AppleNotificationVerifierTestCase(unittest.TestCase):
-    def config(self, *, environment: str = "sandbox", app_id: int | None = None):
+    def config(
+        self,
+        *,
+        environment: str = "sandbox",
+        app_id: int | None = None,
+        accepted_environments: tuple[str, ...] = (),
+    ):
         return AppleSubscriptionsConfig(
             bundle_id="MB.FuelNear",
             environment=environment,
             app_id=app_id,
             root_certificates_path=Path("/unused/apple-root.cer"),
             enable_online_checks=True,
+            accepted_environments=accepted_environments,
         )
 
     def notification(
@@ -108,7 +132,12 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             ),
         )
 
-    def transaction(self, *, app_account_token=None):
+    def transaction(
+        self,
+        *,
+        app_account_token=None,
+        environment=Environment.SANDBOX,
+    ):
         return JWSTransactionDecodedPayload(
             productId="MB.FuelNear.plus.monthly",
             transactionId="transaction-1",
@@ -118,16 +147,16 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             revocationDate=None,
             revocationReason=None,
             appAccountToken=str(app_account_token or uuid4()),
-            environment=Environment.SANDBOX,
+            environment=environment,
             bundleId="MB.FuelNear",
         )
 
-    def renewal(self):
+    def renewal(self, *, environment=Environment.SANDBOX):
         return JWSRenewalInfoDecodedPayload(
             autoRenewStatus=AutoRenewStatus.ON,
             expirationIntent=ExpirationIntent.BILLING_ERROR,
             autoRenewProductId="MB.FuelNear.plus.monthly",
-            environment=Environment.SANDBOX,
+            environment=environment,
         )
 
     def verify(self, notification=None, transaction=None, renewal=None, **kwargs):
@@ -211,8 +240,7 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
                 environment=Environment.PRODUCTION,
                 app_id=app_id,
             ),
-            transaction=evolve(
-                self.transaction(),
+            transaction=self.transaction(
                 environment=Environment.PRODUCTION,
             ),
             renewal=JWSRenewalInfoDecodedPayload(
@@ -332,8 +360,7 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
         config = self.config()
         verifier = Mock()
         with (
-            patch.object(notification_verifier_module, "_default_verifier", None),
-            patch.object(notification_verifier_module, "_default_verifier_config", None),
+            patch.object(notification_verifier_module, "_default_verifiers", {}),
             patch.object(
                 notification_verifier_module,
                 "create_app_store_notification_verifier",
@@ -350,6 +377,150 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
         self.assertIs(first, verifier)
         self.assertIs(second, verifier)
         factory.assert_called_once_with(config)
+
+    def test_dual_allowlist_accepts_sandbox_and_production_notifications(self):
+        config = self.config(
+            environment="production",
+            app_id=123456789,
+            accepted_environments=("sandbox", "production"),
+        )
+        sandbox_payload = self.notification(environment=Environment.SANDBOX)
+        sandbox_verifier = EnvironmentVerifier(
+            Environment.SANDBOX,
+            sandbox_payload,
+            transaction=self.transaction(environment=Environment.SANDBOX),
+            renewal=self.renewal(environment=Environment.SANDBOX),
+        )
+        production_verifier = EnvironmentVerifier(
+            Environment.PRODUCTION,
+            sandbox_payload,
+        )
+        sandbox_result = verify_app_store_notification(
+            "sandbox-notification",
+            config=config,
+            verifiers=[
+                ("production", production_verifier),
+                ("sandbox", sandbox_verifier),
+            ],
+        )
+        self.assertEqual(sandbox_result.environment, "Sandbox")
+
+        production_payload = self.notification(
+            environment=Environment.PRODUCTION,
+            app_id=123456789,
+        )
+        production_verifier = EnvironmentVerifier(
+            Environment.PRODUCTION,
+            production_payload,
+            transaction=self.transaction(environment=Environment.PRODUCTION),
+            renewal=self.renewal(environment=Environment.PRODUCTION),
+        )
+        production_result = verify_app_store_notification(
+            "production-notification",
+            config=config,
+            verifiers=[("production", production_verifier)],
+        )
+        self.assertEqual(production_result.environment, "Production")
+
+    def test_dual_allowlist_builds_distinct_official_verifiers(self):
+        config = self.config(
+            environment="production",
+            app_id=123456789,
+            accepted_environments=("sandbox", "production"),
+        )
+        production_verifier = Mock(name="production-verifier")
+        sandbox_verifier = Mock(name="sandbox-verifier")
+        with (
+            patch.object(notification_verifier_module, "_default_verifiers", {}),
+            patch.object(
+                notification_verifier_module,
+                "create_app_store_notification_verifier",
+                side_effect=[production_verifier, sandbox_verifier],
+            ) as factory,
+        ):
+            candidates = notification_verifier_module._get_configured_notification_verifier_candidates(
+                config
+            )
+
+        self.assertEqual(
+            candidates,
+            [
+                ("production", production_verifier),
+                ("sandbox", sandbox_verifier),
+            ],
+        )
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(factory.call_args_list[0].args[0].environment, "production")
+        self.assertEqual(factory.call_args_list[1].args[0].environment, "sandbox")
+
+    def test_single_environment_allowlist_rejects_the_other_environment(self):
+        sandbox_payload = self.notification(environment=Environment.SANDBOX)
+        with self.assertRaises(AppleNotificationInvalidError):
+            verify_app_store_notification(
+                "sandbox-notification",
+                config=self.config(environment="production", app_id=123456789),
+                verifiers=[
+                    (
+                        "production",
+                        EnvironmentVerifier(Environment.PRODUCTION, sandbox_payload),
+                    )
+                ],
+            )
+
+        production_payload = self.notification(
+            environment=Environment.PRODUCTION,
+            app_id=123456789,
+        )
+        with self.assertRaises(AppleNotificationInvalidError):
+            verify_app_store_notification(
+                "production-notification",
+                config=self.config(environment="sandbox"),
+                verifiers=[
+                    (
+                        "sandbox",
+                        EnvironmentVerifier(Environment.SANDBOX, production_payload),
+                    )
+                ],
+            )
+
+    def test_transaction_environment_must_match_notification(self):
+        with self.assertRaises(AppleNotificationTransactionDataError):
+            self.verify(
+                transaction=self.transaction(environment=Environment.PRODUCTION)
+            )
+
+    def test_renewal_environment_must_match_notification(self):
+        with self.assertRaises(AppleNotificationRenewalDataError):
+            self.verify(renewal=self.renewal(environment=Environment.PRODUCTION))
+
+    def test_unknown_or_missing_notification_environment_is_rejected(self):
+        unknown = self.notification(environment=Environment.XCODE)
+        with self.assertRaises(AppleNotificationPayloadError):
+            self.verify(notification=unknown)
+
+        missing = self.notification(environment=None)
+        with self.assertRaises(AppleNotificationPayloadError):
+            self.verify(notification=missing)
+
+        transaction_missing = self.transaction()
+        object.__setattr__(transaction_missing, "environment", None)
+        with self.assertRaises(AppleNotificationTransactionDataError):
+            self.verify(transaction=transaction_missing)
+
+    def test_environment_normalization_is_case_and_whitespace_safe(self):
+        notification = self.notification()
+        object.__setattr__(notification.data, "environment", " Sandbox ")
+        transaction = self.transaction()
+        object.__setattr__(transaction, "environment", "SANDBOX")
+        renewal = self.renewal()
+        object.__setattr__(renewal, "environment", " sandbox ")
+
+        result, _ = self.verify(
+            notification=notification,
+            transaction=transaction,
+            renewal=renewal,
+        )
+        self.assertEqual(result.environment, "Sandbox")
 
 
 if __name__ == "__main__":

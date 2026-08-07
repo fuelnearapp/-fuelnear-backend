@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 from app import (
+    apple_auth_service,
     apple_jws_verifier,
     apple_notification_processor,
     apple_notification_verifier,
@@ -1948,6 +1949,7 @@ def authenticate_with_provider(
     device_info: str | None,
     referral_code: str | None = None,
     log_prefix: str | None = None,
+    provider_token_ciphertext: str | None = None,
 ) -> dict[str, Any]:
     provider = provider_claims["provider"]
     provider_user_id = provider_claims["provider_user_id"]
@@ -2094,6 +2096,19 @@ def authenticate_with_provider(
                     if user_row is None:
                         raise HTTPException(status_code=404, detail="User not found")
 
+                if provider == "apple" and provider_token_ciphertext:
+                    cur.execute(
+                        """
+                        UPDATE user_auth_providers
+                        SET apple_refresh_token_ciphertext = %s,
+                            apple_token_updated_at = NOW(),
+                            updated_at = NOW()
+                        WHERE provider = 'apple'
+                          AND provider_user_id = %s;
+                        """,
+                        (provider_token_ciphertext, provider_user_id),
+                    )
+
                 if not user_row["is_active"]:
                     raise HTTPException(status_code=403, detail="User account is inactive")
 
@@ -2130,9 +2145,71 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
     user_id = user_payload["id"]
     account_delete_log(f"authenticated user id present={bool(user_id)}")
 
+    apple_token_ciphertext = None
+    lookup_conn = get_connection()
+    try:
+        with lookup_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT apple_refresh_token_ciphertext
+                FROM user_auth_providers
+                WHERE user_id = %s
+                  AND provider = 'apple'
+                LIMIT 1;
+                """,
+                (user_id,),
+            )
+            provider_row = cur.fetchone()
+            if provider_row is not None:
+                apple_token_ciphertext = provider_row[0]
+    finally:
+        lookup_conn.close()
+
+    pending_apple_revocation = False
+    if apple_token_ciphertext:
+        account_delete_log("apple revoke attempted=true")
+        try:
+            apple_refresh_token = apple_auth_service.decrypt_apple_refresh_token(
+                apple_token_ciphertext
+            )
+            revoke_result = apple_auth_service.revoke_apple_refresh_token(
+                apple_refresh_token
+            )
+            account_delete_log(
+                "apple revoke success=true "
+                f"already_invalid={str(revoke_result.status == 'already_invalid').lower()}"
+            )
+        except (
+            apple_auth_service.AppleAuthConfigurationError,
+            apple_auth_service.AppleTokenRevocationTemporaryError,
+        ) as exc:
+            pending_apple_revocation = True
+            account_delete_log(
+                f"apple revoke temporary_failure=true type={exc.__class__.__name__} "
+                "retry_scheduled=true"
+            )
+        except apple_auth_service.AppleTokenEncryptionError as exc:
+            pending_apple_revocation = True
+            account_delete_log(
+                f"apple revoke temporary_failure=true type={exc.__class__.__name__} "
+                "retry_scheduled=true"
+            )
+        except apple_auth_service.AppleTokenRevocationError as exc:
+            account_delete_log(
+                f"apple revoke permanent_failure=true type={exc.__class__.__name__}"
+            )
+    elif provider_row is not None:
+        account_delete_log("apple legacy account no revoke token=true")
+
     conn = get_connection()
     try:
         with conn:
+            apple_auth_service.ensure_apple_auth_schema(conn)
+            if pending_apple_revocation and apple_token_ciphertext:
+                apple_auth_service.queue_apple_revocation(
+                    conn,
+                    apple_token_ciphertext,
+                )
             with conn.cursor() as cur:
                 account_delete_log("deletion started")
                 cur.execute("DELETE FROM user_device_tokens WHERE user_id = %s;", (user_id,))
@@ -2598,6 +2675,7 @@ def ensure_auth_provider_schema(conn) -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_auth_providers_user_id ON user_auth_providers(user_id);")
+    apple_auth_service.ensure_apple_auth_schema(conn)
 
 
 def ensure_user_device_tokens_schema(conn) -> None:
@@ -3662,6 +3740,20 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
         conn.close()
 
 
+def process_pending_apple_revocations_safely() -> None:
+    try:
+        summary = apple_auth_service.process_pending_apple_revocations()
+        account_delete_log(
+            "apple revoke retry processed="
+            f"{summary['processed']} completed={summary['completed']} "
+            f"temporary_failed={summary['temporary_failed']} expired={summary['expired']}"
+        )
+    except Exception as exc:
+        account_delete_log(
+            f"apple revoke retry failed type={exc.__class__.__name__}"
+        )
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     conn = get_connection()
@@ -3670,6 +3762,11 @@ def on_startup() -> None:
             ensure_auth_schema(conn)
     finally:
         conn.close()
+    threading.Thread(
+        target=process_pending_apple_revocations_safely,
+        name="apple-revocation-retry",
+        daemon=True,
+    ).start()
 
 
 @app.on_event("shutdown")
@@ -4973,6 +5070,9 @@ def login_user(payload: LoginRequest, request: Request) -> dict[str, Any]:
 @app.post("/auth/apple")
 def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     identity_token = payload.identityToken or payload.identity_token
+    authorization_code = (
+        payload.authorizationCode or payload.authorization_code or ""
+    ).strip()
     display_name = (
         sanitize_display_name(payload.display_name)
         or apple_full_name_to_display_name(payload.fullName)
@@ -5014,6 +5114,34 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
         raw_nonce=raw_nonce,
     )
 
+    provider_token_ciphertext = None
+    apple_auth_debug_log(
+        f"authorization_code_present={str(bool(authorization_code)).lower()}"
+    )
+    if authorization_code:
+        try:
+            exchange_result = apple_auth_service.exchange_apple_authorization_code(
+                authorization_code
+            )
+            provider_token_ciphertext = apple_auth_service.encrypt_apple_refresh_token(
+                exchange_result.refresh_token
+            )
+            apple_auth_debug_log("authorization_code_exchange_success=true")
+        except apple_auth_service.AppleAuthorizationCodeInvalid:
+            apple_auth_debug_log(
+                "authorization_code_exchange_success=false type=InvalidOrReusedCode"
+            )
+        except (
+            apple_auth_service.AppleAuthConfigurationError,
+            apple_auth_service.AppleTokenExchangeTemporaryError,
+            apple_auth_service.AppleTokenExchangeError,
+            apple_auth_service.AppleTokenEncryptionError,
+        ) as exc:
+            apple_auth_debug_log(
+                "authorization_code_exchange_success=false "
+                f"type={exc.__class__.__name__}"
+            )
+
     claims["display_name"] = display_name
     return authenticate_with_provider(
         claims,
@@ -5021,6 +5149,7 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
         device_info=payload.device_info,
         referral_code=payload.referral_code,
         log_prefix="[AUTH][APPLE]",
+        provider_token_ciphertext=provider_token_ciphertext,
     )
 
 

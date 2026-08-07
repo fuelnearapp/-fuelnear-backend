@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hmac
+import logging
 from pathlib import Path
 import threading
 from typing import Any, Callable
@@ -27,9 +28,14 @@ from appstoreserverlibrary.signed_data_verifier import (
 from app.apple_config import (
     AppleSubscriptionsConfig,
     AppleSubscriptionsConfigurationError,
+    get_apple_subscription_accepted_environments,
     load_apple_subscriptions_config,
+    normalize_apple_subscription_environment,
     validate_apple_subscriptions_config,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AppleNotificationVerificationError(RuntimeError):
@@ -103,8 +109,15 @@ class VerifiedAppStoreNotification:
 
 
 VerifierFactory = Callable[..., SignedDataVerifier]
-_default_verifier: SignedDataVerifier | None = None
-_default_verifier_config: AppleSubscriptionsConfig | None = None
+VerifierCandidate = tuple[str | None, SignedDataVerifier]
+_ENVIRONMENT_FALLBACK_STATUSES = frozenset(
+    {
+        VerificationStatus.VERIFICATION_FAILURE,
+        VerificationStatus.INVALID_APP_IDENTIFIER,
+        VerificationStatus.INVALID_ENVIRONMENT,
+    }
+)
+_default_verifiers: dict[AppleSubscriptionsConfig, SignedDataVerifier] = {}
 _default_verifier_lock = threading.Lock()
 
 
@@ -189,13 +202,38 @@ def create_app_store_notification_verifier(
 def _get_default_app_store_notification_verifier(
     config: AppleSubscriptionsConfig,
 ) -> SignedDataVerifier:
-    global _default_verifier, _default_verifier_config
-    if _default_verifier is None or _default_verifier_config != config:
+    verifier = _default_verifiers.get(config)
+    if verifier is None:
         with _default_verifier_lock:
-            if _default_verifier is None or _default_verifier_config != config:
-                _default_verifier = create_app_store_notification_verifier(config)
-                _default_verifier_config = config
-    return _default_verifier
+            verifier = _default_verifiers.get(config)
+            if verifier is None:
+                verifier = create_app_store_notification_verifier(config)
+                _default_verifiers[config] = verifier
+    return verifier
+
+
+def _get_configured_notification_verifier_candidates(
+    config: AppleSubscriptionsConfig,
+) -> list[VerifierCandidate]:
+    accepted_environments = get_apple_subscription_accepted_environments(config)
+    ordered_environments = [
+        environment
+        for environment in ("production", "sandbox")
+        if environment in accepted_environments
+    ]
+    return [
+        (
+            environment,
+            _get_default_app_store_notification_verifier(
+                replace(
+                    config,
+                    environment=environment,
+                    accepted_environments=(environment,),
+                )
+            ),
+        )
+        for environment in ordered_environments
+    ]
 
 
 def _is_retryable_verification_error(exc: VerificationException) -> bool:
@@ -280,28 +318,75 @@ def _notification_metadata(
 def _validate_notification_metadata(
     payload: ResponseBodyV2DecodedPayload,
     config: AppleSubscriptionsConfig,
+    expected_environment: str | None,
 ) -> tuple[str, int | None, str]:
     bundle_id_value, app_apple_id, environment_value = _notification_metadata(payload)
     bundle_id = _required_text(bundle_id_value, "bundleId")
     environment = _required_text(_enum_value(environment_value), "environment")
-    expected_environment = {
-        "sandbox": Environment.SANDBOX.value,
-        "production": Environment.PRODUCTION.value,
-    }[config.environment]
+    normalized_environment = normalize_apple_subscription_environment(environment)
+    accepted_environments = get_apple_subscription_accepted_environments(config)
 
     if not hmac.compare_digest(bundle_id, config.bundle_id):
         raise AppleNotificationPayloadError(
             "Apple notification bundle identifier is invalid"
         )
-    if not hmac.compare_digest(environment, expected_environment):
+    if normalized_environment not in accepted_environments:
+        logger.warning(
+            "apple_notification_environment environment=%s accepted=false reason=not_allowed allowlist=%s",
+            normalized_environment or "missing",
+            ",".join(accepted_environments),
+        )
         raise AppleNotificationPayloadError(
             "Apple notification environment is invalid"
         )
-    if config.environment == "production" and app_apple_id != config.app_id:
+    if (
+        expected_environment is not None
+        and normalized_environment != expected_environment
+    ):
+        logger.warning(
+            "apple_notification_environment environment=%s accepted=false reason=verifier_mismatch",
+            normalized_environment or "missing",
+        )
+        raise AppleNotificationPayloadError(
+            "Apple notification environment is invalid"
+        )
+    if normalized_environment == "production" and app_apple_id != config.app_id:
         raise AppleNotificationPayloadError(
             "Apple notification app identifier is invalid"
         )
-    return bundle_id, app_apple_id, environment
+    logger.info(
+        "apple_notification_environment environment=%s accepted=true allowlist=%s",
+        normalized_environment,
+        ",".join(accepted_environments),
+    )
+    canonical_environment = {
+        "sandbox": Environment.SANDBOX.value,
+        "production": Environment.PRODUCTION.value,
+    }[normalized_environment]
+    return bundle_id, app_apple_id, canonical_environment
+
+
+def _validate_nested_environment(
+    value: Any,
+    expected_environment: str,
+    data_type: str,
+) -> None:
+    normalized = normalize_apple_subscription_environment(_enum_value(value))
+    if normalized != expected_environment:
+        logger.warning(
+            "apple_notification_environment environment=%s accepted=false reason=%s_mismatch expected=%s",
+            normalized or "missing",
+            data_type,
+            expected_environment,
+        )
+        error_type = (
+            AppleNotificationTransactionDataError
+            if data_type == "transaction"
+            else AppleNotificationRenewalDataError
+        )
+        raise error_type(
+            f"Apple notification {data_type} environment is invalid"
+        )
 
 
 def _parse_app_account_token(value: Any) -> UUID | None:
@@ -406,6 +491,7 @@ def verify_app_store_notification(
     *,
     config: AppleSubscriptionsConfig | None = None,
     verifier: SignedDataVerifier | None = None,
+    verifiers: list[VerifierCandidate] | None = None,
 ) -> VerifiedAppStoreNotification:
     if not isinstance(signed_payload, str) or not signed_payload.strip():
         raise AppleNotificationInvalidError(
@@ -421,27 +507,63 @@ def verify_app_store_notification(
             "Apple subscriptions configuration is invalid"
         ) from exc
 
-    selected_verifier = (
-        verifier
-        if verifier is not None
-        else _get_default_app_store_notification_verifier(validated_config)
-    )
-    try:
-        payload = selected_verifier.verify_and_decode_notification(
-            signed_payload.strip()
+    if verifier is not None and verifiers is not None:
+        raise ValueError("verifier and verifiers cannot both be provided")
+    if verifier is not None:
+        verifier_candidates: list[VerifierCandidate] = [(None, verifier)]
+    elif verifiers is not None:
+        verifier_candidates = list(verifiers)
+    else:
+        verifier_candidates = _get_configured_notification_verifier_candidates(
+            validated_config
         )
-    except VerificationException as exc:
-        if _is_retryable_verification_error(exc):
-            raise AppleNotificationVerificationUnavailableError(
-                "Apple notification verification is temporarily unavailable"
+    if not verifier_candidates:
+        raise AppleNotificationConfigurationError(
+            "No Apple notification verifier is configured"
+        )
+
+    payload = None
+    selected_verifier = None
+    selected_environment = None
+    last_verification_error: VerificationException | None = None
+    for candidate_environment, candidate_verifier in verifier_candidates:
+        try:
+            candidate_payload = candidate_verifier.verify_and_decode_notification(
+                signed_payload.strip()
+            )
+        except VerificationException as exc:
+            if _is_retryable_verification_error(exc):
+                raise AppleNotificationVerificationUnavailableError(
+                    "Apple notification verification is temporarily unavailable"
+                ) from exc
+            last_verification_error = exc
+            if exc.status not in _ENVIRONMENT_FALLBACK_STATUSES:
+                break
+            continue
+        except Exception as exc:
+            raise AppleNotificationInvalidError(
+                "Apple signed notification could not be verified"
             ) from exc
-        raise AppleNotificationInvalidError(
-            "Apple signed notification is invalid"
-        ) from exc
-    except Exception as exc:
+
+        payload = candidate_payload
+        selected_verifier = candidate_verifier
+        selected_environment = candidate_environment
+        break
+
+    if payload is None or selected_verifier is None:
+        logger.warning(
+            "apple_notification_environment environment=unverified accepted=false reason=verification_failed allowlist=%s",
+            ",".join(
+                get_apple_subscription_accepted_environments(validated_config)
+            ),
+        )
+        if last_verification_error is not None:
+            raise AppleNotificationInvalidError(
+                "Apple signed notification is invalid"
+            ) from last_verification_error
         raise AppleNotificationInvalidError(
             "Apple signed notification could not be verified"
-        ) from exc
+        )
 
     notification_type = _enum_or_raw(
         payload.notificationType,
@@ -473,7 +595,9 @@ def verify_app_store_notification(
     bundle_id, app_apple_id, environment = _validate_notification_metadata(
         payload,
         validated_config,
+        selected_environment,
     )
+    normalized_environment = normalize_apple_subscription_environment(environment)
 
     signed_transaction_info = (
         payload.data.signedTransactionInfo
@@ -504,6 +628,11 @@ def verify_app_store_notification(
             raise AppleNotificationTransactionDataError(
                 "Apple notification transaction data is invalid"
             ) from exc
+        _validate_nested_environment(
+            transaction_payload.environment,
+            normalized_environment,
+            "transaction",
+        )
         transaction = _normalize_transaction(transaction_payload)
 
     renewal = None
@@ -524,6 +653,11 @@ def verify_app_store_notification(
             raise AppleNotificationRenewalDataError(
                 "Apple notification renewal data is invalid"
             ) from exc
+        _validate_nested_environment(
+            renewal_payload.environment,
+            normalized_environment,
+            "renewal",
+        )
         renewal = _normalize_renewal(renewal_payload)
 
     return VerifiedAppStoreNotification(

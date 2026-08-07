@@ -20,6 +20,7 @@ from app.apple_config import (
     AppleSubscriptionsConfigurationError,
     get_apple_subscription_accepted_environments,
     load_apple_subscriptions_config,
+    normalize_apple_subscription_environment,
     validate_apple_subscriptions_config,
 )
 from app.apple_subscriptions import SUPPORTED_APPLE_PRODUCT_IDS
@@ -348,10 +349,8 @@ def verify_apple_signed_transaction(
             continue
 
         candidate_environment = _optional_text_value(candidate_payload.environment)
-        normalized_candidate_environment = (
-            candidate_environment.strip().lower()
-            if isinstance(candidate_environment, str)
-            else ""
+        normalized_candidate_environment = normalize_apple_subscription_environment(
+            candidate_environment
         )
         if normalized_candidate_environment not in {"sandbox", "production"}:
             last_verification_error = VerificationException(

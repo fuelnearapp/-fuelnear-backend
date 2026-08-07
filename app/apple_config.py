@@ -13,6 +13,13 @@ class AppleSubscriptionsConfigurationError(ValueError):
     pass
 
 
+def normalize_apple_subscription_environment(value: object) -> str:
+    normalized = getattr(value, "value", value)
+    if not isinstance(normalized, str):
+        return ""
+    return normalized.strip().lower()
+
+
 @dataclass(frozen=True, slots=True)
 class AppleSubscriptionsConfig:
     bundle_id: str
@@ -61,7 +68,7 @@ def _parse_accepted_environments(raw_value: str | None) -> tuple[str, ...]:
 
     values: list[str] = []
     for item in raw_value.split(","):
-        normalized = item.strip().lower()
+        normalized = normalize_apple_subscription_environment(item)
         if normalized and normalized not in values:
             values.append(normalized)
     return tuple(values)
@@ -72,7 +79,9 @@ def load_apple_subscriptions_config(
 ) -> AppleSubscriptionsConfig:
     source = os.environ if environ is None else environ
     bundle_id = _optional_text(source, "APPLE_SUBSCRIPTIONS_BUNDLE_ID") or ""
-    environment = (_optional_text(source, "APPLE_SUBSCRIPTIONS_ENVIRONMENT") or "").lower()
+    environment = normalize_apple_subscription_environment(
+        _optional_text(source, "APPLE_SUBSCRIPTIONS_ENVIRONMENT")
+    )
     accepted_environments = _parse_accepted_environments(
         _optional_text(source, "APPLE_SUBSCRIPTIONS_ACCEPTED_ENVIRONMENTS")
     )
@@ -109,9 +118,9 @@ def validate_apple_subscriptions_config(
 
     errors: list[str] = []
     bundle_id = config.bundle_id.strip() if isinstance(config.bundle_id, str) else ""
-    environment = config.environment.strip().lower() if isinstance(config.environment, str) else ""
+    environment = normalize_apple_subscription_environment(config.environment)
     accepted_environments = tuple(
-        item.strip().lower()
+        normalize_apple_subscription_environment(item)
         for item in config.accepted_environments
         if isinstance(item, str) and item.strip()
     )
