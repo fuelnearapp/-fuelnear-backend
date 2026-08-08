@@ -1252,6 +1252,303 @@ class AuthTestCase(unittest.TestCase):
         self.assertEqual(profile["user"]["app_account_token"], original_token)
         self.assertEqual(second_profile["user"]["app_account_token"], original_token)
 
+    def queue_apple_revocation_for_test(
+        self,
+        ciphertext: str,
+        *,
+        next_attempt_delta: timedelta = timedelta(0),
+        expires_delta: timedelta = timedelta(days=30),
+    ) -> None:
+        with main.get_connection() as conn:
+            main.apple_auth_service.queue_apple_revocation(conn, ciphertext)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE apple_token_revocations
+                    SET next_attempt_at = NOW() + %s,
+                        expires_at = NOW() + %s
+                    WHERE token_ciphertext = %s;
+                    """,
+                    (next_attempt_delta, expires_delta, ciphertext),
+                )
+
+    def apple_revocation_rows(self) -> list[tuple]:
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT token_ciphertext, status, attempts, next_attempt_at
+                    FROM apple_token_revocations
+                    ORDER BY id;
+                    """
+                )
+                return cur.fetchall()
+
+    def test_48_empty_apple_revocation_queue_is_successful(self):
+        summary = main.apple_auth_service.process_pending_apple_revocations()
+        self.assertEqual(summary["eligible"], 0)
+        self.assertEqual(summary["attempted"], 0)
+        self.assertEqual(summary["remaining_pending"], 0)
+
+    def test_49_pending_apple_revocation_is_removed_after_success(self):
+        self.queue_apple_revocation_for_test("cipher-success")
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult("revoked", 1),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(summary["remaining_pending"], 0)
+        self.assertEqual(self.apple_revocation_rows(), [])
+
+    def test_50_timeout_reschedules_apple_revocation(self):
+        self.queue_apple_revocation_for_test("cipher-timeout")
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                side_effect=main.apple_auth_service.AppleTokenRevocationTemporaryError("timeout"),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        row = self.apple_revocation_rows()[0]
+        self.assertEqual(summary["temporary_failed"], 1)
+        self.assertEqual(row[1], "pending")
+        self.assertEqual(row[2], 1)
+        self.assertGreater(row[3], datetime.now(timezone.utc))
+
+    def test_51_apple_5xx_reschedules_revocation(self):
+        self.queue_apple_revocation_for_test("cipher-5xx")
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                side_effect=main.apple_auth_service.AppleTokenRevocationTemporaryError("503"),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["temporary_failed"], 1)
+        self.assertEqual(self.apple_revocation_rows()[0][1], "pending")
+
+    def test_52_already_invalid_apple_token_completes_queue_item(self):
+        self.queue_apple_revocation_for_test("cipher-invalid")
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult("already_invalid", 1),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(self.apple_revocation_rows(), [])
+
+    def test_53_not_yet_eligible_revocation_is_not_processed(self):
+        self.queue_apple_revocation_for_test(
+            "cipher-future",
+            next_attempt_delta=timedelta(hours=1),
+        )
+        with patch.object(main.apple_auth_service, "revoke_apple_refresh_token") as revoke:
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["eligible"], 0)
+        self.assertEqual(summary["remaining_pending"], 1)
+        revoke.assert_not_called()
+
+    def test_54_expired_revocation_is_cleaned_without_decrypt(self):
+        self.queue_apple_revocation_for_test(
+            "cipher-expired",
+            expires_delta=timedelta(seconds=-1),
+        )
+        with patch.object(main.apple_auth_service, "decrypt_apple_refresh_token") as decrypt:
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["expired"], 1)
+        self.assertEqual(summary["cleaned"], 1)
+        self.assertEqual(self.apple_revocation_rows(), [])
+        decrypt.assert_not_called()
+
+    def test_55_permanent_revocation_error_becomes_terminal(self):
+        self.queue_apple_revocation_for_test("cipher-terminal")
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                side_effect=main.apple_auth_service.AppleTokenRevocationError("rejected"),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["terminal_failed"], 1)
+        self.assertEqual(self.apple_revocation_rows()[0][1], "failed")
+
+    def test_56_two_concurrent_revocation_runs_do_not_duplicate_processing(self):
+        self.queue_apple_revocation_for_test("cipher-concurrent")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def revoke(_token):
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return main.apple_auth_service.AppleTokenRevocationResult("revoked", 1)
+
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(main.apple_auth_service, "revoke_apple_refresh_token", side_effect=revoke) as revoke_mock,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(main.apple_auth_service.process_pending_apple_revocations)
+            self.assertTrue(entered.wait(timeout=5))
+            second = executor.submit(main.apple_auth_service.process_pending_apple_revocations)
+            second_summary = second.result(timeout=5)
+            release.set()
+            first_summary = first.result(timeout=5)
+
+        self.assertEqual(revoke_mock.call_count, 1)
+        self.assertEqual(first_summary["succeeded"] + second_summary["succeeded"], 1)
+
+    def test_57_startup_and_cron_share_concurrency_safe_processor(self):
+        self.queue_apple_revocation_for_test("cipher-startup-cron")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def revoke(_token):
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return main.apple_auth_service.AppleTokenRevocationResult("revoked", 1)
+
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(main.apple_auth_service, "revoke_apple_refresh_token", side_effect=revoke) as revoke_mock,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            startup = executor.submit(main.process_pending_apple_revocations_safely)
+            self.assertTrue(entered.wait(timeout=5))
+            cron = executor.submit(main.admin_process_apple_revocations, None)
+            cron_result = cron.result(timeout=5)
+            release.set()
+            startup.result(timeout=5)
+
+        self.assertEqual(revoke_mock.call_count, 1)
+        self.assertEqual(cron_result["status"], "ok")
+
+    def test_58_revocation_queued_during_run_is_processed_next_time(self):
+        self.queue_apple_revocation_for_test("cipher-first")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def revoke(_token):
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return main.apple_auth_service.AppleTokenRevocationResult("revoked", 1)
+
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(main.apple_auth_service, "revoke_apple_refresh_token", side_effect=revoke),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            running = executor.submit(main.apple_auth_service.process_pending_apple_revocations)
+            self.assertTrue(entered.wait(timeout=5))
+            self.queue_apple_revocation_for_test("cipher-during-run")
+            release.set()
+            running.result(timeout=5)
+
+        with (
+            patch.object(main.apple_auth_service, "decrypt_apple_refresh_token", return_value="refresh"),
+            patch.object(
+                main.apple_auth_service,
+                "revoke_apple_refresh_token",
+                return_value=main.apple_auth_service.AppleTokenRevocationResult("revoked", 1),
+            ),
+        ):
+            summary = main.apple_auth_service.process_pending_apple_revocations()
+
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(self.apple_revocation_rows(), [])
+
+    def test_59_apple_revocation_admin_token_is_scope_specific(self):
+        from fastapi.testclient import TestClient
+
+        with (
+            patch.object(main, "APPLE_REVOCATION_ADMIN_TOKEN", "current-token"),
+            patch.object(main, "APPLE_REVOCATION_ADMIN_TOKEN_PREVIOUS", "previous-token"),
+            patch.object(
+                main.apple_auth_service,
+                "process_pending_apple_revocations",
+                return_value={"eligible": 0, "remaining_pending": 0},
+            ),
+        ):
+            client = TestClient(main.app)
+            rejected = client.post(
+                "/admin/process-apple-revocations",
+                headers={"X-Admin-Token": "wrong-token"},
+            )
+            accepted = client.post(
+                "/admin/process-apple-revocations",
+                headers={"X-Admin-Token": "current-token"},
+            )
+            previous = client.post(
+                "/admin/process-apple-revocations",
+                headers={"X-Admin-Token": "previous-token"},
+            )
+
+        self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(previous.status_code, 200)
+
+    def test_60_authorized_cron_returns_safe_summary_and_is_idempotent(self):
+        safe_summary = {
+            "eligible": 0,
+            "attempted": 0,
+            "succeeded": 0,
+            "temporary_failed": 0,
+            "terminal_failed": 0,
+            "expired": 0,
+            "cleaned": 0,
+            "remaining_pending": 0,
+            "processed": 0,
+            "completed": 0,
+        }
+        with patch.object(
+            main.apple_auth_service,
+            "process_pending_apple_revocations",
+            side_effect=[safe_summary, safe_summary],
+        ) as processor:
+            first = main.admin_process_apple_revocations(None)
+            second = main.admin_process_apple_revocations(None)
+
+        serialized = json.dumps(first)
+        self.assertEqual(first, second)
+        self.assertNotIn("token", serialized.lower())
+        self.assertNotIn("email", serialized.lower())
+        self.assertEqual(processor.call_count, 2)
+
+    def test_61_database_failure_is_safe_and_does_not_corrupt_queue(self):
+        self.queue_apple_revocation_for_test("cipher-db-failure")
+        with patch.object(
+            main.apple_auth_service,
+            "get_connection",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            with self.assertRaises(main.HTTPException) as cm:
+                main.admin_process_apple_revocations(None)
+
+        self.assertEqual(cm.exception.status_code, 500)
+        self.assertNotIn("database unavailable", str(cm.exception.detail))
+        self.assertEqual(len(self.apple_revocation_rows()), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

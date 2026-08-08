@@ -69,6 +69,8 @@ REFERRAL_ADMIN_TOKEN = os.getenv("REFERRAL_ADMIN_TOKEN")
 REFERRAL_ADMIN_TOKEN_PREVIOUS = os.getenv("REFERRAL_ADMIN_TOKEN_PREVIOUS")
 PRICE_NOTIFICATIONS_ADMIN_TOKEN = os.getenv("PRICE_NOTIFICATIONS_ADMIN_TOKEN")
 PRICE_NOTIFICATIONS_ADMIN_TOKEN_PREVIOUS = os.getenv("PRICE_NOTIFICATIONS_ADMIN_TOKEN_PREVIOUS")
+APPLE_REVOCATION_ADMIN_TOKEN = os.getenv("APPLE_REVOCATION_ADMIN_TOKEN")
+APPLE_REVOCATION_ADMIN_TOKEN_PREVIOUS = os.getenv("APPLE_REVOCATION_ADMIN_TOKEN_PREVIOUS")
 ADMIN_DEBUG_TOKEN = os.getenv("ADMIN_DEBUG_TOKEN")
 ADMIN_DEBUG_TOKEN_PREVIOUS = os.getenv("ADMIN_DEBUG_TOKEN_PREVIOUS")
 PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
@@ -2655,6 +2657,16 @@ def require_price_notifications_admin_token(x_admin_token: str | None = Header(d
     )
 
 
+def require_apple_revocation_admin_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
+    require_admin_token_for_scope(
+        "apple_revocation",
+        x_admin_token,
+        APPLE_REVOCATION_ADMIN_TOKEN,
+        APPLE_REVOCATION_ADMIN_TOKEN_PREVIOUS,
+        include_legacy=False,
+    )
+
+
 def require_admin_debug_token(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
     require_admin_token_for_scope(
         "admin_debug",
@@ -4183,7 +4195,9 @@ def process_pending_apple_revocations_safely() -> None:
         account_delete_log(
             "apple revoke retry processed="
             f"{summary['processed']} completed={summary['completed']} "
-            f"temporary_failed={summary['temporary_failed']} expired={summary['expired']}"
+            f"temporary_failed={summary['temporary_failed']} "
+            f"terminal_failed={summary['terminal_failed']} expired={summary['expired']} "
+            f"remaining_pending={summary['remaining_pending']}"
         )
     except Exception as exc:
         account_delete_log(
@@ -4895,7 +4909,26 @@ def admin_mimit_diagnostics(
         conn.close()
 
 
-# === ADMIN REFERRAL PROCESSING ENDPOINT ===
+# === ADMIN CRON PROCESSING ENDPOINTS ===
+
+@app.post("/admin/process-apple-revocations")
+def admin_process_apple_revocations(
+    _: None = Depends(require_apple_revocation_admin_token),
+) -> dict[str, Any]:
+    try:
+        result = apple_auth_service.process_pending_apple_revocations()
+        return {
+            "status": "ok",
+            "message": "Apple revocation processing completed",
+            "result": result,
+        }
+    except Exception as exc:
+        request_id = log_internal_exception("apple_revocation_processing", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Apple revocation processing failed. request_id={request_id}",
+        )
+
 
 @app.post("/admin/process-referrals")
 def admin_process_referrals(_: None = Depends(require_referral_admin_token)) -> dict[str, Any]:

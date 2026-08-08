@@ -376,11 +376,22 @@ def queue_apple_revocation(conn: Any, token_ciphertext: str) -> None:
 
 
 def process_pending_apple_revocations(limit: int = 25) -> dict[str, int]:
-    summary = {"processed": 0, "completed": 0, "temporary_failed": 0, "expired": 0}
+    summary = {
+        "eligible": 0,
+        "attempted": 0,
+        "succeeded": 0,
+        "temporary_failed": 0,
+        "terminal_failed": 0,
+        "expired": 0,
+        "cleaned": 0,
+        "remaining_pending": 0,
+        # Backward-compatible aliases used by the startup recovery log.
+        "processed": 0,
+        "completed": 0,
+    }
     conn = get_connection()
     try:
         with conn:
-            ensure_apple_auth_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -390,6 +401,7 @@ def process_pending_apple_revocations(limit: int = 25) -> dict[str, int]:
                     """
                 )
                 summary["expired"] = len(cur.fetchall())
+                summary["cleaned"] = summary["expired"]
                 cur.execute(
                     """
                     SELECT id, token_ciphertext, attempts
@@ -403,8 +415,10 @@ def process_pending_apple_revocations(limit: int = 25) -> dict[str, int]:
                     (max(1, limit),),
                 )
                 rows = [dict(row) for row in cur.fetchall()]
+                summary["eligible"] = len(rows)
 
             for row in rows:
+                summary["attempted"] += 1
                 summary["processed"] += 1
                 try:
                     token = decrypt_apple_refresh_token(row["token_ciphertext"])
@@ -426,6 +440,7 @@ def process_pending_apple_revocations(limit: int = 25) -> dict[str, int]:
                         )
                     continue
                 except (AppleTokenEncryptionError, AppleTokenRevocationError):
+                    summary["terminal_failed"] += 1
                     with conn.cursor() as cur:
                         cur.execute(
                             """
@@ -447,14 +462,26 @@ def process_pending_apple_revocations(limit: int = 25) -> dict[str, int]:
                             (row["id"],),
                         )
                     summary["completed"] += 1
+                    summary["succeeded"] += 1
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM apple_token_revocations "
+                    "WHERE status = 'pending';"
+                )
+                summary["remaining_pending"] = int(cur.fetchone()[0])
     finally:
         conn.close()
 
     logger.info(
-        "apple pending revocations processed=%s completed=%s temporary_failed=%s expired=%s",
-        summary["processed"],
-        summary["completed"],
+        "apple pending revocations eligible=%s attempted=%s succeeded=%s "
+        "temporary_failed=%s terminal_failed=%s expired=%s remaining_pending=%s",
+        summary["eligible"],
+        summary["attempted"],
+        summary["succeeded"],
         summary["temporary_failed"],
+        summary["terminal_failed"],
         summary["expired"],
+        summary["remaining_pending"],
     )
     return summary
