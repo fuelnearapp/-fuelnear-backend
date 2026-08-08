@@ -429,7 +429,7 @@ class FuelNearE2ETestCase(unittest.TestCase):
                 )
         main.upsert_current_user_device_token(
             main.DeviceTokenRequest(
-                device_token="apns-e2e-device-token",
+                device_token="ab" * 32,
                 platform="ios",
                 environment="sandbox",
                 app_version="1.0",

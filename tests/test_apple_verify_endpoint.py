@@ -28,6 +28,15 @@ from app.apple_subscriptions import (
 class AppleSubscriptionVerifyEndpointTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(main.app)
+        main.app.dependency_overrides[main.rate_limit_apple_subscription_ip] = lambda: None
+        self.addCleanup(
+            main.app.dependency_overrides.pop,
+            main.rate_limit_apple_subscription_ip,
+            None,
+        )
+        rate_limit_patcher = patch.object(main, "enforce_owner_rate_limit")
+        rate_limit_patcher.start()
+        self.addCleanup(rate_limit_patcher.stop)
         self.app_account_token = uuid4()
         self.now = datetime.now(timezone.utc)
         self.verified = VerifiedAppleTransaction(

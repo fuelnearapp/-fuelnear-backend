@@ -22,7 +22,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depe
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app import (
     apple_auth_service,
@@ -76,6 +76,14 @@ PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR = max(
     float(os.getenv("PRICE_NOTIFICATION_MIN_IMPROVEMENT_EUR", "0.01")),
 )
 APNS_MAX_CONCURRENCY = max(1, int(os.getenv("APNS_MAX_CONCURRENCY", "5")))
+PUSH_PROCESSING_STALE_SECONDS = max(
+    60,
+    int(os.getenv("PUSH_PROCESSING_STALE_SECONDS", "900")),
+)
+PUSH_NOTIFICATION_MAX_ATTEMPTS = max(
+    1,
+    int(os.getenv("PUSH_NOTIFICATION_MAX_ATTEMPTS", "3")),
+)
 USER_LOCATION_MAX_AGE_HOURS = max(1, int(os.getenv("USER_LOCATION_MAX_AGE_HOURS", str(7 * 24))))
 USER_LOCATION_RETENTION_DAYS = max(1, int(os.getenv("USER_LOCATION_RETENTION_DAYS", "30")))
 ENABLE_ADMIN_DEBUG_ENDPOINTS = env_flag("ENABLE_ADMIN_DEBUG_ENDPOINTS", False)
@@ -99,6 +107,56 @@ AUTH_GUEST_RATE_WINDOW_SECONDS = max(
     1,
     int(os.getenv("AUTH_GUEST_RATE_WINDOW_SECONDS", str(60 * 60))),
 )
+SOCIAL_AUTH_RATE_LIMIT = max(1, int(os.getenv("SOCIAL_AUTH_RATE_LIMIT", "20")))
+SOCIAL_AUTH_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("SOCIAL_AUTH_RATE_WINDOW_SECONDS", str(10 * 60))),
+)
+APPLE_SUBSCRIPTION_VERIFY_RATE_LIMIT = max(
+    1,
+    int(os.getenv("APPLE_SUBSCRIPTION_VERIFY_RATE_LIMIT", "30")),
+)
+APPLE_SUBSCRIPTION_VERIFY_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("APPLE_SUBSCRIPTION_VERIFY_RATE_WINDOW_SECONDS", str(15 * 60))),
+)
+APPLE_SUBSCRIPTION_IP_RATE_LIMIT = max(
+    1,
+    int(os.getenv("APPLE_SUBSCRIPTION_IP_RATE_LIMIT", "120")),
+)
+APPLE_SUBSCRIPTION_IP_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("APPLE_SUBSCRIPTION_IP_RATE_WINDOW_SECONDS", str(60 * 60))),
+)
+APPLE_GUEST_CLAIM_RATE_LIMIT = max(
+    1,
+    int(os.getenv("APPLE_GUEST_CLAIM_RATE_LIMIT", "20")),
+)
+APPLE_GUEST_CLAIM_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("APPLE_GUEST_CLAIM_RATE_WINDOW_SECONDS", str(60 * 60))),
+)
+STATION_SEARCH_RATE_LIMIT = max(1, int(os.getenv("STATION_SEARCH_RATE_LIMIT", "120")))
+STATION_SEARCH_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("STATION_SEARCH_RATE_WINDOW_SECONDS", "60")),
+)
+STATION_NEARBY_RATE_LIMIT = max(1, int(os.getenv("STATION_NEARBY_RATE_LIMIT", "240")))
+STATION_NEARBY_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("STATION_NEARBY_RATE_WINDOW_SECONDS", "60")),
+)
+COMMUNITY_PRICE_DAILY_RATE_LIMIT = max(
+    1,
+    int(os.getenv("COMMUNITY_PRICE_DAILY_RATE_LIMIT", "50")),
+)
+COMMUNITY_PRICE_STATION_RATE_LIMIT = max(
+    1,
+    int(os.getenv("COMMUNITY_PRICE_STATION_RATE_LIMIT", "12")),
+)
+DEVICE_TOKEN_RATE_LIMIT = max(1, int(os.getenv("DEVICE_TOKEN_RATE_LIMIT", "30")))
+USER_LOCATION_RATE_LIMIT = max(1, int(os.getenv("USER_LOCATION_RATE_LIMIT", "120")))
+REFERRAL_CODE_RATE_LIMIT = max(1, int(os.getenv("REFERRAL_CODE_RATE_LIMIT", "10")))
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
@@ -120,6 +178,19 @@ GOOGLE_CLIENT_IDS = [
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+
+MAX_EMAIL_LENGTH = 254
+MAX_DISPLAY_NAME_LENGTH = 100
+MAX_DEVICE_INFO_LENGTH = 512
+MAX_REFERRAL_CODE_INPUT_LENGTH = 32
+MAX_SOCIAL_ID_TOKEN_LENGTH = 16 * 1024
+MAX_AUTHORIZATION_CODE_LENGTH = 4 * 1024
+MAX_STOREKIT_JWS_LENGTH = 64 * 1024
+MAX_GUEST_ACCESS_TOKEN_LENGTH = 512
+MAX_APNS_DEVICE_TOKEN_LENGTH = 256
+MAX_APP_VERSION_LENGTH = 64
+MAX_FUEL_TYPE_LENGTH = 32
+MAX_STATION_SEARCH_LENGTH = 128
 
 app = FastAPI(title="FuelNear Backend")
 
@@ -228,8 +299,15 @@ if REDACTED_ACCESS_LOG_ENABLED:
 
 
 class APIError(HTTPException):
-    def __init__(self, status_code: int, error_code: str, message: str):
-        super().__init__(status_code=status_code, detail=message)
+    def __init__(
+        self,
+        status_code: int,
+        error_code: str,
+        message: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ):
+        super().__init__(status_code=status_code, detail=message, headers=headers)
         self.error_code = error_code
         self.message = message
 
@@ -374,61 +452,68 @@ MIMIT_ADVISORY_LOCK_ID = 618_493_027
 
 
 class RegisterRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr = Field(max_length=MAX_EMAIL_LENGTH)
     password: str
-    display_name: str | None = None
-    referral_code: str | None = None
-    device_info: str | None = None
+    display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
+    referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr = Field(max_length=MAX_EMAIL_LENGTH)
     password: str
-    device_info: str | None = None
+    device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
 
 class EmailVerificationRequest(BaseModel):
-    token: str | None = None
-    code: str | None = None
-    email: EmailStr | None = None
+    token: str | None = Field(default=None, max_length=512)
+    code: str | None = Field(default=None, max_length=6)
+    email: EmailStr | None = Field(default=None, max_length=MAX_EMAIL_LENGTH)
 
 
 class ResendEmailVerificationRequest(BaseModel):
-    email: EmailStr
+    email: EmailStr = Field(max_length=MAX_EMAIL_LENGTH)
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str = Field(min_length=1, max_length=MAX_GUEST_ACCESS_TOKEN_LENGTH)
 
 
 class AppleAuthRequest(BaseModel):
-    identity_token: str | None = None
-    identityToken: str | None = None
-    authorization_code: str | None = None
-    authorizationCode: str | None = None
-    email: str | None = None
+    identity_token: str | None = Field(default=None, max_length=MAX_SOCIAL_ID_TOKEN_LENGTH)
+    identityToken: str | None = Field(default=None, max_length=MAX_SOCIAL_ID_TOKEN_LENGTH)
+    authorization_code: str | None = Field(default=None, max_length=MAX_AUTHORIZATION_CODE_LENGTH)
+    authorizationCode: str | None = Field(default=None, max_length=MAX_AUTHORIZATION_CODE_LENGTH)
+    email: str | None = Field(default=None, max_length=MAX_EMAIL_LENGTH)
     full_name: Any | None = None
     fullName: Any | None = None
-    display_name: str | None = None
-    nonce: str | None = None
-    raw_nonce: str | None = None
-    rawNonce: str | None = None
-    hashed_nonce: str | None = None
-    hashedNonce: str | None = None
-    referral_code: str | None = None
-    device_info: str | None = None
+    display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
+    nonce: str | None = Field(default=None, max_length=512)
+    raw_nonce: str | None = Field(default=None, max_length=512)
+    rawNonce: str | None = Field(default=None, max_length=512)
+    hashed_nonce: str | None = Field(default=None, max_length=128)
+    hashedNonce: str | None = Field(default=None, max_length=128)
+    referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
+
+    @field_validator("full_name", "fullName")
+    @classmethod
+    def validate_full_name_size(cls, value: Any) -> Any:
+        if value is not None and len(str(value)) > 1024:
+            raise ValueError("full name payload is too large")
+        return value
 
 
 class GoogleAuthRequest(BaseModel):
-    id_token: str
-    display_name: str | None = None
-    referral_code: str | None = None
-    device_info: str | None = None
+    id_token: str = Field(min_length=1, max_length=MAX_SOCIAL_ID_TOKEN_LENGTH)
+    display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
+    referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
 
 class AppleSubscriptionVerifyRequest(BaseModel):
-    signed_transaction: str
+    signed_transaction: str = Field(max_length=MAX_STOREKIT_JWS_LENGTH)
 
     @field_validator("signed_transaction")
     @classmethod
@@ -465,7 +550,7 @@ class GuestSubscriptionResponse(BaseModel):
 
 
 class GuestClaimRequest(BaseModel):
-    guest_access_token: str
+    guest_access_token: str = Field(max_length=MAX_GUEST_ACCESS_TOKEN_LENGTH)
 
     @field_validator("guest_access_token")
     @classmethod
@@ -488,7 +573,7 @@ class GuestClaimResponse(BaseModel):
 class AppleNotificationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    signedPayload: str
+    signedPayload: str = Field(max_length=APPLE_NOTIFICATION_MAX_BODY_BYTES)
 
 
 class AppleNotificationResponse(BaseModel):
@@ -496,26 +581,39 @@ class AppleNotificationResponse(BaseModel):
 
 
 class ApplyReferralCodeRequest(BaseModel):
-    referral_code: str | None = None
+    referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
 
 
 class DeviceTokenRequest(BaseModel):
-    device_token: str
-    platform: str
-    environment: str | None = None
-    app_version: str | None = None
-    device_info: str | None = None
+    device_token: str = Field(min_length=32, max_length=MAX_APNS_DEVICE_TOKEN_LENGTH)
+    platform: str = Field(min_length=1, max_length=16)
+    environment: str | None = Field(default=None, max_length=16)
+    app_version: str | None = Field(default=None, max_length=MAX_APP_VERSION_LENGTH)
+    device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
+
+    @field_validator("device_token")
+    @classmethod
+    def validate_device_token_format(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) % 2 != 0 or not re.fullmatch(r"[0-9a-fA-F]+", normalized):
+            raise ValueError("device_token must be an even-length hexadecimal string")
+        return normalized.lower()
 
 
 class DeleteDeviceTokenRequest(BaseModel):
-    device_token: str
+    device_token: str = Field(min_length=32, max_length=MAX_APNS_DEVICE_TOKEN_LENGTH)
+
+    @field_validator("device_token")
+    @classmethod
+    def validate_device_token_format(cls, value: str) -> str:
+        return DeviceTokenRequest.validate_device_token_format(value)
 
 
 class UserLocationRequest(BaseModel):
-    lat: float
-    lng: float
-    accuracy: float | None = None
-    source: str | None = None
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    accuracy: float | None = Field(default=None, gt=0)
+    source: str | None = Field(default=None, max_length=100)
 
 
 class NotificationPreferencesRequest(BaseModel):
@@ -536,7 +634,7 @@ class AdminTestPushRequest(BaseModel):
 
 
 class CommunityPriceReportRequest(BaseModel):
-    fuel_type: str
+    fuel_type: str = Field(min_length=1, max_length=MAX_FUEL_TYPE_LENGTH)
     price: float
     is_self_service: bool
 
@@ -649,6 +747,63 @@ def cleanup_expired_user_locations(conn) -> int:
 
     user_location_log(f"stale_locations_cleaned_count={cleaned_count}")
     return cleaned_count
+
+
+def cleanup_expired_legacy_notification_locations(
+    conn,
+    *,
+    user_id: int | None = None,
+) -> int:
+    ensure_price_notification_preferences_schema(conn)
+    user_filter = "AND user_id = %s" if user_id is not None else ""
+    params: tuple[Any, ...] = (
+        (USER_LOCATION_RETENTION_DAYS, user_id)
+        if user_id is not None
+        else (USER_LOCATION_RETENTION_DAYS,)
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE price_notification_preferences
+            SET latitude = NULL,
+                longitude = NULL,
+                location_updated_at = NULL
+            WHERE (latitude IS NOT NULL OR longitude IS NOT NULL OR location_updated_at IS NOT NULL)
+              AND (
+                  location_updated_at IS NULL
+                  OR location_updated_at < NOW() - (%s * INTERVAL '1 day')
+              )
+              {user_filter};
+            """,
+            params,
+        )
+        cleaned_count = cur.rowcount or 0
+
+    user_location_log(
+        "stale_legacy_locations_cleaned_count="
+        f"{cleaned_count} scoped_to_user={str(user_id is not None).lower()}"
+    )
+    return cleaned_count
+
+
+def clear_legacy_notification_location(conn, user_id: int) -> int:
+    ensure_price_notification_preferences_schema(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE price_notification_preferences
+            SET latitude = NULL,
+                longitude = NULL,
+                location_updated_at = NULL
+            WHERE user_id = %s
+              AND (latitude IS NOT NULL OR longitude IS NOT NULL OR location_updated_at IS NOT NULL);
+            """,
+            (user_id,),
+        )
+        cleared_count = cur.rowcount or 0
+
+    user_location_log(f"legacy_location_cleared={str(cleared_count > 0).lower()}")
+    return cleared_count
 
 
 def auth_rate_limit_log(message: str) -> None:
@@ -778,9 +933,93 @@ def check_auth_rate_limit(
                 429,
                 "RATE_LIMITED",
                 "Troppi tentativi. Riprova più tardi.",
+                headers={"Retry-After": str(window_seconds)},
             )
     finally:
         conn.close()
+
+
+def enforce_ip_rate_limit(
+    request: Request,
+    *,
+    endpoint: str,
+    discriminator: str,
+    limit: int,
+    window_seconds: int,
+) -> None:
+    check_auth_rate_limit(
+        endpoint,
+        build_rate_limit_bucket(discriminator, get_request_ip(request)),
+        limit=limit,
+        window_seconds=window_seconds,
+    )
+
+
+def rate_limit_google_auth(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint="/auth/google",
+        discriminator="google",
+        limit=SOCIAL_AUTH_RATE_LIMIT,
+        window_seconds=SOCIAL_AUTH_RATE_WINDOW_SECONDS,
+    )
+
+
+def rate_limit_apple_auth(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint="/auth/apple",
+        discriminator="apple",
+        limit=SOCIAL_AUTH_RATE_LIMIT,
+        window_seconds=SOCIAL_AUTH_RATE_WINDOW_SECONDS,
+    )
+
+
+def rate_limit_station_search(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint="/stations/search",
+        discriminator="search",
+        limit=STATION_SEARCH_RATE_LIMIT,
+        window_seconds=STATION_SEARCH_RATE_WINDOW_SECONDS,
+    )
+
+
+def rate_limit_station_nearby(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint=request.url.path,
+        discriminator="stations",
+        limit=STATION_NEARBY_RATE_LIMIT,
+        window_seconds=STATION_NEARBY_RATE_WINDOW_SECONDS,
+    )
+
+
+def rate_limit_apple_subscription_ip(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint=request.url.path,
+        discriminator="apple-subscription",
+        limit=APPLE_SUBSCRIPTION_IP_RATE_LIMIT,
+        window_seconds=APPLE_SUBSCRIPTION_IP_RATE_WINDOW_SECONDS,
+    )
+
+
+def enforce_owner_rate_limit(
+    endpoint: str,
+    owner_type: str,
+    owner_id: int,
+    *,
+    limit: int,
+    window_seconds: int,
+    discriminator: str | None = None,
+) -> None:
+    check_auth_rate_limit(
+        endpoint,
+        build_rate_limit_bucket(owner_type, str(owner_id), discriminator),
+        limit=limit,
+        window_seconds=window_seconds,
+    )
 
 
 def normalize_device_token(value: str | None) -> str:
@@ -2766,6 +3005,7 @@ def ensure_sent_price_notifications_schema(conn) -> None:
                 price DOUBLE PRECISION NULL CHECK (price > 0),
                 distance_km DOUBLE PRECISION NULL CHECK (distance_km >= 0),
                 send_attempts INTEGER NOT NULL DEFAULT 0,
+                processing_attempts INTEGER NOT NULL DEFAULT 0,
                 last_error_temporary BOOLEAN NULL,
                 last_status_code INTEGER NULL,
                 last_reason TEXT NULL,
@@ -2782,14 +3022,29 @@ def ensure_sent_price_notifications_schema(conn) -> None:
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS distance_km DOUBLE PRECISION NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS send_attempts INTEGER NOT NULL DEFAULT 0;")
+        cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS processing_attempts INTEGER NOT NULL DEFAULT 0;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_error_temporary BOOLEAN NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_status_code INTEGER NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS last_reason TEXT NULL;")
         cur.execute("ALTER TABLE sent_price_notifications ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ NULL;")
         cur.execute(
             """
+            UPDATE sent_price_notifications
+            SET processing_attempts = 1
+            WHERE status = 'processing'
+              AND processing_attempts = 0;
+            """
+        )
+        cur.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_sent_price_notifications_run_status
             ON sent_price_notifications(mimit_run_id, status);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sent_price_notifications_stale_processing
+            ON sent_price_notifications(mimit_run_id, status, processing_started_at);
             """
         )
 
@@ -3395,6 +3650,227 @@ def send_price_notification_to_devices(
     return results
 
 
+def recover_stale_price_notifications(
+    conn: Any,
+    mimit_run_id: int,
+    *,
+    reference_date: datetime | None = None,
+    stale_seconds: int | None = None,
+    max_attempts: int | None = None,
+) -> dict[str, Any]:
+    now = reference_date or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    selected_stale_seconds = max(
+        60,
+        stale_seconds if stale_seconds is not None else PUSH_PROCESSING_STALE_SECONDS,
+    )
+    selected_max_attempts = max(
+        1,
+        max_attempts if max_attempts is not None else PUSH_NOTIFICATION_MAX_ATTEMPTS,
+    )
+    cutoff = now - timedelta(seconds=selected_stale_seconds)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            WITH stale AS (
+                SELECT id, processing_attempts
+                FROM sent_price_notifications
+                WHERE mimit_run_id = %s
+                  AND status = 'processing'
+                  AND COALESCE(processing_started_at, updated_at) < %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE sent_price_notifications AS notification
+            SET status = 'failed',
+                processing_attempts = CASE
+                    WHEN stale.processing_attempts < %s
+                    THEN stale.processing_attempts + 1
+                    ELSE stale.processing_attempts
+                END,
+                last_error_temporary = stale.processing_attempts < %s,
+                last_status_code = NULL,
+                last_reason = CASE
+                    WHEN stale.processing_attempts < %s
+                    THEN 'StaleProcessingRecovered'
+                    ELSE 'ProcessingAttemptsExceeded'
+                END,
+                processing_started_at = NULL,
+                updated_at = %s
+            FROM stale
+            WHERE notification.id = stale.id
+            RETURNING notification.last_error_temporary;
+            """,
+            (
+                mimit_run_id,
+                cutoff,
+                selected_max_attempts,
+                selected_max_attempts,
+                selected_max_attempts,
+                now,
+            ),
+        )
+        recovered_rows = [dict(row) for row in cur.fetchall()]
+
+    recovered_count = sum(
+        1 for row in recovered_rows if row["last_error_temporary"] is True
+    )
+    terminal_count = len(recovered_rows) - recovered_count
+    summary = {
+        "stale_processing_found_count": len(recovered_rows),
+        "stale_processing_recovered_count": recovered_count,
+        "stale_processing_terminal_count": terminal_count,
+        "cutoff": cutoff,
+    }
+    print(
+        "[PRICE_NOTIFICATIONS] "
+        f"stale_processing_found={len(recovered_rows)} "
+        f"stale_recovered={recovered_count} stale_terminal={terminal_count} "
+        f"cutoff={cutoff.isoformat()} retry_scheduled={str(recovered_count > 0).lower()}"
+    )
+    return summary
+
+
+def claim_price_notification_record(
+    conn: Any,
+    *,
+    user_id: int,
+    mimit_run_id: int,
+    fuel_type: str,
+    station_id: int,
+    price: float,
+    distance_km: float,
+    max_attempts: int | None = None,
+) -> int | None:
+    selected_max_attempts = max(
+        1,
+        max_attempts if max_attempts is not None else PUSH_NOTIFICATION_MAX_ATTEMPTS,
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO sent_price_notifications (
+                user_id,
+                mimit_run_id,
+                fuel_type,
+                station_id,
+                price,
+                distance_km,
+                status,
+                processing_started_at,
+                processing_attempts,
+                last_error_temporary,
+                last_status_code,
+                last_reason,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, 'processing', NOW(), 1, NULL, NULL, NULL, NOW(), NOW())
+            ON CONFLICT (user_id, mimit_run_id) DO UPDATE SET
+                fuel_type = EXCLUDED.fuel_type,
+                station_id = EXCLUDED.station_id,
+                price = EXCLUDED.price,
+                distance_km = EXCLUDED.distance_km,
+                status = 'processing',
+                processing_started_at = NOW(),
+                processing_attempts = CASE
+                    WHEN sent_price_notifications.last_reason = 'StaleProcessingRecovered'
+                    THEN sent_price_notifications.processing_attempts
+                    ELSE sent_price_notifications.processing_attempts + 1
+                END,
+                last_error_temporary = NULL,
+                last_status_code = NULL,
+                last_reason = NULL,
+                updated_at = NOW()
+            WHERE sent_price_notifications.status = 'failed'
+              AND sent_price_notifications.last_error_temporary IS TRUE
+              AND sent_price_notifications.processing_attempts <= %s
+            RETURNING sent_price_notifications.id;
+            """,
+            (
+                user_id,
+                mimit_run_id,
+                fuel_type,
+                station_id,
+                price,
+                distance_km,
+                selected_max_attempts,
+            ),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row is not None else None
+
+
+def deactivate_invalid_device_token(conn: Any, token_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE user_device_tokens
+            SET is_active = FALSE,
+                updated_at = NOW()
+            WHERE id = %s;
+            """,
+            (token_id,),
+        )
+
+
+def finalize_price_notification_record(
+    conn: Any,
+    *,
+    notification_id: int,
+    final_status: str,
+    send_attempts: int,
+    temporary_failure: bool,
+    last_status_code: int | None,
+    last_reason: str | None,
+    max_attempts: int | None = None,
+) -> None:
+    selected_max_attempts = max(
+        1,
+        max_attempts if max_attempts is not None else PUSH_NOTIFICATION_MAX_ATTEMPTS,
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sent_price_notifications
+            SET status = %s,
+                sent_at = CASE WHEN %s::text = 'sent' THEN NOW() ELSE NULL END,
+                send_attempts = send_attempts + %s,
+                last_error_temporary = CASE
+                    WHEN %s::text = 'sent' THEN NULL
+                    WHEN processing_attempts >= %s THEN FALSE
+                    ELSE %s::boolean
+                END,
+                last_status_code = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::integer END,
+                last_reason = CASE
+                    WHEN %s::text = 'sent' THEN NULL
+                    WHEN %s::boolean AND processing_attempts >= %s
+                    THEN 'ProcessingAttemptsExceeded'
+                    ELSE %s::text
+                END,
+                processing_started_at = NULL,
+                updated_at = NOW()
+            WHERE id = %s;
+            """,
+            (
+                final_status,
+                final_status,
+                send_attempts,
+                final_status,
+                selected_max_attempts,
+                temporary_failure,
+                final_status,
+                last_status_code,
+                final_status,
+                temporary_failure,
+                selected_max_attempts,
+                last_reason,
+                notification_id,
+            ),
+        )
+
+
 def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "mimit_run_id": mimit_run_id,
@@ -3411,6 +3887,10 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
         "client_reused": False,
         "jwt_reused": False,
         "stale_locations_cleaned_count": 0,
+        "stale_legacy_locations_cleaned_count": 0,
+        "stale_processing_found_count": 0,
+        "stale_processing_recovered_count": 0,
+        "stale_processing_terminal_count": 0,
         "skipped_same_price": 0,
         "skipped_worse_price": 0,
         "skipped_below_threshold": 0,
@@ -3439,6 +3919,9 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
             ensure_price_notification_preferences_schema(conn)
             ensure_sent_price_notifications_schema(conn)
             summary["stale_locations_cleaned_count"] = cleanup_expired_user_locations(conn)
+            summary["stale_legacy_locations_cleaned_count"] = (
+                cleanup_expired_legacy_notification_locations(conn)
+            )
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -3452,6 +3935,21 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                 )
                 if cur.fetchone() is None:
                     raise ValueError("MIMIT run is not successful")
+
+                recovery_summary = recover_stale_price_notifications(
+                    conn,
+                    mimit_run_id,
+                )
+                summary.update(
+                    {
+                        key: recovery_summary[key]
+                        for key in (
+                            "stale_processing_found_count",
+                            "stale_processing_recovered_count",
+                            "stale_processing_terminal_count",
+                        )
+                    }
+                )
 
                 cur.execute(
                     """
@@ -3557,52 +4055,17 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                     continue
 
             with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO sent_price_notifications (
-                            user_id,
-                            mimit_run_id,
-                            fuel_type,
-                            station_id,
-                            price,
-                            distance_km,
-                            status,
-                            processing_started_at,
-                            last_error_temporary,
-                            last_status_code,
-                            last_reason,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, 'processing', NOW(), NULL, NULL, NULL, NOW(), NOW())
-                        ON CONFLICT (user_id, mimit_run_id) DO UPDATE SET
-                            fuel_type = EXCLUDED.fuel_type,
-                            station_id = EXCLUDED.station_id,
-                            price = EXCLUDED.price,
-                            distance_km = EXCLUDED.distance_km,
-                            status = 'processing',
-                            processing_started_at = NOW(),
-                            last_error_temporary = NULL,
-                            last_status_code = NULL,
-                            last_reason = NULL,
-                            updated_at = NOW()
-                        WHERE sent_price_notifications.status = 'failed'
-                          AND sent_price_notifications.last_error_temporary IS TRUE
-                        RETURNING sent_price_notifications.id;
-                        """,
-                        (
-                            user_id,
-                            mimit_run_id,
-                            fuel_type,
-                            best_price["station_id"],
-                            current_price,
-                            distance_km,
-                        ),
-                    )
-                    notification_row = cur.fetchone()
+                notification_id = claim_price_notification_record(
+                    conn,
+                    user_id=user_id,
+                    mimit_run_id=mimit_run_id,
+                    fuel_type=fuel_type,
+                    station_id=int(best_price["station_id"]),
+                    price=current_price,
+                    distance_km=distance_km,
+                )
 
-            if notification_row is None:
+            if notification_id is None:
                 skip("skipped_duplicate_run")
                 continue
 
@@ -3658,16 +4121,7 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
                     token_id = send_result.get("token_id")
                     if token_id is not None:
                         with conn:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    UPDATE user_device_tokens
-                                    SET is_active = FALSE,
-                                        updated_at = NOW()
-                                    WHERE id = %s;
-                                    """,
-                                    (token_id,),
-                                )
+                            deactivate_invalid_device_token(conn, int(token_id))
 
                 if not result["success"]:
                     if result["temporary_error"]:
@@ -3687,32 +4141,15 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
 
             final_status = "sent" if any_sent else "failed"
             with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE sent_price_notifications
-                        SET status = %s,
-                            sent_at = CASE WHEN %s::text = 'sent' THEN NOW() ELSE NULL END,
-                            send_attempts = send_attempts + %s,
-                            last_error_temporary = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::boolean END,
-                            last_status_code = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::integer END,
-                            last_reason = CASE WHEN %s::text = 'sent' THEN NULL ELSE %s::text END,
-                            updated_at = NOW()
-                        WHERE id = %s;
-                        """,
-                        (
-                            final_status,
-                            final_status,
-                            send_attempts,
-                            final_status,
-                            any_temporary_failed,
-                            final_status,
-                            last_status_code,
-                            final_status,
-                            last_reason,
-                            notification_row[0],
-                        ),
-                    )
+                finalize_price_notification_record(
+                    conn,
+                    notification_id=notification_id,
+                    final_status=final_status,
+                    send_attempts=send_attempts,
+                    temporary_failure=any_temporary_failed,
+                    last_status_code=last_status_code,
+                    last_reason=last_reason,
+                )
 
             if any_sent:
                 summary["sent_count"] += 1
@@ -5067,7 +5504,7 @@ def login_user(payload: LoginRequest, request: Request) -> dict[str, Any]:
             conn.close()
 
 
-@app.post("/auth/apple")
+@app.post("/auth/apple", dependencies=[Depends(rate_limit_apple_auth)])
 def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     identity_token = payload.identityToken or payload.identity_token
     authorization_code = (
@@ -5153,7 +5590,7 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
     )
 
 
-@app.post("/auth/google")
+@app.post("/auth/google", dependencies=[Depends(rate_limit_google_auth)])
 def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
     auth_debug_log("endpoint reached")
     auth_debug_log(f"config present={bool(GOOGLE_CLIENT_IDS)}")
@@ -5249,6 +5686,13 @@ def upsert_current_user_device_token(
 
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
+    enforce_owner_rate_limit(
+        "/user/device-token",
+        "user",
+        int(user_id),
+        limit=DEVICE_TOKEN_RATE_LIMIT,
+        window_seconds=60 * 60,
+    )
 
     conn = get_connection()
     try:
@@ -5388,6 +5832,13 @@ def upsert_current_user_location(
     user_location_log("location update endpoint reached")
     user_payload = get_current_user_from_token(authorization)
     user_id = int(user_payload["id"])
+    enforce_owner_rate_limit(
+        "/user/location",
+        "user",
+        user_id,
+        limit=USER_LOCATION_RATE_LIMIT,
+        window_seconds=60 * 60,
+    )
     user_location_log(f"user_id={user_id} location_present=true location_stale=false")
 
     if not isfinite(payload.lat) or not -90 <= payload.lat <= 90:
@@ -5438,6 +5889,8 @@ def upsert_current_user_location(
                     ),
                 )
                 location = cur.fetchone()
+
+            clear_legacy_notification_location(conn, user_id)
 
         return {
             "status": "ok",
@@ -5530,11 +5983,14 @@ def delete_current_user_location(
                     (user_id,),
                 )
                 deleted = (cur.rowcount or 0) > 0
+            legacy_deleted = clear_legacy_notification_location(conn, user_id) > 0
 
-        user_location_log(f"location_deleted={str(deleted).lower()} user_id={user_id}")
+        user_location_log(
+            f"location_deleted={str(deleted or legacy_deleted).lower()} user_id={user_id}"
+        )
         return {
             "status": "ok",
-            "location_deleted": deleted,
+            "location_deleted": deleted or legacy_deleted,
             "has_location": False,
         }
     except Exception as exc:
@@ -5556,6 +6012,7 @@ def get_current_user_notification_preferences(
     try:
         with conn:
             ensure_price_notification_preferences_schema(conn)
+            cleanup_expired_legacy_notification_locations(conn, user_id=int(user_id))
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -5664,6 +6121,7 @@ def update_current_user_notification_preferences(
     try:
         with conn:
             ensure_price_notification_preferences_schema(conn)
+            cleanup_expired_legacy_notification_locations(conn, user_id=int(user_id))
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -5766,6 +6224,13 @@ def apply_current_user_referral_code(
 
     user_payload = get_current_user_from_token(authorization)
     user_id = user_payload["id"]
+    enforce_owner_rate_limit(
+        "/user/referral-code",
+        "user",
+        int(user_id),
+        limit=REFERRAL_CODE_RATE_LIMIT,
+        window_seconds=60 * 60,
+    )
 
     conn = None
     try:
@@ -6145,6 +6610,7 @@ def _verify_and_process_apple_subscription(
 @app.post(
     "/user/subscription/apple/verify",
     response_model=AppleSubscriptionVerifyResponse,
+    dependencies=[Depends(rate_limit_apple_subscription_ip)],
 )
 def verify_current_user_apple_subscription(
     payload: AppleSubscriptionVerifyRequest,
@@ -6152,6 +6618,13 @@ def verify_current_user_apple_subscription(
 ) -> AppleSubscriptionVerifyResponse:
     user_payload = get_current_user_from_token(authorization)
     user_id = int(user_payload["id"])
+    enforce_owner_rate_limit(
+        "/user/subscription/apple/verify",
+        "user",
+        user_id,
+        limit=APPLE_SUBSCRIPTION_VERIFY_RATE_LIMIT,
+        window_seconds=APPLE_SUBSCRIPTION_VERIFY_RATE_WINDOW_SECONDS,
+    )
     expected_tokens = guest_subscriptions.get_allowed_app_account_tokens_for_user(user_id)
     return _verify_and_process_apple_subscription(
         payload,
@@ -6163,16 +6636,25 @@ def verify_current_user_apple_subscription(
 @app.post(
     "/guest/subscription/apple/verify",
     response_model=AppleSubscriptionVerifyResponse,
+    dependencies=[Depends(rate_limit_apple_subscription_ip)],
 )
 def verify_guest_apple_subscription(
     payload: AppleSubscriptionVerifyRequest,
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> AppleSubscriptionVerifyResponse:
     guest = get_guest_from_token(authorization)
+    guest_id = int(guest["guest_id"])
+    enforce_owner_rate_limit(
+        "/guest/subscription/apple/verify",
+        "guest",
+        guest_id,
+        limit=APPLE_SUBSCRIPTION_VERIFY_RATE_LIMIT,
+        window_seconds=APPLE_SUBSCRIPTION_VERIFY_RATE_WINDOW_SECONDS,
+    )
     return _verify_and_process_apple_subscription(
         payload,
         expected_app_account_tokens=[guest["app_account_token"]],
-        guest_id=int(guest["guest_id"]),
+        guest_id=guest_id,
     )
 
 
@@ -6190,15 +6672,27 @@ def get_guest_subscription(
     )
 
 
-@app.post("/user/subscription/claim-guest", response_model=GuestClaimResponse)
+@app.post(
+    "/user/subscription/claim-guest",
+    response_model=GuestClaimResponse,
+    dependencies=[Depends(rate_limit_apple_subscription_ip)],
+)
 def claim_guest_subscription_for_current_user(
     payload: GuestClaimRequest,
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> GuestClaimResponse:
     user = get_current_user_from_token(authorization)
+    user_id = int(user["id"])
+    enforce_owner_rate_limit(
+        "/user/subscription/claim-guest",
+        "user",
+        user_id,
+        limit=APPLE_GUEST_CLAIM_RATE_LIMIT,
+        window_seconds=APPLE_GUEST_CLAIM_RATE_WINDOW_SECONDS,
+    )
     try:
         result = guest_subscriptions.claim_guest_subscription(
-            int(user["id"]),
+            user_id,
             payload.guest_access_token,
         )
         print(
@@ -6412,16 +6906,24 @@ def list_stations(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any
         raise safe_internal_http_error("stations_list", exc, "Stations request failed")
 
 
-@app.get("/stations/search")
+@app.get("/stations/search", dependencies=[Depends(rate_limit_station_search)])
 def search_stations(
-    q: str = Query(..., min_length=2, description="Search query for station name, address, city, province, brand, or operator"),
+    q: str = Query(
+        ...,
+        min_length=2,
+        max_length=MAX_STATION_SEARCH_LENGTH,
+        description="Search query for station name, address, city, province, brand, or operator",
+    ),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     try:
+        normalized_query = q.strip()
+        if len(normalized_query) < 2:
+            raise HTTPException(status_code=400, detail="Search query is too short")
         conn = get_connection()
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                search_query = f"%{q.lower()}%"
+                search_query = f"%{normalized_query.lower()}%"
                 cur.execute(
                     """
                     SELECT
@@ -6461,21 +6963,31 @@ def search_stations(
             "count": len(stations),
             "items": [dict(row) for row in stations],
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise safe_internal_http_error("stations_search", exc, "Station search failed")
 
 
 # Nearby stations endpoint
-@app.get("/stations/nearby")
+@app.get("/stations/nearby", dependencies=[Depends(rate_limit_station_nearby)])
 def get_nearby_stations(
-    lat: float = Query(..., description="User latitude"),
-    lng: float = Query(..., description="User longitude"),
-    fuel_type: str = Query(..., description="Fuel type, for example benzina or diesel"),
+    lat: float = Query(..., ge=-90, le=90, description="User latitude"),
+    lng: float = Query(..., ge=-180, le=180, description="User longitude"),
+    fuel_type: str = Query(
+        ...,
+        min_length=1,
+        max_length=MAX_FUEL_TYPE_LENGTH,
+        description="Fuel type, for example benzina or diesel",
+    ),
     is_self_service: bool | None = Query(default=None, description="Filter by self service: true, false, or omit for both"),
     radius_km: float = Query(default=5.0, gt=0, le=100),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     try:
+        normalized_fuel_type = normalize_notification_fuel_type(fuel_type)
+        if normalized_fuel_type is None:
+            raise HTTPException(status_code=400, detail="Unsupported fuel type")
         lat_delta = radius_km / 111.32
         lng_divisor = 111.32 * max(cos(radians(lat)), 0.01)
         lng_delta = radius_km / lng_divisor
@@ -6566,7 +7078,7 @@ def get_nearby_stations(
                         lng - lng_delta,
                         lng + lng_delta,
                         radius_km,
-                        fuel_type.strip().lower(),
+                        normalized_fuel_type,
                         is_self_service,
                         is_self_service,
                         limit,
@@ -6578,6 +7090,8 @@ def get_nearby_stations(
             "count": len(stations),
             "items": serialize_datetime_fields([dict(row) for row in stations], ["reported_at", "last_reported_at"]),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise safe_internal_http_error("stations_nearby", exc, "Nearby stations request failed")
 
@@ -6648,8 +7162,23 @@ def submit_station_community_price(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> dict[str, Any]:
     user_payload = get_current_user_from_token(authorization)
-    user_id = user_payload["id"]
+    user_id = int(user_payload["id"])
+    enforce_owner_rate_limit(
+        "/stations/community-prices/daily",
+        "user",
+        user_id,
+        limit=COMMUNITY_PRICE_DAILY_RATE_LIMIT,
+        window_seconds=24 * 60 * 60,
+    )
     fuel_type, price = validate_community_price_report(payload)
+    enforce_owner_rate_limit(
+        "/stations/community-prices/station",
+        "user",
+        user_id,
+        discriminator=f"{station_id}:{fuel_type}:{int(payload.is_self_service)}",
+        limit=COMMUNITY_PRICE_STATION_RATE_LIMIT,
+        window_seconds=60 * 60,
+    )
     reported_at = datetime.now(timezone.utc)
 
     conn = get_connection()
@@ -6717,11 +7246,16 @@ def submit_station_community_price(
 
 
 # Best station endpoint
-@app.get("/stations/best")
+@app.get("/stations/best", dependencies=[Depends(rate_limit_station_nearby)])
 def get_best_station(
-    lat: float = Query(..., description="User latitude"),
-    lng: float = Query(..., description="User longitude"),
-    fuel_type: str = Query(..., description="Fuel type, for example benzina or diesel"),
+    lat: float = Query(..., ge=-90, le=90, description="User latitude"),
+    lng: float = Query(..., ge=-180, le=180, description="User longitude"),
+    fuel_type: str = Query(
+        ...,
+        min_length=1,
+        max_length=MAX_FUEL_TYPE_LENGTH,
+        description="Fuel type, for example benzina or diesel",
+    ),
     is_self_service: bool | None = Query(default=None, description="Filter by self service: true, false, or omit for both"),
     radius_km: float = Query(default=5.0, gt=0, le=100),
 ) -> dict[str, Any]:
