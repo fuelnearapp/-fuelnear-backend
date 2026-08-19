@@ -346,6 +346,58 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                 )
                 return int(cur.fetchone()[0])
 
+    def referral_usable_seconds(self, user_id: int, reference: datetime) -> float:
+        entitlement = self.get_entitlement(user_id)
+        if entitlement is None or entitlement["referral_expires_at"] is None:
+            return 0.0
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT purchase_date, expires_date, revocation_date
+                    FROM apple_transactions
+                    WHERE user_id = %s
+                      AND expires_date IS NOT NULL
+                    ORDER BY purchase_date, expires_date;
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+
+        intervals: list[tuple[datetime, datetime]] = []
+        for purchase_date, expires_date, revocation_date in rows:
+            interval_end = min(expires_date, revocation_date) if revocation_date else expires_date
+            interval_start = max(reference, purchase_date)
+            interval_end = min(entitlement["referral_expires_at"], interval_end)
+            if interval_end > interval_start:
+                intervals.append((interval_start, interval_end))
+
+        intervals.sort()
+        merged: list[tuple[datetime, datetime]] = []
+        for interval_start, interval_end in intervals:
+            if not merged or interval_start > merged[-1][1]:
+                merged.append((interval_start, interval_end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+
+        projected_seconds = max(
+            0.0,
+            (entitlement["referral_expires_at"] - reference).total_seconds(),
+        )
+        covered_seconds = sum(
+            (interval_end - interval_start).total_seconds()
+            for interval_start, interval_end in merged
+        )
+        return max(0.0, projected_seconds - covered_seconds)
+
+    def assert_referral_days(self, user_id: int, reference: datetime, days: int) -> None:
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, reference),
+            timedelta(days=days).total_seconds(),
+            delta=1.0,
+        )
+
     def test_apple_active_without_previous_entitlement(self):
         user_id = self.create_user()
         reference = datetime.now(timezone.utc)
@@ -404,6 +456,253 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             apple_expiry + timedelta(days=7),
         )
         self.assertEqual(result.expires_at, apple_expiry + timedelta(days=7))
+
+    def test_apple_active_preserves_thirty_referral_days_after_coverage(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        apple_expiry = reference + timedelta(days=30)
+        self.insert_apple_transaction(user_id, apple_expiry)
+        self.insert_reward(user_id, 2001, reference, days=30)
+
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(entitlement["apple_expires_at"], apple_expiry)
+        self.assertEqual(
+            entitlement["referral_expires_at"],
+            apple_expiry + timedelta(days=30),
+        )
+        self.assert_referral_days(user_id, reference, 30)
+
+    def test_apple_purchase_preserves_existing_referral_balance(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        self.insert_reward(user_id, 2002, reference, days=30)
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+        balance_before = self.referral_usable_seconds(user_id, reference)
+        apple_expiry = reference + timedelta(days=30)
+        self.insert_apple_transaction(user_id, apple_expiry)
+
+        result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        self.assertTrue(result.apple_active)
+        self.assertEqual(self.get_entitlement(user_id)["apple_expires_at"], apple_expiry)
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, reference),
+            balance_before,
+            delta=1.0,
+        )
+
+    def test_apple_renewal_moves_projection_without_consuming_referral_balance(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"original-{user_id}"
+        initial = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"initial-balance-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference,
+            expires_at=reference + timedelta(days=30),
+        )
+        self.save_and_reconcile(initial, reference)
+        self.insert_reward(user_id, 2003, reference, days=30)
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+        expiry_before = self.get_entitlement(user_id)["referral_expires_at"]
+        balance_before = self.referral_usable_seconds(user_id, reference)
+        renewal = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"renewal-balance-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=1),
+            expires_at=reference + timedelta(days=60),
+        )
+
+        self.save_and_reconcile(renewal, reference)
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertGreater(entitlement["referral_expires_at"], expiry_before)
+        self.assertEqual(entitlement["apple_expires_at"], renewal.expires_date)
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, reference),
+            balance_before,
+            delta=1.0,
+        )
+
+    def test_refund_releases_complete_referral_balance_immediately(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        refund_at = reference + timedelta(days=5)
+        self.insert_reward(user_id, 2004, reference, days=30)
+        self.insert_apple_transaction(user_id, reference + timedelta(days=30))
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE apple_transactions
+                    SET revocation_date = %s, signed_date = %s
+                    WHERE user_id = %s;
+                    """,
+                    (refund_at, refund_at, user_id),
+                )
+
+        result = reconciler.reconcile_apple_entitlement(user_id, refund_at)
+
+        self.assertTrue(result.is_plus)
+        self.assertFalse(result.apple_active)
+        self.assert_referral_days(user_id, refund_at, 30)
+
+    def test_consumed_referral_does_not_disable_active_apple(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        self.insert_reward(user_id, 2005, reference - timedelta(days=31), days=30)
+        apple_expiry = reference + timedelta(days=30)
+        self.insert_apple_transaction(user_id, apple_expiry)
+
+        result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertTrue(result.is_plus)
+        self.assertTrue(result.apple_active)
+        self.assertEqual(result.expires_at, apple_expiry)
+        self.assertIsNone(entitlement["referral_expires_at"])
+
+    def test_restore_preserves_referral_reward_and_usable_balance(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        transaction = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"restore-{user_id}",
+            original_transaction_id=f"restore-original-{user_id}",
+            signed_date=reference,
+            expires_at=reference + timedelta(days=30),
+        )
+        self.save_and_reconcile(transaction, reference)
+        self.insert_reward(user_id, 2006, reference, days=30)
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+        rewards_before = self.get_rewards(user_id)
+        balance_before = self.referral_usable_seconds(user_id, reference)
+
+        result = self.save_and_reconcile(transaction, reference)
+
+        self.assertTrue(result.is_plus)
+        self.assertEqual(self.get_rewards(user_id), rewards_before)
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, reference),
+            balance_before,
+            delta=1.0,
+        )
+
+    def test_duplicate_referral_reward_preserves_apple_and_balance(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        apple_expiry = reference + timedelta(days=30)
+        self.insert_apple_transaction(user_id, apple_expiry)
+        first = self.grant_reward(user_id, 2007, days=30)
+        checked_at = datetime.now(timezone.utc)
+        balance_before = self.referral_usable_seconds(user_id, checked_at)
+
+        second = self.grant_reward(user_id, 2007, days=30)
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertFalse(first["already_granted"])
+        self.assertTrue(second["already_granted"])
+        self.assertEqual(len(self.get_rewards(user_id)), 1)
+        self.assertEqual(entitlement["apple_expires_at"], apple_expiry)
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, checked_at),
+            balance_before,
+            delta=1.0,
+        )
+
+    def test_stale_apple_event_does_not_reduce_referral_balance(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"stale-original-{user_id}"
+        newer = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"stale-newer-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=2),
+            expires_at=reference + timedelta(days=60),
+        )
+        self.save_and_reconcile(newer, reference)
+        self.insert_reward(user_id, 2008, reference, days=30)
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+        balance_before = self.referral_usable_seconds(user_id, reference)
+        stale = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"stale-older-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference + timedelta(seconds=3),
+            expires_at=reference + timedelta(days=30),
+        )
+
+        self.save_and_reconcile(stale, reference)
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(entitlement["apple_expires_at"], newer.expires_date)
+        self.assertAlmostEqual(
+            self.referral_usable_seconds(user_id, reference),
+            balance_before,
+            delta=1.0,
+        )
+
+    def test_multiple_apple_renewals_keep_referral_balance_constant(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        original_id = f"multi-renew-original-{user_id}"
+        initial = self.make_apple_transaction(
+            user_id,
+            transaction_id=f"multi-renew-initial-{user_id}",
+            original_transaction_id=original_id,
+            signed_date=reference,
+            expires_at=reference + timedelta(days=30),
+        )
+        self.save_and_reconcile(initial, reference)
+        self.insert_reward(user_id, 2009, reference, days=30)
+        reconciler.reconcile_apple_entitlement(user_id, reference)
+        balance_before = self.referral_usable_seconds(user_id, reference)
+
+        for index, days in enumerate((60, 90), start=1):
+            renewal = self.make_apple_transaction(
+                user_id,
+                transaction_id=f"multi-renew-{index}-{user_id}",
+                original_transaction_id=original_id,
+                signed_date=reference + timedelta(seconds=index),
+                expires_at=reference + timedelta(days=days),
+            )
+            self.save_and_reconcile(renewal, reference)
+            self.assertAlmostEqual(
+                self.referral_usable_seconds(user_id, reference),
+                balance_before,
+                delta=1.0,
+            )
+
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(entitlement["apple_expires_at"], reference + timedelta(days=90))
+        self.assertEqual(
+            entitlement["referral_expires_at"],
+            reference + timedelta(days=120),
+        )
+
+    def test_aggregate_subscription_status_uses_combined_entitlement_expiry(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        apple_expiry = reference + timedelta(days=30)
+        self.insert_apple_transaction(user_id, apple_expiry)
+        self.insert_reward(user_id, 2010, reference, days=30)
+        result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        with self.connect() as conn:
+            status = main.get_active_plus_status(conn, user_id)
+
+        self.assertTrue(status["is_plus"])
+        self.assertEqual(
+            datetime.fromisoformat(status["subscription"]["expires_at"]),
+            result.expires_at,
+        )
 
     def test_original_bug_refund_leaves_only_seven_referral_days(self):
         user_id = self.create_user()

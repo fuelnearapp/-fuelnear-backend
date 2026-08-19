@@ -199,6 +199,8 @@ def _calculate_referral_expiry(
     intervals: list[tuple[datetime, datetime]],
     reference_date: datetime,
 ) -> datetime | None:
+    # Referral rewards represent usable Plus time outside Apple coverage.
+    # Apple-covered seconds preserve the balance and move its projected expiry.
     balance_seconds = 0.0
     cursor: datetime | None = None
     for granted_at, days in rewards:
