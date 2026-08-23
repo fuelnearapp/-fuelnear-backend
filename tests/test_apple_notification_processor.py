@@ -28,6 +28,8 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         *,
         transaction: bool = True,
         renewal: bool = False,
+        subtype: str | None = None,
+        grace_period_expires_date: datetime | None = None,
     ) -> VerifiedAppStoreNotification:
         transaction_info = (
             NormalizedAppleNotificationTransaction(
@@ -48,6 +50,7 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
                 auto_renew_status=1,
                 expiration_intent=None,
                 renewal_product_id="MB.FuelNear.plus.monthly",
+                grace_period_expires_date=grace_period_expires_date,
             )
             if renewal
             else None
@@ -55,7 +58,7 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         return VerifiedAppStoreNotification(
             notification_uuid="notification-1",
             notification_type=notification_type,
-            subtype=None,
+            subtype=subtype,
             signed_date=self.now,
             bundle_id="MB.FuelNear",
             environment="Sandbox",
@@ -123,6 +126,80 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
     def test_did_renew_is_processed(self):
         result, _ = self.process_with_owner(self.notification("DID_RENEW"))
         self.assertEqual(result.action, "transaction_processed")
+
+    def test_did_fail_to_renew_passes_active_grace_period(self):
+        grace_expiry = self.now + timedelta(days=5)
+        notification = self.notification(
+            "DID_FAIL_TO_RENEW",
+            renewal=True,
+            grace_period_expires_date=grace_expiry,
+        )
+
+        result, process_mock = self.process_with_owner(notification)
+
+        self.assertTrue(result.handled)
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertEqual(apple_transaction.grace_period_expires_date, grace_expiry)
+
+    def test_grace_period_expired_reconciles_verified_state(self):
+        grace_expiry = self.now - timedelta(seconds=1)
+        notification = self.notification(
+            "GRACE_PERIOD_EXPIRED",
+            renewal=True,
+            grace_period_expires_date=grace_expiry,
+        )
+
+        result, process_mock = self.process_with_owner(
+            notification,
+            result=self.processing_result(
+                is_plus=False,
+                expires_at=self.now,
+                changed=True,
+            ),
+        )
+
+        self.assertFalse(result.is_plus)
+        self.assertEqual(
+            process_mock.call_args.args[0].grace_period_expires_date,
+            grace_expiry,
+        )
+
+    def test_renewal_preference_upgrade_processes_verified_transaction(self):
+        result, process_mock = self.process_with_owner(
+            self.notification("DID_CHANGE_RENEWAL_PREF", subtype="UPGRADE")
+        )
+
+        self.assertTrue(result.handled)
+        self.assertEqual(result.action, "transaction_processed")
+        process_mock.assert_called_once()
+
+    def test_renewal_preference_downgrade_is_acknowledged_without_entitlement_change(self):
+        with patch.object(
+            processor.apple_purchase_processor,
+            "process_apple_transaction",
+        ) as process_mock:
+            result = processor.process_app_store_notification(
+                self.notification("DID_CHANGE_RENEWAL_PREF", subtype="DOWNGRADE")
+            )
+
+        self.assertTrue(result.handled)
+        self.assertEqual(result.action, "future_renewal_preference_acknowledged")
+        self.assertIsNone(result.changed)
+        process_mock.assert_not_called()
+
+    def test_renewal_status_is_acknowledged_without_entitlement_change(self):
+        with patch.object(
+            processor.apple_purchase_processor,
+            "process_apple_transaction",
+        ) as process_mock:
+            result = processor.process_app_store_notification(
+                self.notification("DID_CHANGE_RENEWAL_STATUS", renewal=True)
+            )
+
+        self.assertTrue(result.handled)
+        self.assertEqual(result.action, "renewal_status_acknowledged")
+        self.assertIsNone(result.changed)
+        process_mock.assert_not_called()
 
     def test_expired_is_reconciled(self):
         result, _ = self.process_with_owner(

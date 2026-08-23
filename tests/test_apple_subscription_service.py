@@ -83,6 +83,7 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
                         original_transaction_id TEXT NOT NULL,
                         purchase_date TIMESTAMPTZ NOT NULL,
                         expires_date TIMESTAMPTZ NULL,
+                        grace_period_expires_date TIMESTAMPTZ NULL,
                         environment TEXT NOT NULL,
                         ownership_type TEXT NULL,
                         transaction_reason TEXT NULL,
@@ -132,6 +133,7 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
         purchase_date: datetime,
         expires_date: datetime | None,
         *,
+        grace_period_expires_date: datetime | None = None,
         revocation_date: datetime | None = None,
         signed_date: datetime | None = None,
     ) -> None:
@@ -146,11 +148,12 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
                         original_transaction_id,
                         purchase_date,
                         expires_date,
+                        grace_period_expires_date,
                         environment,
                         revocation_date,
                         signed_date
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, 'Sandbox', %s, %s);
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'Sandbox', %s, %s);
                     """,
                     (
                         user_id,
@@ -159,6 +162,7 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
                         original_transaction_id,
                         purchase_date,
                         expires_date,
+                        grace_period_expires_date,
                         revocation_date,
                         signed_date,
                     ),
@@ -240,6 +244,44 @@ class AppleSubscriptionServiceTestCase(unittest.TestCase):
         self.assertTrue(service.is_subscription_active("original-1", now))
         active = service.get_active_subscription_for_user(user_id)
         self.assertEqual(active["original_transaction_id"], "original-1")
+
+    def test_subscription_remains_active_until_grace_period_expires(self):
+        user_id = self.create_user()
+        now = datetime.now(timezone.utc)
+        grace_expiry = now + timedelta(days=5)
+        self.insert_transaction(
+            user_id,
+            "tx-grace",
+            "original-grace",
+            now - timedelta(days=31),
+            now - timedelta(days=1),
+            grace_period_expires_date=grace_expiry,
+        )
+
+        self.assertTrue(service.is_subscription_active("original-grace", now))
+        active = service.get_active_subscription_for_user(user_id, now)
+        self.assertIsNotNone(active)
+        self.assertEqual(
+            service.effective_subscription_expiration(active),
+            grace_expiry,
+        )
+
+    def test_subscription_is_inactive_after_grace_period_expires(self):
+        user_id = self.create_user()
+        now = datetime.now(timezone.utc)
+        self.insert_transaction(
+            user_id,
+            "tx-grace-expired",
+            "original-grace-expired",
+            now - timedelta(days=32),
+            now - timedelta(days=2),
+            grace_period_expires_date=now - timedelta(days=1),
+        )
+
+        self.assertFalse(
+            service.is_subscription_active("original-grace-expired", now)
+        )
+        self.assertIsNone(service.get_active_subscription_for_user(user_id, now))
 
     def test_expired_subscription(self):
         user_id = self.create_user()

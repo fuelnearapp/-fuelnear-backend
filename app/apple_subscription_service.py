@@ -18,6 +18,7 @@ APPLE_TRANSACTION_COLUMNS = """
     original_transaction_id,
     purchase_date,
     expires_date,
+    grace_period_expires_date,
     environment,
     ownership_type,
     transaction_reason,
@@ -58,6 +59,16 @@ def _reference_date(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def effective_subscription_expiration(transaction: dict[str, Any]) -> datetime | None:
+    expires_date = transaction.get("expires_date")
+    grace_period_expires_date = transaction.get("grace_period_expires_date")
+    if expires_date is None:
+        return None
+    if grace_period_expires_date is None:
+        return expires_date
+    return max(expires_date, grace_period_expires_date)
 
 
 def get_transaction(transaction_id: str) -> dict[str, Any] | None:
@@ -167,10 +178,18 @@ def is_subscription_active(
                 FROM apple_transactions
                 WHERE original_transaction_id = %s
                   AND revocation_date IS NULL
-                  AND (expires_date IS NULL OR expires_date > %s)
+                  AND (
+                      expires_date IS NULL
+                      OR expires_date > %s
+                      OR grace_period_expires_date > %s
+                  )
                 LIMIT 1;
                 """,
-                (normalized_original_transaction_id, normalized_reference_date),
+                (
+                    normalized_original_transaction_id,
+                    normalized_reference_date,
+                    normalized_reference_date,
+                ),
             )
             return cur.fetchone() is not None
     finally:
@@ -195,14 +214,22 @@ def get_active_subscription_for_user(
                 FROM apple_transactions
                 WHERE user_id = %s
                   AND revocation_date IS NULL
-                  AND (expires_date IS NULL OR expires_date > %s)
+                  AND (
+                      expires_date IS NULL
+                      OR expires_date > %s
+                      OR grace_period_expires_date > %s
+                  )
                 ORDER BY (expires_date IS NULL) DESC,
-                         expires_date DESC NULLS FIRST,
+                         GREATEST(expires_date, grace_period_expires_date) DESC NULLS FIRST,
                          purchase_date DESC,
                          id DESC
                 LIMIT 1;
                 """,
-                (normalized_user_id, normalized_reference_date),
+                (
+                    normalized_user_id,
+                    normalized_reference_date,
+                    normalized_reference_date,
+                ),
             )
             row = cur.fetchone()
             return dict(row) if row is not None else None

@@ -91,6 +91,7 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
                         original_transaction_id TEXT NOT NULL,
                         purchase_date TIMESTAMPTZ NOT NULL,
                         expires_date TIMESTAMPTZ NULL,
+                        grace_period_expires_date TIMESTAMPTZ NULL,
                         environment TEXT NOT NULL,
                         ownership_type TEXT NULL,
                         transaction_reason TEXT NULL,

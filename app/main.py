@@ -3355,6 +3355,7 @@ def ensure_auth_schema(conn) -> None:
                 original_transaction_id TEXT NOT NULL,
                 purchase_date TIMESTAMPTZ NOT NULL,
                 expires_date TIMESTAMPTZ NULL,
+                grace_period_expires_date TIMESTAMPTZ NULL,
                 environment TEXT NOT NULL,
                 ownership_type TEXT NULL,
                 transaction_reason TEXT NULL,
@@ -3367,6 +3368,12 @@ def ensure_auth_schema(conn) -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE apple_transactions
+            ADD COLUMN IF NOT EXISTS grace_period_expires_date TIMESTAMPTZ NULL;
             """
         )
         guest_subscriptions.ensure_guest_subscription_schema(conn)

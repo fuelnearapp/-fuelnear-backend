@@ -9,7 +9,7 @@ from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
-from app import apple_subscription_reconciler
+from app import apple_subscription_reconciler, apple_subscription_service
 from app.auth_utils import hash_token
 from app.db import get_connection
 
@@ -325,22 +325,31 @@ def get_guest_subscription_status(
                 FROM apple_transactions
                 WHERE guest_id = %s
                 ORDER BY (revocation_date IS NULL
-                          AND (expires_date IS NULL OR expires_date > %s)) DESC,
+                          AND (
+                              expires_date IS NULL
+                              OR expires_date > %s
+                              OR grace_period_expires_date > %s
+                          )) DESC,
                          (expires_date IS NULL) DESC,
-                         expires_date DESC NULLS FIRST,
+                         GREATEST(expires_date, grace_period_expires_date) DESC NULLS FIRST,
                          purchase_date DESC,
                          id DESC
                 LIMIT 1;
                 """,
-                (guest_id, reference),
+                (guest_id, reference, reference),
             )
             latest = cur.fetchone()
             if latest is None:
                 return GuestSubscriptionStatus(False, None, None, "none")
+            effective_expiry = (
+                apple_subscription_service.effective_subscription_expiration(
+                    dict(latest)
+                )
+            )
             if latest["revocation_date"] is not None:
                 status = "revoked"
                 active = False
-            elif latest["expires_date"] is not None and latest["expires_date"] <= reference:
+            elif effective_expiry is not None and effective_expiry <= reference:
                 status = "expired"
                 active = False
             else:
@@ -349,7 +358,7 @@ def get_guest_subscription_status(
             return GuestSubscriptionStatus(
                 is_plus=active,
                 product_id=str(latest["product_id"]),
-                expires_at=latest["expires_date"],
+                expires_at=effective_expiry,
                 status=status,
             )
     finally:

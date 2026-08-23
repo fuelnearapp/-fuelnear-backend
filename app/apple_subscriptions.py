@@ -45,6 +45,7 @@ class AppleTransaction:
     environment: str
     guest_id: int | None = None
     expires_date: datetime | None = None
+    grace_period_expires_date: datetime | None = None
     ownership_type: str | None = None
     transaction_reason: str | None = None
     revocation_date: datetime | None = None
@@ -116,6 +117,10 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
         raise AppleTransactionValidationError("purchase_date is required")
 
     _validate_optional_datetime(transaction.expires_date, "expires_date")
+    _validate_optional_datetime(
+        transaction.grace_period_expires_date,
+        "grace_period_expires_date",
+    )
     _validate_optional_datetime(transaction.revocation_date, "revocation_date")
     _validate_optional_datetime(transaction.signed_date, "signed_date")
 
@@ -201,6 +206,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                         SET product_id = %s,
                             purchase_date = %s,
                             expires_date = COALESCE(%s, expires_date),
+                            grace_period_expires_date = %s,
                             environment = %s,
                             ownership_type = COALESCE(%s, ownership_type),
                             transaction_reason = COALESCE(%s, transaction_reason),
@@ -218,6 +224,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                             normalized.product_id,
                             normalized.purchase_date,
                             normalized.expires_date,
+                            normalized.grace_period_expires_date,
                             normalized.environment,
                             normalized.ownership_type,
                             normalized.transaction_reason,
@@ -280,6 +287,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     original_transaction_id,
                     purchase_date,
                     expires_date,
+                    grace_period_expires_date,
                     environment,
                     ownership_type,
                     transaction_reason,
@@ -290,7 +298,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     storefront,
                     offer_type
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *;
                 """,
                 (
@@ -301,6 +309,7 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
                     normalized.original_transaction_id,
                     normalized.purchase_date,
                     normalized.expires_date,
+                    normalized.grace_period_expires_date,
                     normalized.environment,
                     normalized.ownership_type,
                     normalized.transaction_reason,

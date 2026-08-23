@@ -19,6 +19,7 @@ PROCESSABLE_NOTIFICATION_TYPES: Final[frozenset[str]] = frozenset(
         "SUBSCRIBED",
         "DID_RENEW",
         "DID_FAIL_TO_RENEW",
+        "DID_CHANGE_RENEWAL_PREF",
         "EXPIRED",
         "GRACE_PERIOD_EXPIRED",
         "REFUND",
@@ -28,6 +29,10 @@ PROCESSABLE_NOTIFICATION_TYPES: Final[frozenset[str]] = frozenset(
         "PRICE_INCREASE",
         "RENEWAL_EXTENDED",
     }
+)
+
+ACKNOWLEDGED_NOTIFICATION_TYPES: Final[frozenset[str]] = frozenset(
+    {"DID_CHANGE_RENEWAL_STATUS"}
 )
 
 IGNORED_NOTIFICATION_TYPES: Final[frozenset[str]] = frozenset(
@@ -184,6 +189,11 @@ def _to_apple_transaction(
             original_transaction_id=transaction.original_transaction_id,
             purchase_date=transaction.purchase_date,
             expires_date=transaction.expires_date,
+            grace_period_expires_date=(
+                notification.renewal.grace_period_expires_date
+                if notification.renewal is not None
+                else None
+            ),
             environment=notification.environment,
             revocation_date=transaction.revocation_date,
             revocation_reason=(
@@ -227,6 +237,22 @@ def process_app_store_notification(
         )
 
     notification_type = notification.notification_type.strip().upper()
+    if notification_type in ACKNOWLEDGED_NOTIFICATION_TYPES:
+        return _no_action_result(
+            notification,
+            handled=True,
+            action="renewal_status_acknowledged",
+            reason="renewal_status_does_not_change_current_entitlement",
+        )
+    if notification_type == "DID_CHANGE_RENEWAL_PREF" and (
+        (notification.subtype or "").strip().upper() != "UPGRADE"
+    ):
+        return _no_action_result(
+            notification,
+            handled=True,
+            action="future_renewal_preference_acknowledged",
+            reason="renewal_preference_does_not_change_current_entitlement",
+        )
     if notification_type in IGNORED_NOTIFICATION_TYPES:
         return _no_action_result(
             notification,

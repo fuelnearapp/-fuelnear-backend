@@ -151,11 +151,17 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             bundleId="MB.FuelNear",
         )
 
-    def renewal(self, *, environment=Environment.SANDBOX):
+    def renewal(
+        self,
+        *,
+        environment=Environment.SANDBOX,
+        grace_period_expires_date=None,
+    ):
         return JWSRenewalInfoDecodedPayload(
             autoRenewStatus=AutoRenewStatus.ON,
             expirationIntent=ExpirationIntent.BILLING_ERROR,
             autoRenewProductId="MB.FuelNear.plus.monthly",
+            gracePeriodExpiresDate=grace_period_expires_date,
             environment=environment,
         )
 
@@ -193,6 +199,24 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
         self.assertEqual(fake.notification_calls, ["signed-notification"])
         self.assertEqual(fake.transaction_calls, ["signed-transaction"])
         self.assertEqual(fake.renewal_calls, ["signed-renewal"])
+
+    def test_grace_period_expiration_is_normalized(self):
+        result, _ = self.verify(
+            renewal=self.renewal(grace_period_expires_date=1_700_172_800_000)
+        )
+
+        self.assertEqual(
+            result.renewal.grace_period_expires_date,
+            datetime.fromtimestamp(1_700_172_800, tz=timezone.utc),
+        )
+
+    def test_missing_grace_period_expiration_is_allowed(self):
+        result, _ = self.verify(renewal=self.renewal())
+        self.assertIsNone(result.renewal.grace_period_expires_date)
+
+    def test_invalid_grace_period_expiration_is_rejected(self):
+        with self.assertRaises(AppleNotificationRenewalDataError):
+            self.verify(renewal=self.renewal(grace_period_expires_date="invalid"))
 
     def test_empty_payload_is_rejected(self):
         with self.assertRaises(AppleNotificationInvalidError):

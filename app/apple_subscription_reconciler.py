@@ -70,7 +70,9 @@ def reconcile_apple_entitlement(
                 )
                 apple_active = apple_subscription is not None
                 apple_expires_at = (
-                    apple_subscription["expires_date"]
+                    apple_subscription_service.effective_subscription_expiration(
+                        apple_subscription
+                    )
                     if apple_subscription
                     else None
                 )
@@ -78,11 +80,19 @@ def reconcile_apple_entitlement(
                     raise AppleEntitlementMissingExpiration(
                         "An active Apple subscription requires expires_date for entitlement reconciliation"
                     )
+                effective_apple_subscription = (
+                    {
+                        **dict(apple_subscription),
+                        "expires_date": apple_expires_at,
+                    }
+                    if apple_subscription
+                    else None
+                )
                 components = plus_entitlements.reconcile_user_plus_entitlement(
                     conn,
                     user_id,
                     normalized_reference_date,
-                    apple_subscription=(dict(apple_subscription) if apple_subscription else None),
+                    apple_subscription=effective_apple_subscription,
                     user_locked=True,
                 )
                 return AppleEntitlementReconciliationResult(

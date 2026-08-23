@@ -91,6 +91,7 @@ class NormalizedAppleNotificationRenewal:
     auto_renew_status: int
     expiration_intent: int | None
     renewal_product_id: str
+    grace_period_expires_date: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +484,12 @@ def _normalize_renewal(
         auto_renew_status=auto_renew_status,
         expiration_intent=expiration_intent,
         renewal_product_id=renewal_product_id.strip(),
+        grace_period_expires_date=_milliseconds_datetime(
+            payload.gracePeriodExpiresDate,
+            "gracePeriodExpiresDate",
+            required=False,
+            error_type=AppleNotificationRenewalDataError,
+        ),
     )
 
 

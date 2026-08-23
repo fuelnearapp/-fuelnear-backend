@@ -163,6 +163,7 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
         transaction_id: str = "guest-transaction-1",
         original_transaction_id: str = "guest-original-1",
         expires_date: datetime | None = None,
+        grace_period_expires_date: datetime | None = None,
         signed_date: datetime | None = None,
         revocation_date: datetime | None = None,
     ) -> apple_subscriptions.AppleTransaction:
@@ -175,6 +176,7 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
             original_transaction_id=original_transaction_id,
             purchase_date=now,
             expires_date=expires_date or now + timedelta(days=30),
+            grace_period_expires_date=grace_period_expires_date,
             environment="Sandbox",
             revocation_date=revocation_date,
             app_account_token=guest.app_account_token,
@@ -294,6 +296,27 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
             signed_transaction="signed-guest-transaction",
             expected_app_account_token=str(guest.app_account_token),
         )
+
+    def test_guest_subscription_remains_active_during_grace_period(self):
+        guest = self.create_guest()
+        now = datetime.now(timezone.utc)
+        grace_expiry = now + timedelta(days=5)
+        apple_purchase_processor.process_apple_transaction(
+            self.transaction(
+                guest,
+                expires_date=now - timedelta(days=1),
+                grace_period_expires_date=grace_expiry,
+            )
+        )
+
+        status = guest_subscriptions.get_guest_subscription_status(
+            guest.guest_id,
+            now,
+        )
+
+        self.assertTrue(status.is_plus)
+        self.assertEqual(status.status, "active")
+        self.assertEqual(status.expires_at, grace_expiry)
 
     def test_05_guest_verify_rejects_app_account_token_mismatch(self):
         guest = self.create_guest()

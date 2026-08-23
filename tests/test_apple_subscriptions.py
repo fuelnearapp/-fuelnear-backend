@@ -87,6 +87,7 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
                         original_transaction_id TEXT NOT NULL,
                         purchase_date TIMESTAMPTZ NOT NULL,
                         expires_date TIMESTAMPTZ NULL,
+                        grace_period_expires_date TIMESTAMPTZ NULL,
                         environment TEXT NOT NULL,
                         ownership_type TEXT NULL,
                         transaction_reason TEXT NULL,
@@ -243,6 +244,47 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
 
         self.assertEqual(result.row["revocation_date"], revocation_date)
         self.assertEqual(result.row["revocation_reason"], "1")
+
+    def test_newer_duplicate_updates_grace_period_expiration(self):
+        user_id = self.create_user()
+        signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(user_id, signed_date=signed_date)
+        self.save(transaction)
+        grace_expiry = transaction.expires_date + timedelta(days=5)
+
+        result = self.save(
+            replace(
+                transaction,
+                signed_date=signed_date + timedelta(minutes=1),
+                grace_period_expires_date=grace_expiry,
+            )
+        )
+
+        self.assertFalse(result.created)
+        self.assertTrue(result.changed)
+        self.assertEqual(result.row["grace_period_expires_date"], grace_expiry)
+
+    def test_older_grace_event_cannot_overwrite_newer_expired_state(self):
+        user_id = self.create_user()
+        signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(
+            user_id,
+            signed_date=signed_date + timedelta(minutes=2),
+            grace_period_expires_date=None,
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(
+                transaction,
+                signed_date=signed_date,
+                grace_period_expires_date=transaction.expires_date
+                + timedelta(days=5),
+            )
+        )
+
+        self.assertFalse(result.changed)
+        self.assertIsNone(result.row["grace_period_expires_date"])
 
     def test_newer_refund_reversed_clears_revocation(self):
         user_id = self.create_user()

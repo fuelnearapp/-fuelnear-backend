@@ -80,16 +80,28 @@ def _load_active_apple_subscription(
             WHERE user_id = %s
               AND revocation_date IS NULL
               AND expires_date IS NOT NULL
-              AND expires_date > %s
-            ORDER BY expires_date DESC,
+              AND (
+                  expires_date > %s
+                  OR grace_period_expires_date > %s
+              )
+            ORDER BY GREATEST(expires_date, grace_period_expires_date) DESC,
                      purchase_date DESC,
                      id DESC
             LIMIT 1;
             """,
-            (user_id, reference_date),
+            (user_id, reference_date, reference_date),
         )
         row = cur.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        subscription = dict(row)
+        grace_expiry = subscription.get("grace_period_expires_date")
+        if grace_expiry is not None:
+            subscription["expires_date"] = max(
+                subscription["expires_date"],
+                grace_expiry,
+            )
+        return subscription
 
 
 def _load_apple_intervals(
@@ -99,7 +111,8 @@ def _load_apple_intervals(
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, original_transaction_id, purchase_date, expires_date,
+            SELECT id, original_transaction_id, purchase_date,
+                   GREATEST(expires_date, grace_period_expires_date) AS expires_date,
                    revocation_date, signed_date
             FROM apple_transactions
             WHERE user_id = %s

@@ -90,6 +90,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                         original_transaction_id TEXT NOT NULL,
                         purchase_date TIMESTAMPTZ NOT NULL,
                         expires_date TIMESTAMPTZ NULL,
+                        grace_period_expires_date TIMESTAMPTZ NULL,
                         environment TEXT NOT NULL,
                         ownership_type TEXT NULL,
                         transaction_reason TEXT NULL,
@@ -179,6 +180,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
         user_id: int,
         expires_at: datetime,
         *,
+        grace_period_expires_at: datetime | None = None,
         revoked_at: datetime | None = None,
     ) -> None:
         with self.connect() as conn:
@@ -187,9 +189,10 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                     """
                     INSERT INTO apple_transactions (
                         user_id, product_id, transaction_id, original_transaction_id,
-                        purchase_date, expires_date, environment, revocation_date, signed_date
+                        purchase_date, expires_date, grace_period_expires_date,
+                        environment, revocation_date, signed_date
                     )
-                    VALUES (%s, 'MB.FuelNear.plus.monthly', %s, %s, %s, %s, 'Sandbox', %s, %s);
+                    VALUES (%s, 'MB.FuelNear.plus.monthly', %s, %s, %s, %s, %s, 'Sandbox', %s, %s);
                     """,
                     (
                         user_id,
@@ -197,6 +200,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                         f"original-{user_id}",
                         expires_at - timedelta(days=30),
                         expires_at,
+                        grace_period_expires_at,
                         revoked_at,
                         expires_at - timedelta(days=30),
                     ),
@@ -408,6 +412,44 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
         self.assertTrue(result.apple_active)
         self.assertTrue(result.changed)
         self.assertEqual(result.expires_at, apple_expiry)
+
+    def test_expired_transaction_remains_active_during_grace_period(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        grace_expiry = reference + timedelta(days=5)
+        self.insert_apple_transaction(
+            user_id,
+            reference - timedelta(days=1),
+            grace_period_expires_at=grace_expiry,
+        )
+
+        result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        self.assertTrue(result.is_plus)
+        self.assertTrue(result.apple_active)
+        self.assertEqual(result.expires_at, grace_expiry)
+        entitlement = self.get_entitlement(user_id)
+        self.assertEqual(entitlement["apple_expires_at"], grace_expiry)
+
+    def test_expired_grace_period_removes_apple_entitlement(self):
+        user_id = self.create_user()
+        reference = datetime.now(timezone.utc)
+        self.insert_apple_transaction(
+            user_id,
+            reference - timedelta(days=2),
+            grace_period_expires_at=reference - timedelta(days=1),
+        )
+        self.insert_entitlement(
+            user_id,
+            reconciler.APPLE_SUBSCRIPTION_SOURCE,
+            reference + timedelta(days=5),
+        )
+
+        result = reconciler.reconcile_apple_entitlement(user_id, reference)
+
+        self.assertFalse(result.is_plus)
+        self.assertFalse(result.apple_active)
+        self.assertEqual(self.get_entitlement(user_id)["status"], "expired")
 
     def test_referral_only_creates_independent_component(self):
         user_id = self.create_user()
