@@ -15,6 +15,7 @@ from uuid import UUID
 from unittest.mock import patch
 
 import psycopg2
+from fastapi.testclient import TestClient
 from psycopg2.extras import RealDictCursor
 
 
@@ -271,6 +272,44 @@ class DeferredBackgroundTasks:
     def run(self):
         for func, args, kwargs in self.tasks:
             func(*args, **kwargs)
+
+
+class TrackingConnectionPool:
+    def __init__(self, delegate, *, acquire_delay_seconds: float = 0.0):
+        self._delegate = delegate
+        self._lock = threading.Lock()
+        self._acquire_delay_seconds = acquire_delay_seconds
+        self.checked_out = 0
+        self.max_checked_out = 0
+        self.exhausted_count = 0
+
+    def getconn(self, *args, **kwargs):
+        try:
+            connection = self._delegate.getconn(*args, **kwargs)
+        except psycopg2.pool.PoolError:
+            with self._lock:
+                self.exhausted_count += 1
+            raise
+
+        with self._lock:
+            self.checked_out += 1
+            self.max_checked_out = max(self.max_checked_out, self.checked_out)
+        if self._acquire_delay_seconds:
+            time.sleep(self._acquire_delay_seconds)
+        return connection
+
+    def putconn(self, *args, **kwargs):
+        try:
+            return self._delegate.putconn(*args, **kwargs)
+        finally:
+            with self._lock:
+                self.checked_out -= 1
+
+    def closeall(self):
+        return self._delegate.closeall()
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
 
 
 class FuelNearE2ETestCase(unittest.TestCase):
@@ -700,6 +739,159 @@ class FuelNearE2ETestCase(unittest.TestCase):
         self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM rewards;"), 4)
         self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_subscriptions WHERE status = 'active';"), 1)
         self.assertLessEqual(self.count_active_pool_connections(), 1)
+
+    def test_07c_post_login_http_burst_uses_pool_five_without_deadlock(self):
+        account = self.signup_verified_login("burst@example.com")
+        authorization = self.auth_header(account)
+        guest = main.create_or_restore_guest_session(
+            FakeRequest(ip="10.30.0.1", path="/auth/guest"),
+            None,
+        )
+
+        original_pool_max = db.DB_POOL_MAX_CONNECTIONS
+        main.close_connection_pool()
+        db.DB_POOL_MAX_CONNECTIONS = 5
+        tracking_pool = TrackingConnectionPool(
+            db.get_connection_pool(),
+            acquire_delay_seconds=0.02,
+        )
+        db._connection_pool = tracking_pool
+        client = TestClient(main.app, raise_server_exceptions=False)
+        responses = []
+
+        def perform_request(operation: str, wave: int, barrier: threading.Barrier):
+            barrier.wait(timeout=10)
+            if operation == "login":
+                return operation, client.post(
+                    "/auth/login",
+                    json={
+                        "email": "burst@example.com",
+                        "password": self.password,
+                        "device_info": "ios-burst",
+                    },
+                )
+            if operation == "claim":
+                return operation, client.post(
+                    "/user/subscription/claim-guest",
+                    headers={"Authorization": authorization},
+                    json={"guest_access_token": guest.guest_access_token},
+                )
+            if operation == "device":
+                return operation, client.post(
+                    "/user/device-token",
+                    headers={"Authorization": authorization},
+                    json={
+                        "device_token": "cd" * 32,
+                        "platform": "ios",
+                        "environment": "production",
+                        "app_version": "1.0",
+                        "device_info": "iPhone",
+                    },
+                )
+            if operation == "location":
+                return operation, client.post(
+                    "/user/location",
+                    headers={"Authorization": authorization},
+                    json={
+                        "lat": 41.9028,
+                        "lng": 12.4964,
+                        "accuracy": 12.0,
+                        "source": "ios",
+                    },
+                )
+            return operation, client.get(
+                "/auth/me",
+                headers={"Authorization": authorization},
+            )
+
+        try:
+            operations = ("login", "claim", "device", "location", "me")
+            with patch.object(
+                main,
+                "ensure_auth_rate_limit_schema",
+                side_effect=AssertionError("rate limit schema initialization reached request path"),
+            ) as schema_initializer:
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    for wave in range(12):
+                        barrier = threading.Barrier(len(operations))
+                        futures = [
+                            executor.submit(perform_request, operation, wave, barrier)
+                            for operation in operations
+                        ]
+                        responses.extend(future.result(timeout=20) for future in futures)
+
+                runtime_bucket = main.build_rate_limit_bucket("post-fix-runtime-check")
+                main.check_auth_rate_limit(
+                    "/auth/runtime-check",
+                    runtime_bucket,
+                    limit=1,
+                    window_seconds=60,
+                )
+                with self.assertRaises(main.APIError) as limited:
+                    main.check_auth_rate_limit(
+                        "/auth/runtime-check",
+                        runtime_bucket,
+                        limit=1,
+                        window_seconds=60,
+                    )
+                self.assert_api_error(limited, "RATE_LIMITED", 429)
+                schema_initializer.assert_not_called()
+
+            statuses = [response.status_code for _, response in responses]
+            bodies = [response.text for _, response in responses]
+            self.assertNotIn(500, statuses)
+            self.assertNotIn(503, statuses)
+            self.assertFalse(any("DeadlockDetected" in body for body in bodies))
+            self.assertFalse(any("DatabasePoolExhausted" in body for body in bodies))
+            self.assertEqual(tracking_pool.exhausted_count, 0)
+
+            for operation, expected_status in {
+                "login": 200,
+                "claim": 400,
+                "device": 200,
+                "location": 200,
+                "me": 200,
+            }.items():
+                operation_responses = [
+                    response for name, response in responses if name == operation
+                ]
+                self.assertEqual(len(operation_responses), 12)
+                self.assertTrue(
+                    all(response.status_code == expected_status for response in operation_responses)
+                )
+
+            claim_responses = [response for name, response in responses if name == "claim"]
+            self.assertTrue(
+                all(
+                    response.json().get("error_code") == "GUEST_SUBSCRIPTION_NOT_FOUND"
+                    for response in claim_responses
+                )
+            )
+            self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_device_tokens;"), 1)
+            self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_locations;"), 1)
+            self.assertEqual(
+                self.fetch_value(
+                    """
+                    SELECT COUNT(*)
+                    FROM user_sessions session
+                    LEFT JOIN users owner ON owner.id = session.user_id
+                    WHERE owner.id IS NULL;
+                    """
+                ),
+                0,
+            )
+            self.assertEqual(tracking_pool.checked_out, 0)
+            self.assertEqual(tracking_pool.max_checked_out, 5)
+            print(
+                "[RATE_LIMIT TEST] requests=60 concurrency=5 pool_max=5 "
+                f"max_checked_out={tracking_pool.max_checked_out} "
+                f"pool_exhausted={tracking_pool.exhausted_count}"
+            )
+        finally:
+            client.close()
+            main.close_connection_pool()
+            db.DB_POOL_MAX_CONNECTIONS = original_pool_max
+            db.get_connection_pool()
 
     def test_08_security_errors_are_structured_and_safe(self):
         with self.assertRaises(main.HTTPException) as wrong_admin:

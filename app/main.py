@@ -887,7 +887,6 @@ def check_auth_rate_limit(
     conn = get_connection()
     try:
         with conn:
-            ensure_auth_rate_limit_schema(conn)
             maybe_cleanup_auth_rate_limits(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
