@@ -225,6 +225,8 @@ def ensure_core_price_schema(conn) -> None:
                 latitude DOUBLE PRECISION NOT NULL,
                 longitude DOUBLE PRECISION NOT NULL,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                geodata_status TEXT NOT NULL DEFAULT 'unassessed',
+                geodata_reason TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -449,10 +451,10 @@ class FuelNearE2ETestCase(unittest.TestCase):
                     """
                     INSERT INTO stations (
                         mimit_id, name, brand, operator, address, city, province,
-                        latitude, longitude, is_active
+                        latitude, longitude, is_active, geodata_status
                     )
                     VALUES (1001, 'FuelNear Test Station', 'Q8', 'Q8', 'Via Test 1',
-                            'Anzio', 'RM', 41.4959, 12.6190, TRUE)
+                            'Anzio', 'RM', 41.4959, 12.6190, TRUE, 'valid')
                     RETURNING id;
                     """
                 )
@@ -498,10 +500,10 @@ class FuelNearE2ETestCase(unittest.TestCase):
                     """
                     INSERT INTO stations (
                         mimit_id, name, brand, operator, address, city, province,
-                        latitude, longitude, is_active
+                        latitude, longitude, is_active, geodata_status
                     )
                     VALUES (2001, 'Cron Station', 'Q8', 'Q8', 'Via Cron 1',
-                            'Anzio', 'RM', 41.4959, 12.6190, TRUE)
+                            'Anzio', 'RM', 41.4959, 12.6190, TRUE, 'valid')
                     ON CONFLICT (mimit_id) DO UPDATE SET updated_at = NOW()
                     RETURNING id;
                     """

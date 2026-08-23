@@ -46,6 +46,15 @@ MIMIT_UNKNOWN_FUEL_WARNING_ROWS = max(
     0,
     int(os.getenv("MIMIT_UNKNOWN_FUEL_WARNING_ROWS", "100")),
 )
+GEODATA_STATUS_UNASSESSED = "unassessed"
+GEODATA_STATUS_VALID = "valid"
+GEODATA_STATUS_QUARANTINED = "quarantined"
+GEODATA_MIN_LATITUDE = 35.0
+GEODATA_MAX_LATITUDE = 48.0
+GEODATA_MIN_LONGITUDE = 6.0
+GEODATA_MAX_LONGITUDE = 19.5
+GEODATA_MIN_MUNICIPALITY_STATIONS = 5
+GEODATA_MAX_MUNICIPALITY_DISTANCE_KM = 100.0
 KNOWN_UNKNOWN_MIMIT_FUEL_NAMES = frozenset(
     {
         "gasolio ecoplus",
@@ -53,6 +62,148 @@ KNOWN_UNKNOWN_MIMIT_FUEL_NAMES = frozenset(
     }
 )
 LOGGER = logging.getLogger("fuelnear.mimit")
+
+
+def ensure_station_geodata_schema(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.stations');")
+        if cur.fetchone()[0] is None:
+            return 0
+
+        cur.execute(
+            """
+            ALTER TABLE stations
+            ADD COLUMN IF NOT EXISTS geodata_status TEXT NOT NULL DEFAULT 'unassessed';
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE stations
+            ADD COLUMN IF NOT EXISTS geodata_reason TEXT NULL;
+            """
+        )
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'stations_geodata_status_check'
+                      AND conrelid = 'stations'::regclass
+                ) THEN
+                    ALTER TABLE stations
+                    ADD CONSTRAINT stations_geodata_status_check
+                    CHECK (geodata_status IN ('unassessed', 'valid', 'quarantined'));
+                END IF;
+            END
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            WITH municipality_stats AS (
+                SELECT
+                    UPPER(BTRIM(city)) AS city_key,
+                    UPPER(BTRIM(province)) AS province_key,
+                    COUNT(*) FILTER (
+                        WHERE latitude BETWEEN %s AND %s
+                          AND longitude BETWEEN %s AND %s
+                    ) AS reference_count,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY latitude) FILTER (
+                        WHERE latitude BETWEEN %s AND %s
+                          AND longitude BETWEEN %s AND %s
+                    ) AS median_latitude,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY longitude) FILTER (
+                        WHERE latitude BETWEEN %s AND %s
+                          AND longitude BETWEEN %s AND %s
+                    ) AS median_longitude
+                FROM stations
+                GROUP BY UPPER(BTRIM(city)), UPPER(BTRIM(province))
+            ), assessed AS (
+                SELECT
+                    s.id,
+                    CASE
+                        WHEN s.latitude NOT BETWEEN %s AND %s
+                          OR s.longitude NOT BETWEEN %s AND %s
+                            THEN 'quarantined'
+                        WHEN stats.reference_count >= %s
+                          AND 6371 * acos(
+                              least(1, greatest(-1,
+                                  cos(radians(stats.median_latitude)) * cos(radians(s.latitude)) *
+                                  cos(radians(s.longitude) - radians(stats.median_longitude)) +
+                                  sin(radians(stats.median_latitude)) * sin(radians(s.latitude))
+                              ))
+                          ) > %s
+                            THEN 'quarantined'
+                        ELSE 'valid'
+                    END AS status,
+                    CASE
+                        WHEN s.latitude NOT BETWEEN %s AND %s
+                          OR s.longitude NOT BETWEEN %s AND %s
+                            THEN 'outside_italy_bounds'
+                        WHEN stats.reference_count >= %s
+                          AND 6371 * acos(
+                              least(1, greatest(-1,
+                                  cos(radians(stats.median_latitude)) * cos(radians(s.latitude)) *
+                                  cos(radians(s.longitude) - radians(stats.median_longitude)) +
+                                  sin(radians(stats.median_latitude)) * sin(radians(s.latitude))
+                              ))
+                          ) > %s
+                            THEN 'municipality_outlier'
+                        ELSE NULL
+                    END AS reason
+                FROM stations s
+                JOIN municipality_stats stats
+                  ON stats.city_key = UPPER(BTRIM(s.city))
+                 AND stats.province_key = UPPER(BTRIM(s.province))
+                WHERE s.geodata_status = 'unassessed'
+            )
+            UPDATE stations s
+            SET geodata_status = assessed.status,
+                geodata_reason = assessed.reason
+            FROM assessed
+            WHERE s.id = assessed.id;
+            """,
+            (
+                GEODATA_MIN_LATITUDE,
+                GEODATA_MAX_LATITUDE,
+                GEODATA_MIN_LONGITUDE,
+                GEODATA_MAX_LONGITUDE,
+                GEODATA_MIN_LATITUDE,
+                GEODATA_MAX_LATITUDE,
+                GEODATA_MIN_LONGITUDE,
+                GEODATA_MAX_LONGITUDE,
+                GEODATA_MIN_LATITUDE,
+                GEODATA_MAX_LATITUDE,
+                GEODATA_MIN_LONGITUDE,
+                GEODATA_MAX_LONGITUDE,
+                GEODATA_MIN_LATITUDE,
+                GEODATA_MAX_LATITUDE,
+                GEODATA_MIN_LONGITUDE,
+                GEODATA_MAX_LONGITUDE,
+                GEODATA_MIN_MUNICIPALITY_STATIONS,
+                GEODATA_MAX_MUNICIPALITY_DISTANCE_KM,
+                GEODATA_MIN_LATITUDE,
+                GEODATA_MAX_LATITUDE,
+                GEODATA_MIN_LONGITUDE,
+                GEODATA_MAX_LONGITUDE,
+                GEODATA_MIN_MUNICIPALITY_STATIONS,
+                GEODATA_MAX_MUNICIPALITY_DISTANCE_KM,
+            ),
+        )
+        assessed_count = cur.rowcount
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stations_geodata_nearby
+            ON stations(latitude, longitude)
+            WHERE is_active = TRUE AND geodata_status = 'valid';
+            """
+        )
+
+    if assessed_count:
+        LOGGER.info("geodata_backfill_assessed_count=%s", assessed_count)
+    return assessed_count
 
 
 def safe_download_log_url(url: str) -> str:
@@ -83,6 +234,8 @@ def ensure_core_schema(conn) -> None:
                 latitude DOUBLE PRECISION NOT NULL,
                 longitude DOUBLE PRECISION NOT NULL,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                geodata_status TEXT NOT NULL DEFAULT 'unassessed',
+                geodata_reason TEXT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -122,6 +275,8 @@ def ensure_core_schema(conn) -> None:
             ON fuel_prices(fuel_type, reported_at DESC);
             """
         )
+
+    ensure_station_geodata_schema(conn)
 
 
 SUPPORTED_FUEL_TYPES = frozenset(
@@ -754,10 +909,90 @@ def get_prices_csv_max_reported_at(df_prices: pd.DataFrame):
     return max_reported_at.to_pydatetime()
 
 
+def geodata_distance_km(
+    latitude: float,
+    longitude: float,
+    reference_latitude: float,
+    reference_longitude: float,
+) -> float:
+    latitude_radians = math.radians(latitude)
+    reference_latitude_radians = math.radians(reference_latitude)
+    latitude_delta = math.radians(reference_latitude - latitude)
+    longitude_delta = math.radians(reference_longitude - longitude)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(latitude_radians)
+        * math.cos(reference_latitude_radians)
+        * math.sin(longitude_delta / 2) ** 2
+    )
+    return 6371 * 2 * math.atan2(math.sqrt(haversine), math.sqrt(max(0.0, 1 - haversine)))
+
+
+def assess_station_coordinate_quality(df_stations: pd.DataFrame) -> pd.DataFrame:
+    assessed = df_stations.copy()
+    latitudes = pd.to_numeric(assessed["Latitudine"], errors="coerce")
+    longitudes = pd.to_numeric(assessed["Longitudine"], errors="coerce")
+    city_keys = assessed["Comune"].fillna("").astype(str).str.strip().str.casefold()
+    province_keys = assessed["Provincia"].fillna("").astype(str).str.strip().str.casefold()
+
+    statuses = pd.Series(GEODATA_STATUS_VALID, index=assessed.index, dtype="object")
+    reasons = pd.Series(None, index=assessed.index, dtype="object")
+    finite_coordinates = latitudes.map(lambda value: pd.notna(value) and math.isfinite(float(value))) & longitudes.map(
+        lambda value: pd.notna(value) and math.isfinite(float(value))
+    )
+    inside_italy_bounds = (
+        finite_coordinates
+        & latitudes.between(GEODATA_MIN_LATITUDE, GEODATA_MAX_LATITUDE)
+        & longitudes.between(GEODATA_MIN_LONGITUDE, GEODATA_MAX_LONGITUDE)
+    )
+
+    statuses.loc[~finite_coordinates] = GEODATA_STATUS_QUARANTINED
+    reasons.loc[~finite_coordinates] = "invalid_coordinate"
+    statuses.loc[finite_coordinates & ~inside_italy_bounds] = GEODATA_STATUS_QUARANTINED
+    reasons.loc[finite_coordinates & ~inside_italy_bounds] = "outside_italy_bounds"
+
+    references = pd.DataFrame(
+        {
+            "city_key": city_keys,
+            "province_key": province_keys,
+            "latitude": latitudes,
+            "longitude": longitudes,
+        },
+        index=assessed.index,
+    ).loc[inside_italy_bounds & city_keys.ne("") & province_keys.ne("")]
+    municipality_stats = references.groupby(["city_key", "province_key"]).agg(
+        reference_count=("latitude", "size"),
+        median_latitude=("latitude", "median"),
+        median_longitude=("longitude", "median"),
+    )
+
+    for row_index in references.index:
+        location_key = (city_keys.at[row_index], province_keys.at[row_index])
+        stats = municipality_stats.loc[location_key]
+        if int(stats["reference_count"]) < GEODATA_MIN_MUNICIPALITY_STATIONS:
+            continue
+        distance_km = geodata_distance_km(
+            float(latitudes.at[row_index]),
+            float(longitudes.at[row_index]),
+            float(stats["median_latitude"]),
+            float(stats["median_longitude"]),
+        )
+        if distance_km > GEODATA_MAX_MUNICIPALITY_DISTANCE_KM:
+            statuses.at[row_index] = GEODATA_STATUS_QUARANTINED
+            reasons.at[row_index] = "municipality_outlier"
+
+    assessed["geodata_status"] = statuses
+    assessed["geodata_reason"] = reasons
+    return assessed
+
+
 def import_stations(conn, df_stations: pd.DataFrame) -> dict[int, int]:
     station_id_map: dict[int, int] = {}
     skipped_missing_coords = 0
     skipped_missing_address = 0
+
+    if "geodata_status" not in df_stations.columns:
+        df_stations = assess_station_coordinate_quality(df_stations)
 
     with conn.cursor() as cur:
         for _, row in df_stations.iterrows():
@@ -787,9 +1022,9 @@ def import_stations(conn, df_stations: pd.DataFrame) -> dict[int, int]:
                 """
                 INSERT INTO stations (
                     mimit_id, name, brand, operator, address, city, province,
-                    latitude, longitude, is_active
+                    latitude, longitude, is_active, geodata_status, geodata_reason
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
                 ON CONFLICT (mimit_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -800,6 +1035,8 @@ def import_stations(conn, df_stations: pd.DataFrame) -> dict[int, int]:
                     latitude = EXCLUDED.latitude,
                     longitude = EXCLUDED.longitude,
                     is_active = TRUE,
+                    geodata_status = EXCLUDED.geodata_status,
+                    geodata_reason = EXCLUDED.geodata_reason,
                     updated_at = NOW()
                 RETURNING id;
                 """,
@@ -813,6 +1050,8 @@ def import_stations(conn, df_stations: pd.DataFrame) -> dict[int, int]:
                     province,
                     latitude,
                     longitude,
+                    str(row["geodata_status"]),
+                    row["geodata_reason"] if pd.notna(row["geodata_reason"]) else None,
                 ),
             )
 
@@ -988,8 +1227,19 @@ def import_local_mimit_files(
         df_stations = load_stations_dataframe()
         if df_stations.empty:
             raise RuntimeError("Anagrafica CSV vuota o non valida")
+        df_stations = assess_station_coordinate_quality(df_stations)
         metrics["stations_csv"] = len(df_stations)
+        metrics["stations_geodata_quarantined"] = int(
+            (
+                (df_stations["geodata_status"] == GEODATA_STATUS_QUARANTINED)
+                & (df_stations["geodata_reason"] != "invalid_coordinate")
+            ).sum()
+        )
         print(f"Stazioni lette dal CSV: {len(df_stations)}")
+        print(
+            "[MIMIT] geodata_quality "
+            f"quarantined_count={metrics['stations_geodata_quarantined']}"
+        )
 
         print("Caricamento prezzi...")
         df_prices = load_prices_dataframe()
@@ -1051,6 +1301,7 @@ def import_local_mimit_files(
             "stations_csv": len(df_stations),
             "prices_csv": len(df_prices),
             "stations_imported": len(station_id_map),
+            "stations_geodata_quarantined": metrics["stations_geodata_quarantined"],
             "prices_imported": imported_prices,
             "max_reported_at_csv": max_reported_at_csv.isoformat() if max_reported_at_csv else None,
             "max_reported_at_imported": max_reported_at_imported.isoformat() if max_reported_at_imported else None,

@@ -34,7 +34,7 @@ from app import (
     guest_subscriptions,
     plus_entitlements,
 )
-from app.import_mimit import update_mimit_data
+from app.import_mimit import ensure_station_geodata_schema, update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
 from app.email_service import email_delivery_is_configured, send_verification_email
 from app.db import DatabasePoolExhausted, close_connection_pool, get_connection
@@ -3478,6 +3478,7 @@ def ensure_auth_schema(conn) -> None:
         ensure_user_locations_schema(conn)
         ensure_price_notification_preferences_schema(conn)
         ensure_mimit_import_schema(conn)
+        ensure_station_geodata_schema(conn)
         ensure_sent_price_notifications_schema(conn)
         ensure_community_price_schema(conn)
 
@@ -3557,6 +3558,7 @@ def find_best_price_for_notification(
                     ) AS distance_km
                 FROM stations s
                 WHERE s.is_active = TRUE
+                  AND s.geodata_status = 'valid'
                   AND s.latitude BETWEEN %s AND %s
                   AND s.longitude BETWEEN %s AND %s
             )
@@ -4823,7 +4825,9 @@ def admin_mimit_diagnostics(
                                 )
                             ) AS distance_km
                         FROM stations s
-                        WHERE s.latitude BETWEEN %s AND %s
+                        WHERE s.is_active = TRUE
+                          AND s.geodata_status = 'valid'
+                          AND s.latitude BETWEEN %s AND %s
                           AND s.longitude BETWEEN %s AND %s
                     ),
                     ranked_prices AS (
@@ -7059,7 +7063,9 @@ def get_nearby_stations(
                                 )
                             ) AS distance_km
                         FROM stations s
-                        WHERE s.latitude BETWEEN %s AND %s
+                        WHERE s.is_active = TRUE
+                          AND s.geodata_status = 'valid'
+                          AND s.latitude BETWEEN %s AND %s
                           AND s.longitude BETWEEN %s AND %s
                     ),
                     ranked_prices AS (

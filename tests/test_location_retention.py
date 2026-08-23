@@ -102,6 +102,8 @@ class LocationRetentionTestCase(unittest.TestCase):
                         latitude DOUBLE PRECISION NOT NULL,
                         longitude DOUBLE PRECISION NOT NULL,
                         is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                        geodata_status TEXT NOT NULL DEFAULT 'unassessed',
+                        geodata_reason TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
@@ -272,10 +274,10 @@ class LocationRetentionTestCase(unittest.TestCase):
                     ) VALUES (%s, %s, 'ios', 'sandbox', TRUE);
                     INSERT INTO stations (
                         mimit_id, name, brand, address, city, province,
-                        latitude, longitude, is_active
+                        latitude, longitude, is_active, geodata_status
                     ) VALUES (
                         1001, 'Station', 'Q8', 'Via Test', 'Anzio', 'RM',
-                        41.4959, 12.6190, TRUE
+                        41.4959, 12.6190, TRUE, 'valid'
                     ) RETURNING id;
                     """,
                     (user_id, user_id, "ab" * 32),
