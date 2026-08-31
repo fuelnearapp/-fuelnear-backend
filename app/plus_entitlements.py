@@ -423,7 +423,6 @@ def reconcile_user_plus_entitlement(
 
 
 def backfill_plus_entitlement_components(conn: Any) -> int:
-    ensure_plus_entitlement_schema(conn)
     with conn.cursor() as cur:
         cur.execute(
             """

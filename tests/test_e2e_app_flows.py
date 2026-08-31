@@ -742,7 +742,7 @@ class FuelNearE2ETestCase(unittest.TestCase):
         self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_subscriptions WHERE status = 'active';"), 1)
         self.assertLessEqual(self.count_active_pool_connections(), 1)
 
-    def test_07c_post_login_http_burst_uses_pool_five_without_deadlock(self):
+    def test_07c_post_login_http_burst_above_pool_capacity_waits_without_failure(self):
         account = self.signup_verified_login("burst@example.com")
         authorization = self.auth_header(account)
         guest = main.create_or_restore_guest_session(
@@ -807,14 +807,25 @@ class FuelNearE2ETestCase(unittest.TestCase):
             )
 
         try:
-            operations = ("login", "claim", "device", "location", "me")
+            operations = (
+                "login",
+                "login",
+                "claim",
+                "claim",
+                "device",
+                "device",
+                "location",
+                "location",
+                "me",
+                "me",
+            )
             with patch.object(
                 main,
                 "ensure_auth_rate_limit_schema",
                 side_effect=AssertionError("rate limit schema initialization reached request path"),
             ) as schema_initializer:
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    for wave in range(12):
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    for wave in range(8):
                         barrier = threading.Barrier(len(operations))
                         futures = [
                             executor.submit(perform_request, operation, wave, barrier)
@@ -857,7 +868,7 @@ class FuelNearE2ETestCase(unittest.TestCase):
                 operation_responses = [
                     response for name, response in responses if name == operation
                 ]
-                self.assertEqual(len(operation_responses), 12)
+                self.assertEqual(len(operation_responses), 16)
                 self.assertTrue(
                     all(response.status_code == expected_status for response in operation_responses)
                 )
@@ -885,7 +896,7 @@ class FuelNearE2ETestCase(unittest.TestCase):
             self.assertEqual(tracking_pool.checked_out, 0)
             self.assertEqual(tracking_pool.max_checked_out, 5)
             print(
-                "[RATE_LIMIT TEST] requests=60 concurrency=5 pool_max=5 "
+                "[RATE_LIMIT TEST] requests=80 concurrency=10 pool_max=5 "
                 f"max_checked_out={tracking_pool.max_checked_out} "
                 f"pool_exhausted={tracking_pool.exhausted_count}"
             )

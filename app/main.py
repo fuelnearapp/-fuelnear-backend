@@ -34,7 +34,7 @@ from app import (
     guest_subscriptions,
     plus_entitlements,
 )
-from app.import_mimit import ensure_station_geodata_schema, update_mimit_data
+from app.import_mimit import ensure_core_schema, ensure_station_geodata_schema, update_mimit_data
 from app.apns_client import APNsConfigurationError, APNsPushClient, apns_is_configured
 from app.email_service import email_delivery_is_configured, send_verification_email
 from app.db import DatabasePoolExhausted, close_connection_pool, get_connection
@@ -736,7 +736,6 @@ def is_user_location_fresh(updated_at: Any, now: datetime | None = None) -> bool
 
 
 def cleanup_expired_user_locations(conn) -> int:
-    ensure_user_locations_schema(conn)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -756,7 +755,6 @@ def cleanup_expired_legacy_notification_locations(
     *,
     user_id: int | None = None,
 ) -> int:
-    ensure_price_notification_preferences_schema(conn)
     user_filter = "AND user_id = %s" if user_id is not None else ""
     params: tuple[Any, ...] = (
         (USER_LOCATION_RETENTION_DAYS, user_id)
@@ -789,7 +787,6 @@ def cleanup_expired_legacy_notification_locations(
 
 
 def clear_legacy_notification_location(conn, user_id: int) -> int:
-    ensure_price_notification_preferences_schema(conn)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -2203,7 +2200,6 @@ def authenticate_with_provider(
     conn = get_connection()
     try:
         with conn:
-            ensure_auth_provider_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if log_prefix:
                     print(f"{log_prefix} user lookup/create started")
@@ -2444,7 +2440,6 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
     conn = get_connection()
     try:
         with conn:
-            apple_auth_service.ensure_apple_auth_schema(conn)
             if pending_apple_revocation and apple_token_ciphertext:
                 apple_auth_service.queue_apple_revocation(
                     conn,
@@ -3933,11 +3928,6 @@ def process_price_notifications_for_run(mimit_run_id: int) -> dict[str, Any]:
     apns_client: APNsPushClient | None = None
     try:
         with conn:
-            ensure_mimit_import_schema(conn)
-            ensure_user_device_tokens_schema(conn)
-            ensure_user_locations_schema(conn)
-            ensure_price_notification_preferences_schema(conn)
-            ensure_sent_price_notifications_schema(conn)
             summary["stale_locations_cleaned_count"] = cleanup_expired_user_locations(conn)
             summary["stale_legacy_locations_cleaned_count"] = (
                 cleanup_expired_legacy_notification_locations(conn)
@@ -4218,6 +4208,7 @@ def on_startup() -> None:
     conn = get_connection()
     try:
         with conn:
+            ensure_core_schema(conn)
             ensure_auth_schema(conn)
     finally:
         conn.close()
@@ -4344,7 +4335,6 @@ def admin_update_mimit(
         lock_acquired = try_acquire_mimit_update_lock(conn)
         if not lock_acquired:
             with conn:
-                ensure_mimit_import_schema(conn)
                 running_run = get_running_mimit_import_run(conn)
             runtime_state = merge_mimit_runtime_state(running_run)
             print(
@@ -4363,7 +4353,6 @@ def admin_update_mimit(
                 "stale": runtime_state["stale"],
             }
 
-        ensure_mimit_import_schema(conn)
         orphaned_runs = fail_orphaned_mimit_import_runs(conn)
         run_id = create_mimit_import_run(conn)
         conn.commit()
@@ -4419,7 +4408,6 @@ def get_mimit_status() -> dict[str, Any]:
     conn = get_connection()
     try:
         with conn:
-            ensure_mimit_import_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -4525,7 +4513,6 @@ def debug_mimit_status(
     conn = get_connection()
     try:
         with conn:
-            ensure_mimit_import_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -4608,7 +4595,6 @@ def admin_mimit_lock_check(
 
     try:
         with conn:
-            ensure_mimit_import_schema(conn)
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s);", (MIMIT_ADVISORY_LOCK_ID,))
                 probe_lock_acquired = bool(cur.fetchone()[0])
@@ -4987,7 +4973,6 @@ def admin_test_push(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_device_tokens_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if explicit_device_token:
                     cur.execute(
@@ -5129,7 +5114,6 @@ def admin_process_price_notifications(
     conn = get_connection()
     try:
         with conn:
-            ensure_mimit_import_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -5740,7 +5724,6 @@ def upsert_current_user_device_token(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_device_tokens_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -5834,7 +5817,6 @@ def deactivate_current_user_device_token(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_device_tokens_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -5901,7 +5883,6 @@ def upsert_current_user_location(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_locations_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -5962,7 +5943,6 @@ def get_current_user_location(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_locations_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
@@ -6016,7 +5996,6 @@ def delete_current_user_location(
     conn = get_connection()
     try:
         with conn:
-            ensure_user_locations_schema(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -6054,7 +6033,6 @@ def get_current_user_notification_preferences(
     conn = get_connection()
     try:
         with conn:
-            ensure_price_notification_preferences_schema(conn)
             cleanup_expired_legacy_notification_locations(conn, user_id=int(user_id))
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -6163,7 +6141,6 @@ def update_current_user_notification_preferences(
     conn = get_connection()
     try:
         with conn:
-            ensure_price_notification_preferences_schema(conn)
             cleanup_expired_legacy_notification_locations(conn, user_id=int(user_id))
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -7146,7 +7123,6 @@ def get_station_community_prices(station_id: int) -> dict[str, Any]:
     conn = get_connection()
     try:
         with conn:
-            ensure_community_price_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT id FROM stations WHERE id = %s LIMIT 1;", (station_id,))
                 if cur.fetchone() is None:
@@ -7229,7 +7205,6 @@ def submit_station_community_price(
     conn = get_connection()
     try:
         with conn:
-            ensure_community_price_schema(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT id FROM stations WHERE id = %s LIMIT 1;", (station_id,))
                 if cur.fetchone() is None:

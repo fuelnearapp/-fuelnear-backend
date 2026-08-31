@@ -1220,9 +1220,6 @@ def import_local_mimit_files(
     metrics = monitoring_metrics if monitoring_metrics is not None else {}
 
     try:
-        print("Verifica/creazione schema database...")
-        ensure_core_schema(conn)
-
         print("Caricamento anagrafica...")
         df_stations = load_stations_dataframe()
         if df_stations.empty:
