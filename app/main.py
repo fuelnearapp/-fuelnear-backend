@@ -13,6 +13,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 import re
+from uuid import UUID
 
 import psycopg2
 import jwt
@@ -22,9 +23,19 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depe
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 
 from app import (
+    admob_telemetry,
     apple_auth_service,
     apple_jws_verifier,
     apple_notification_processor,
@@ -170,6 +181,26 @@ APPLE_NOTIFICATION_MAX_BODY_BYTES = max(
     1024,
     int(os.getenv("APPLE_NOTIFICATION_MAX_BODY_BYTES", str(256 * 1024))),
 )
+ADMOB_TELEMETRY_MAX_BODY_BYTES = max(
+    1024,
+    int(os.getenv("ADMOB_TELEMETRY_MAX_BODY_BYTES", str(16 * 1024))),
+)
+ADMOB_TELEMETRY_IP_RATE_LIMIT = max(
+    1,
+    int(os.getenv("ADMOB_TELEMETRY_IP_RATE_LIMIT", "120")),
+)
+ADMOB_TELEMETRY_SESSION_RATE_LIMIT = max(
+    1,
+    int(os.getenv("ADMOB_TELEMETRY_SESSION_RATE_LIMIT", "60")),
+)
+ADMOB_TELEMETRY_RATE_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("ADMOB_TELEMETRY_RATE_WINDOW_SECONDS", "60")),
+)
+ADMOB_TELEMETRY_RETENTION_DAYS = max(
+    1,
+    int(os.getenv("ADMOB_TELEMETRY_RETENTION_DAYS", "30")),
+)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_IDS = [
     client_id.strip()
@@ -294,6 +325,10 @@ class AppleNotificationRequestGuardMiddleware:
 app.add_middleware(
     AppleNotificationRequestGuardMiddleware,
     max_body_bytes=APPLE_NOTIFICATION_MAX_BODY_BYTES,
+)
+app.add_middleware(
+    admob_telemetry.AdMobTelemetryRequestGuardMiddleware,
+    max_body_bytes=ADMOB_TELEMETRY_MAX_BODY_BYTES,
 )
 
 if REDACTED_ACCESS_LOG_ENABLED:
@@ -639,6 +674,89 @@ class CommunityPriceReportRequest(BaseModel):
     fuel_type: str = Field(min_length=1, max_length=MAX_FUEL_TYPE_LENGTH)
     price: float
     is_self_service: bool
+
+
+class AdMobTelemetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    session_id: UUID
+    event: admob_telemetry.AdMobTelemetryEvent
+    placement: admob_telemetry.AdMobTelemetryPlacement
+    app_version: str = Field(min_length=1, max_length=64)
+    build_number: str = Field(min_length=1, max_length=64)
+    ios_version: str = Field(min_length=1, max_length=64)
+    network_type: admob_telemetry.AdMobTelemetryNetworkType
+    ump_can_request_ads: StrictBool | None = None
+    ump_status: StrictStr | StrictInt | None = None
+    att_status: str | None = Field(default=None, max_length=32)
+    error_domain: str | None = Field(default=None, max_length=128)
+    error_code: StrictInt | None = Field(
+        default=None,
+        ge=-2147483648,
+        le=2147483647,
+    )
+    response_id_present: StrictBool | None = None
+    latency_ms: StrictInt | None = Field(default=None, ge=0, le=300000)
+    reason: str | None = Field(default=None, max_length=256)
+    timestamp_client: datetime | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: UUID) -> UUID:
+        if value.int == 0:
+            raise ValueError("session_id must not be nil")
+        return value
+
+    @field_validator("app_version", "build_number", "ios_version")
+    @classmethod
+    def validate_required_technical_string(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be empty")
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError("value contains unsupported characters")
+        return normalized
+
+    @field_validator("ump_status", mode="before")
+    @classmethod
+    def validate_ump_status(cls, value: Any) -> str | int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("ump_status must be a string or integer")
+        if isinstance(value, int):
+            if value < -2147483648 or value > 2147483647:
+                raise ValueError("ump_status integer is out of range")
+            return value
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 64:
+            raise ValueError("ump_status is too long")
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError("ump_status contains unsupported characters")
+        return normalized
+
+    @field_validator("att_status", "error_domain", "reason")
+    @classmethod
+    def validate_optional_technical_string(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError("value contains unsupported characters")
+        return normalized
+
+    @field_validator("timestamp_client")
+    @classmethod
+    def validate_timestamp_client(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError("timestamp_client must include a timezone")
+        return value
 
 
 SUPPORTED_COMMUNITY_FUEL_TYPES = {
@@ -1000,6 +1118,16 @@ def rate_limit_apple_subscription_ip(request: Request) -> None:
         discriminator="apple-subscription",
         limit=APPLE_SUBSCRIPTION_IP_RATE_LIMIT,
         window_seconds=APPLE_SUBSCRIPTION_IP_RATE_WINDOW_SECONDS,
+    )
+
+
+def rate_limit_admob_telemetry_ip(request: Request) -> None:
+    enforce_ip_rate_limit(
+        request,
+        endpoint="/telemetry/admob/ip",
+        discriminator="admob-telemetry",
+        limit=ADMOB_TELEMETRY_IP_RATE_LIMIT,
+        window_seconds=ADMOB_TELEMETRY_RATE_WINDOW_SECONDS,
     )
 
 
@@ -3476,6 +3604,7 @@ def ensure_auth_schema(conn) -> None:
         ensure_station_geodata_schema(conn)
         ensure_sent_price_notifications_schema(conn)
         ensure_community_price_schema(conn)
+        admob_telemetry.ensure_admob_telemetry_schema(conn)
 
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
@@ -4274,6 +4403,60 @@ def readiness_check() -> dict[str, str]:
             conn.close()
 
 
+@app.post(
+    admob_telemetry.TELEMETRY_PATH,
+    status_code=202,
+    dependencies=[Depends(rate_limit_admob_telemetry_ip)],
+)
+def record_admob_telemetry(payload: AdMobTelemetryRequest) -> dict[str, str]:
+    check_auth_rate_limit(
+        "/telemetry/admob/session",
+        build_rate_limit_bucket("admob-session", str(payload.session_id)),
+        limit=ADMOB_TELEMETRY_SESSION_RATE_LIMIT,
+        window_seconds=ADMOB_TELEMETRY_RATE_WINDOW_SECONDS,
+    )
+
+    record = admob_telemetry.AdMobTelemetryRecord(
+        session_id=payload.session_id,
+        event=payload.event,
+        placement=payload.placement,
+        app_version=payload.app_version,
+        build_number=payload.build_number,
+        ios_version=payload.ios_version,
+        network_type=payload.network_type,
+        ump_can_request_ads=payload.ump_can_request_ads,
+        ump_status=(str(payload.ump_status) if payload.ump_status is not None else None),
+        att_status=payload.att_status,
+        error_domain=payload.error_domain,
+        error_code=payload.error_code,
+        response_id_present=payload.response_id_present,
+        latency_ms=payload.latency_ms,
+        reason=payload.reason,
+        timestamp_client=payload.timestamp_client,
+    )
+
+    conn = get_connection()
+    try:
+        with conn:
+            admob_telemetry.insert_admob_telemetry_event(
+                conn,
+                record,
+                retention_days=ADMOB_TELEMETRY_RETENTION_DAYS,
+            )
+        return {"status": "accepted"}
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        log_internal_exception("admob_telemetry_ingest", exc)
+        raise APIError(
+            503,
+            "TELEMETRY_UNAVAILABLE",
+            "Telemetry temporarily unavailable",
+        )
+    finally:
+        conn.close()
+
+
 def run_mimit_update_background(conn, run_id: int) -> None:
     started_at = time.monotonic()
     try:
@@ -4901,6 +5084,69 @@ def admin_mimit_diagnostics(
         }
     except Exception as exc:
         raise safe_internal_http_error("mimit_diagnostics", exc, "MIMIT diagnostics failed")
+    finally:
+        conn.close()
+
+
+@app.get("/admin/telemetry/admob/summary")
+def admin_admob_telemetry_summary(
+    days: int = Query(default=7, ge=1, le=90),
+    _: None = Depends(require_admin_debug_token),
+) -> dict[str, Any]:
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    conn = get_connection()
+    try:
+        with conn:
+            summary = admob_telemetry.get_admob_telemetry_summary(
+                conn,
+                since=since,
+            )
+        return {
+            "status": "ok",
+            "window_days": days,
+            "summary": summary,
+        }
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error(
+            "admob_telemetry_summary",
+            exc,
+            "AdMob telemetry summary failed",
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/admin/telemetry/admob/sessions")
+def admin_recent_admob_telemetry_sessions(
+    days: int = Query(default=7, ge=1, le=30),
+    limit: int = Query(default=20, ge=1, le=50),
+    _: None = Depends(require_admin_debug_token),
+) -> dict[str, Any]:
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    conn = get_connection()
+    try:
+        with conn:
+            sessions = admob_telemetry.get_recent_admob_telemetry_sessions(
+                conn,
+                since=since,
+                limit=limit,
+            )
+        return {
+            "status": "ok",
+            "window_days": days,
+            "count": len(sessions),
+            "sessions": sessions,
+        }
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error(
+            "admob_telemetry_sessions",
+            exc,
+            "AdMob telemetry sessions failed",
+        )
     finally:
         conn.close()
 
