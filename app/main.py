@@ -42,6 +42,7 @@ from app import (
     apple_notification_verifier,
     apple_purchase_processor,
     apple_subscriptions,
+    creator_attribution,
     guest_subscriptions,
     plus_entitlements,
 )
@@ -3647,6 +3648,7 @@ def ensure_auth_schema(conn) -> None:
         ensure_sent_price_notifications_schema(conn)
         ensure_community_price_schema(conn)
         admob_telemetry.ensure_admob_telemetry_schema(conn)
+        creator_attribution.ensure_creator_attribution_schema(conn)
 
 def serialize_datetime_fields(items: list[dict[str, Any]], fields: list[str]) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
