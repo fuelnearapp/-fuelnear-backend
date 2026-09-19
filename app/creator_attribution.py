@@ -198,6 +198,86 @@ def ensure_creator_attribution_schema(conn: Any) -> None:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creator_conversion_events (
+                id BIGSERIAL PRIMARY KEY,
+                attribution_id BIGINT NOT NULL
+                    REFERENCES creator_attributions(id) ON DELETE RESTRICT,
+                conversion_type TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                external_event_key TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                product_id TEXT NULL,
+                economic_status TEXT NOT NULL,
+                amount NUMERIC(18,6) NULL,
+                currency TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT creator_conversion_events_type_check
+                    CHECK (conversion_type IN ('plus_granted', 'purchase', 'renewal')),
+                CONSTRAINT creator_conversion_events_provider_check
+                    CHECK (
+                        provider IN (
+                            'apple',
+                            'internal_referral',
+                            'internal_promo',
+                            'google_play'
+                        )
+                    ),
+                CONSTRAINT creator_conversion_events_external_key_check
+                    CHECK (
+                        external_event_key = BTRIM(external_event_key)
+                        AND CHAR_LENGTH(external_event_key) BETWEEN 1 AND 255
+                    ),
+                CONSTRAINT creator_conversion_events_product_id_check
+                    CHECK (
+                        product_id IS NULL
+                        OR (
+                            product_id = BTRIM(product_id)
+                            AND CHAR_LENGTH(product_id) BETWEEN 1 AND 255
+                        )
+                    ),
+                CONSTRAINT creator_conversion_events_economic_status_check
+                    CHECK (
+                        economic_status IN (
+                            'non_economic',
+                            'verified_unknown_value',
+                            'confirmed',
+                            'refunded',
+                            'revoked'
+                        )
+                    ),
+                CONSTRAINT creator_conversion_events_amount_currency_check
+                    CHECK (
+                        (amount IS NULL AND currency IS NULL)
+                        OR (
+                            amount IS NOT NULL
+                            AND amount <> 'NaN'::numeric
+                            AND amount >= 0
+                            AND currency IS NOT NULL
+                            AND currency ~ '^[A-Z]{3}$'
+                        )
+                    ),
+                CONSTRAINT creator_conversion_events_economic_value_check
+                    CHECK (
+                        (economic_status = 'non_economic'
+                            AND amount IS NULL
+                            AND currency IS NULL)
+                        OR (economic_status = 'verified_unknown_value'
+                            AND amount IS NULL
+                            AND currency IS NULL)
+                        OR (economic_status = 'confirmed'
+                            AND amount IS NOT NULL
+                            AND amount > 0
+                            AND currency IS NOT NULL)
+                        OR economic_status IN ('refunded', 'revoked')
+                    ),
+                CONSTRAINT ux_creator_conversion_events_provider_external_key
+                    UNIQUE (provider, external_event_key)
+            );
+            """
+        )
 
         cur.execute(
             """
@@ -236,6 +316,18 @@ def ensure_creator_attribution_schema(conn: Any) -> None:
             ON creator_attributions(qualified_at);
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creator_conversion_events_attribution_occurred
+            ON creator_conversion_events(attribution_id, occurred_at);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_creator_conversion_events_occurred_at
+            ON creator_conversion_events(occurred_at);
+            """
+        )
 
         cur.execute(
             """
@@ -270,6 +362,53 @@ def ensure_creator_attribution_schema(conn: Any) -> None:
                     ON creator_attributions
                     FOR EACH ROW
                     EXECUTE FUNCTION enforce_creator_attribution_snapshot_immutability();
+                END IF;
+            END
+            $$;
+            """
+        )
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION enforce_creator_conversion_event_identity_immutability()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                IF NEW.attribution_id IS DISTINCT FROM OLD.attribution_id
+                   OR NEW.conversion_type IS DISTINCT FROM OLD.conversion_type
+                   OR NEW.provider IS DISTINCT FROM OLD.provider
+                   OR NEW.external_event_key IS DISTINCT FROM OLD.external_event_key
+                   OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+                   OR NEW.product_id IS DISTINCT FROM OLD.product_id THEN
+                    RAISE EXCEPTION 'Creator conversion event identity fields are immutable'
+                        USING ERRCODE = '23514';
+                END IF;
+
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            """
+        )
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgrelid = 'creator_conversion_events'::regclass
+                      AND tgname = 'creator_conversion_events_identity_immutable'
+                      AND NOT tgisinternal
+                ) THEN
+                    CREATE TRIGGER creator_conversion_events_identity_immutable
+                    BEFORE UPDATE OF
+                        attribution_id,
+                        conversion_type,
+                        provider,
+                        external_event_key,
+                        occurred_at,
+                        product_id
+                    ON creator_conversion_events
+                    FOR EACH ROW
+                    EXECUTE FUNCTION enforce_creator_conversion_event_identity_immutability();
                 END IF;
             END
             $$;
