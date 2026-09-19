@@ -437,6 +437,8 @@ def safe_internal_http_error(area: str, exc: BaseException, client_message: str)
 
 AUTH_VALIDATION_PATHS = {
     "/auth/register",
+    "/auth/google",
+    "/auth/apple",
     "/auth/login",
     "/auth/verify-email",
     "/auth/resend-verification-email",
@@ -458,12 +460,18 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
         for error in exc.errors()
         if error.get("loc")
     }
+    if path in {"/auth/google", "/auth/apple"} and "invite_code" not in invalid_fields:
+        return await request_validation_exception_handler(request, exc)
+
     if "email" in invalid_fields:
         error_code = "INVALID_EMAIL"
         message = "Invalid email address"
     elif path == "/auth/verify-email":
         error_code = "VERIFICATION_CODE_INVALID"
         message = "Invalid verification code or token"
+    elif "invite_code" in invalid_fields:
+        error_code = "INVITE_CODE_INVALID"
+        message = "Invalid invite code"
     elif path == "/user/referral-code" or "referral_code" in invalid_fields:
         error_code = "REFERRAL_CODE_INVALID"
         message = "Invalid referral code"
@@ -496,6 +504,7 @@ class RegisterRequest(BaseModel):
     password: str
     display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
     referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    invite_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
     device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
 
@@ -535,6 +544,7 @@ class AppleAuthRequest(BaseModel):
     hashed_nonce: str | None = Field(default=None, max_length=128)
     hashedNonce: str | None = Field(default=None, max_length=128)
     referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    invite_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
     device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
     @field_validator("full_name", "fullName")
@@ -549,6 +559,7 @@ class GoogleAuthRequest(BaseModel):
     id_token: str = Field(min_length=1, max_length=MAX_SOCIAL_ID_TOKEN_LENGTH)
     display_name: str | None = Field(default=None, max_length=MAX_DISPLAY_NAME_LENGTH)
     referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+    invite_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
     device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
 
@@ -2284,6 +2295,82 @@ def normalize_referral_code_input(referral_code: str | None) -> str | None:
     return normalized
 
 
+def classify_registration_invite(
+    referral_code: str | None,
+    invite_code: str | None,
+) -> tuple[str | None, str | None]:
+    legacy_code_present = bool(referral_code and referral_code.strip())
+    invite_code_present = bool(invite_code and invite_code.strip())
+    if legacy_code_present and invite_code_present:
+        raise APIError(
+            400,
+            "INVITE_CODE_AMBIGUOUS",
+            "Provide either referral_code or invite_code, not both",
+        )
+
+    if legacy_code_present:
+        return normalize_referral_code_input(referral_code), None
+    if not invite_code_present:
+        return None, None
+
+    normalized_invite_code = invite_code.strip().upper()
+    if is_valid_personal_referral_code(normalized_invite_code):
+        return normalized_invite_code, None
+
+    try:
+        return None, creator_attribution.normalize_creator_code(normalized_invite_code)
+    except creator_attribution.CreatorCodeFormatInvalidError:
+        raise APIError(400, "INVITE_CODE_INVALID", "Invalid invite code")
+
+
+def apply_registration_creator_attribution(
+    conn: Any,
+    user_id: int,
+    creator_code: str,
+    source: str,
+    *,
+    mark_verified: bool = False,
+) -> creator_attribution.CreatorAttributionResult:
+    try:
+        result = creator_attribution.apply_creator_attribution(
+            conn,
+            user_id,
+            creator_code,
+            source,
+        )
+    except creator_attribution.CreatorCodeFormatInvalidError:
+        raise APIError(400, "INVITE_CODE_INVALID", "Invalid invite code")
+    except creator_attribution.CreatorCodeNotFoundError:
+        raise APIError(400, "CREATOR_CODE_NOT_FOUND", "Creator code was not found")
+    except (
+        creator_attribution.CreatorCampaignNotActiveError,
+        creator_attribution.CreatorNotActiveError,
+        creator_attribution.CreatorCampaignNotStartedError,
+        creator_attribution.CreatorCampaignEndedError,
+    ):
+        raise APIError(400, "CREATOR_CODE_UNAVAILABLE", "Creator code is not available")
+    except creator_attribution.CreatorAttributionAlreadySetError:
+        raise APIError(
+            409,
+            "CREATOR_ATTRIBUTION_ALREADY_SET",
+            "Creator attribution is already set",
+        )
+
+    if mark_verified:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE creator_attributions
+                SET verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+                """,
+                (result.attribution_id,),
+            )
+
+    return result
+
+
 def resolve_active_referrer_id(cur, referral_code: str) -> int:
     cur.execute(
         "SELECT id FROM users WHERE referral_code = %s AND is_active = TRUE LIMIT 1;",
@@ -2320,6 +2407,7 @@ def authenticate_with_provider(
     display_name: str | None,
     device_info: str | None,
     referral_code: str | None = None,
+    invite_code: str | None = None,
     log_prefix: str | None = None,
     provider_token_ciphertext: str | None = None,
 ) -> dict[str, Any]:
@@ -2328,7 +2416,10 @@ def authenticate_with_provider(
     email = provider_claims.get("email")
     email_verified = bool(provider_claims.get("email_verified"))
     provider_display_name = sanitize_display_name(display_name) or sanitize_display_name(provider_claims.get("display_name"))
-    referral_code_input = normalize_referral_code_input(referral_code)
+    referral_code_input, creator_code_input = classify_registration_invite(
+        referral_code,
+        invite_code,
+    )
     linked_by_provider = False
     linked_by_verified_email = False
 
@@ -2342,6 +2433,7 @@ def authenticate_with_provider(
                     print(f"{log_prefix} email_claim_present={bool(email)}")
                     print(f"{log_prefix} email_verified={email_verified}")
                     print(f"{log_prefix} referral_code present={bool(referral_code_input)}")
+                    print(f"{log_prefix} creator_code present={bool(creator_code_input)}")
                 cur.execute(
                     """
                     SELECT user_id
@@ -2424,6 +2516,14 @@ def authenticate_with_provider(
                         if referral_code_input and referrer_user_id is not None:
                             create_pending_referral(cur, referrer_user_id, user_row["id"], referral_code_input)
                             referral_applied = True
+                        if creator_code_input:
+                            apply_registration_creator_attribution(
+                                conn,
+                                user_row["id"],
+                                creator_code_input,
+                                f"{provider}_registration",
+                                mark_verified=email_verified,
+                            )
                     else:
                         cur.execute(
                             """
@@ -5504,8 +5604,12 @@ def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
 
     email = normalize_email(str(payload.email))
     display_name = sanitize_display_name(payload.display_name) or default_display_name_from_email(email)
-    referral_code_input = normalize_referral_code_input(payload.referral_code)
+    referral_code_input, creator_code_input = classify_registration_invite(
+        payload.referral_code,
+        payload.invite_code,
+    )
     print(f"[AUTH][REGISTER] referral_present={str(referral_code_input is not None).lower()}")
+    print(f"[AUTH][REGISTER] creator_code_present={str(creator_code_input is not None).lower()}")
 
     conn = None
     try:
@@ -5564,6 +5668,14 @@ def register_user(payload: RegisterRequest, request: Request) -> dict[str, Any]:
                             user_row["id"],
                             referral_code_input,
                         ),
+                    )
+
+                if creator_code_input:
+                    apply_registration_creator_attribution(
+                        conn,
+                        user_row["id"],
+                        creator_code_input,
+                        "email_registration",
                     )
 
                 verification_token = create_email_verification_token(conn, user_row["id"])
@@ -5902,6 +6014,7 @@ def apple_login(payload: AppleAuthRequest) -> dict[str, Any]:
         display_name=display_name,
         device_info=payload.device_info,
         referral_code=payload.referral_code,
+        invite_code=payload.invite_code,
         log_prefix="[AUTH][APPLE]",
         provider_token_ciphertext=provider_token_ciphertext,
     )
@@ -5924,6 +6037,7 @@ def google_login(payload: GoogleAuthRequest) -> dict[str, Any]:
             display_name=payload.display_name,
             device_info=payload.device_info,
             referral_code=payload.referral_code,
+            invite_code=payload.invite_code,
             log_prefix="[AUTH][GOOGLE]",
         )
     except HTTPException:
