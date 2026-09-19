@@ -180,6 +180,11 @@ CREATOR_ATTRIBUTION_CODE_RATE_LIMIT = max(
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
+CREATOR_ATTRIBUTION_QUALIFICATION_DAYS = 7
+CREATOR_ATTRIBUTION_PROCESS_BATCH_SIZE = max(
+    1,
+    int(os.getenv("CREATOR_ATTRIBUTION_PROCESS_BATCH_SIZE", "100")),
+)
 READINESS_DB_TIMEOUT_MS = max(100, int(os.getenv("READINESS_DB_TIMEOUT_MS", "1000")))
 ACCESS_LOG_MODE = os.getenv("FUELNEAR_ACCESS_LOG_MODE", "redacted").strip().lower()
 REDACTED_ACCESS_LOG_ENABLED = ACCESS_LOG_MODE in {"redacted", "safe", "production", "1", "true", "yes"}
@@ -1796,6 +1801,175 @@ def process_pending_referrals(conn, min_age_days: int = 7, reward_days: int = 7)
         "skipped_referrer_not_verified": skipped_referrer_not_verified,
         "skipped_monthly_limit": skipped_monthly_limit,
         "items": processed,
+    }
+
+
+def process_creator_attribution_milestones(
+    conn,
+    *,
+    qualification_days: int = CREATOR_ATTRIBUTION_QUALIFICATION_DAYS,
+) -> dict[str, int]:
+    if qualification_days <= 0:
+        raise ValueError("qualification_days must be greater than zero")
+
+    started_at = time.monotonic()
+    scanned_count = 0
+    processed_count = 0
+    verified_count = 0
+    qualified_count = 0
+    skipped_count = 0
+    failed_count = 0
+    batch_count = 0
+    last_attribution_id = 0
+
+    try:
+        while True:
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            attribution.id,
+                            attribution.verified_at,
+                            attribution.qualified_at
+                        FROM creator_attributions AS attribution
+                        INNER JOIN users AS attributed_user
+                            ON attributed_user.id = attribution.user_id
+                        WHERE attribution.id > %s
+                          AND attribution.status = 'active'
+                          AND attribution.user_id IS NOT NULL
+                          AND attribution.user_deleted = FALSE
+                          AND (
+                              (
+                                  attribution.verified_at IS NULL
+                                  AND attributed_user.is_email_verified = TRUE
+                              )
+                              OR (
+                                  attribution.qualified_at IS NULL
+                                  AND attributed_user.is_active = TRUE
+                                  AND attributed_user.is_email_verified = TRUE
+                                  AND CURRENT_TIMESTAMP >= attribution.attributed_at
+                                      + (%s * INTERVAL '1 day')
+                              )
+                          )
+                        ORDER BY attribution.id ASC
+                        LIMIT %s
+                        FOR UPDATE OF attribution SKIP LOCKED;
+                        """,
+                        (
+                            last_attribution_id,
+                            qualification_days,
+                            CREATOR_ATTRIBUTION_PROCESS_BATCH_SIZE,
+                        ),
+                    )
+                    batch = cur.fetchall()
+
+                if not batch:
+                    break
+
+                batch_count += 1
+                scanned_count += len(batch)
+                for attribution in batch:
+                    with conn.cursor(cursor_factory=RealDictCursor) as item_cur:
+                        item_cur.execute("SAVEPOINT creator_attribution_item")
+                        try:
+                            item_cur.execute(
+                                """
+                                UPDATE creator_attributions AS attribution
+                                SET verified_at = CASE
+                                        WHEN attribution.verified_at IS NULL
+                                             AND attributed_user.is_email_verified = TRUE
+                                        THEN CURRENT_TIMESTAMP
+                                        ELSE attribution.verified_at
+                                    END,
+                                    qualified_at = CASE
+                                        WHEN attribution.qualified_at IS NULL
+                                             AND attributed_user.is_active = TRUE
+                                             AND attributed_user.is_email_verified = TRUE
+                                             AND CURRENT_TIMESTAMP >= attribution.attributed_at
+                                                 + (%s * INTERVAL '1 day')
+                                        THEN CURRENT_TIMESTAMP
+                                        ELSE attribution.qualified_at
+                                    END,
+                                    updated_at = CASE
+                                        WHEN (
+                                            attribution.verified_at IS NULL
+                                            AND attributed_user.is_email_verified = TRUE
+                                        ) OR (
+                                            attribution.qualified_at IS NULL
+                                            AND attributed_user.is_active = TRUE
+                                            AND attributed_user.is_email_verified = TRUE
+                                            AND CURRENT_TIMESTAMP >= attribution.attributed_at
+                                                + (%s * INTERVAL '1 day')
+                                        )
+                                        THEN CURRENT_TIMESTAMP
+                                        ELSE attribution.updated_at
+                                    END
+                                FROM users AS attributed_user
+                                WHERE attribution.id = %s
+                                  AND attributed_user.id = attribution.user_id
+                                  AND attribution.status = 'active'
+                                  AND attribution.user_id IS NOT NULL
+                                  AND attribution.user_deleted = FALSE
+                                RETURNING attribution.verified_at, attribution.qualified_at;
+                                """,
+                                (
+                                    qualification_days,
+                                    qualification_days,
+                                    attribution["id"],
+                                ),
+                            )
+                            updated = item_cur.fetchone()
+                        except Exception as exc:
+                            item_cur.execute("ROLLBACK TO SAVEPOINT creator_attribution_item")
+                            item_cur.execute("RELEASE SAVEPOINT creator_attribution_item")
+                            failed_count += 1
+                            print(
+                                "[CREATOR_ATTRIBUTION] milestone item failed "
+                                f"type={exc.__class__.__name__}"
+                            )
+                            continue
+
+                        item_cur.execute("RELEASE SAVEPOINT creator_attribution_item")
+
+                    if updated is None:
+                        skipped_count += 1
+                        continue
+
+                    processed_count += 1
+                    verified_changed = (
+                        attribution["verified_at"] is None
+                        and updated["verified_at"] is not None
+                    )
+                    qualified_changed = (
+                        attribution["qualified_at"] is None
+                        and updated["qualified_at"] is not None
+                    )
+                    verified_count += int(verified_changed)
+                    qualified_count += int(qualified_changed)
+                    if not verified_changed and not qualified_changed:
+                        skipped_count += 1
+
+            last_attribution_id = int(batch[-1]["id"])
+    finally:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        print(
+            "[CREATOR_ATTRIBUTION] milestone processing complete "
+            f"scanned_count={scanned_count} processed_count={processed_count} "
+            f"verified_count={verified_count} qualified_count={qualified_count} "
+            f"skipped_count={skipped_count} failed_count={failed_count} "
+            f"batch_count={batch_count} duration_ms={duration_ms}"
+        )
+
+    return {
+        "scanned_count": scanned_count,
+        "processed_count": processed_count,
+        "verified_count": verified_count,
+        "qualified_count": qualified_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "batch_count": batch_count,
+        "duration_ms": duration_ms,
     }
 
 
@@ -5357,6 +5531,39 @@ def admin_process_referrals(_: None = Depends(require_referral_admin_token)) -> 
             f"pgcode={pgcode} table={table} constraint={constraint}"
         )
         raise HTTPException(status_code=500, detail="Referral processing failed")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.post("/admin/process-creator-attributions")
+def admin_process_creator_attributions(
+    _: None = Depends(require_referral_admin_token),
+) -> dict[str, Any]:
+    conn = None
+    try:
+        conn = get_connection()
+        result = process_creator_attribution_milestones(conn)
+        return {
+            "status": "ok",
+            "message": "Creator attribution processing completed",
+            "result": result,
+        }
+    except ValueError as exc:
+        print(
+            "[CREATOR_ATTRIBUTION] milestone processing rejected "
+            f"type={exc.__class__.__name__}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid creator attribution processing request",
+        )
+    except Exception as exc:
+        request_id = log_internal_exception("creator_attribution_processing", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Creator attribution processing failed. request_id={request_id}",
+        )
     finally:
         if conn is not None:
             conn.close()
