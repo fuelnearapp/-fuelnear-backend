@@ -173,6 +173,10 @@ COMMUNITY_PRICE_STATION_RATE_LIMIT = max(
 DEVICE_TOKEN_RATE_LIMIT = max(1, int(os.getenv("DEVICE_TOKEN_RATE_LIMIT", "30")))
 USER_LOCATION_RATE_LIMIT = max(1, int(os.getenv("USER_LOCATION_RATE_LIMIT", "120")))
 REFERRAL_CODE_RATE_LIMIT = max(1, int(os.getenv("REFERRAL_CODE_RATE_LIMIT", "10")))
+CREATOR_ATTRIBUTION_CODE_RATE_LIMIT = max(
+    1,
+    int(os.getenv("CREATOR_ATTRIBUTION_CODE_RATE_LIMIT", "10")),
+)
 AUTH_RATE_LIMIT_RETENTION_HOURS = max(1, int(os.getenv("AUTH_RATE_LIMIT_RETENTION_HOURS", "48")))
 REFERRAL_MONTHLY_REWARD_LIMIT = max(1, int(os.getenv("REFERRAL_MONTHLY_REWARD_LIMIT", "10")))
 REFERRAL_PROCESS_BATCH_SIZE = max(1, int(os.getenv("REFERRAL_PROCESS_BATCH_SIZE", "100")))
@@ -443,6 +447,7 @@ AUTH_VALIDATION_PATHS = {
     "/auth/verify-email",
     "/auth/resend-verification-email",
     "/user/referral-code",
+    "/user/attribution-code",
     "/user/subscription/apple/verify",
     "/guest/subscription/apple/verify",
     "/user/subscription/claim-guest",
@@ -472,6 +477,9 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
     elif "invite_code" in invalid_fields:
         error_code = "INVITE_CODE_INVALID"
         message = "Invalid invite code"
+    elif path == "/user/attribution-code" and "code" in invalid_fields:
+        error_code = "CREATOR_CODE_INVALID"
+        message = "Invalid creator code"
     elif path == "/user/referral-code" or "referral_code" in invalid_fields:
         error_code = "REFERRAL_CODE_INVALID"
         message = "Invalid referral code"
@@ -633,6 +641,10 @@ class AppleNotificationResponse(BaseModel):
 
 class ApplyReferralCodeRequest(BaseModel):
     referral_code: str | None = Field(default=None, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+
+
+class ApplyCreatorAttributionCodeRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
 
 
 class DeviceTokenRequest(BaseModel):
@@ -2355,8 +2367,14 @@ def apply_registration_creator_attribution(
             "CREATOR_ATTRIBUTION_ALREADY_SET",
             "Creator attribution is already set",
         )
+    except creator_attribution.CreatorAttributionWindowExpiredError:
+        raise APIError(
+            400,
+            "CREATOR_ATTRIBUTION_WINDOW_EXPIRED",
+            "The creator attribution window has expired",
+        )
 
-    if mark_verified:
+    if mark_verified and result.created:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -6740,6 +6758,73 @@ def apply_current_user_referral_code(
             f"pgcode={pgcode} table={table} constraint={constraint}"
         )
         raise APIError(500, "SERVER_ERROR", "Referral code apply failed")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.post("/user/attribution-code")
+def apply_current_user_creator_attribution_code(
+    payload: ApplyCreatorAttributionCodeRequest,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> dict[str, Any]:
+    print("[CREATOR_ATTRIBUTION] apply code endpoint reached")
+    user_payload = get_current_user_from_token(authorization)
+    user_id = int(user_payload["id"])
+    enforce_owner_rate_limit(
+        "/user/attribution-code",
+        "user",
+        user_id,
+        limit=CREATOR_ATTRIBUTION_CODE_RATE_LIMIT,
+        window_seconds=60 * 60,
+    )
+    try:
+        creator_code = creator_attribution.normalize_creator_code(payload.code)
+    except creator_attribution.CreatorCodeFormatInvalidError:
+        raise APIError(400, "CREATOR_CODE_INVALID", "Invalid creator code")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            result = apply_registration_creator_attribution(
+                conn,
+                user_id,
+                creator_code,
+                "post_registration",
+                mark_verified=bool(user_payload["is_email_verified"]),
+            )
+
+        print(
+            "[CREATOR_ATTRIBUTION] attribution_applied=true "
+            f"created={str(result.created).lower()} "
+            f"idempotent={str(result.idempotent).lower()}"
+        )
+        return {
+            "status": "ok",
+            "code_used": result.code_used,
+            "attributed_at": result.attributed_at.isoformat(),
+            "created": result.created,
+            "idempotent": result.idempotent,
+        }
+    except HTTPException:
+        raise
+    except ValueError:
+        raise APIError(
+            400,
+            "CREATOR_ATTRIBUTION_WINDOW_INVALID",
+            "The creator attribution window is invalid",
+        )
+    except Exception as exc:
+        pgcode = getattr(exc, "pgcode", None)
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        table = getattr(getattr(exc, "diag", None), "table_name", None)
+        print(
+            "[CREATOR_ATTRIBUTION] apply code failed "
+            f"type={exc.__class__.__name__} pgcode={pgcode} "
+            f"table={table} constraint={constraint}"
+        )
+        raise APIError(500, "SERVER_ERROR", "Creator code apply failed")
     finally:
         if conn is not None:
             conn.close()
