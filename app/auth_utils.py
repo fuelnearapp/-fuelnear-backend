@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import string
 from typing import Final
@@ -17,6 +18,8 @@ PASSWORD_MAX_LENGTH: Final[int] = max(PASSWORD_MIN_LENGTH, int(os.getenv("PASSWO
 SALT_BYTES: Final[int] = 16
 REFERRAL_CODE_LENGTH: Final[int] = 8
 REFERRAL_ALPHABET: Final[str] = string.ascii_uppercase + string.digits
+PERSONAL_REFERRAL_CODE_PATTERN: Final[str] = r"^[A-Z0-9]{8}$"
+_PERSONAL_REFERRAL_CODE_RE: Final[re.Pattern[str]] = re.compile(PERSONAL_REFERRAL_CODE_PATTERN)
 ACCESS_TOKEN_BYTES: Final[int] = 32
 REFRESH_TOKEN_BYTES: Final[int] = 48
 
@@ -106,8 +109,9 @@ def generate_refresh_token() -> str:
     return secrets.token_urlsafe(REFRESH_TOKEN_BYTES)
 
 
-def generate_referral_code(length: int = REFERRAL_CODE_LENGTH) -> str:
-    if length < 6:
-        raise ValueError("Referral code length must be at least 6")
+def is_valid_personal_referral_code(referral_code: str) -> bool:
+    return _PERSONAL_REFERRAL_CODE_RE.fullmatch(referral_code) is not None
 
-    return "".join(secrets.choice(REFERRAL_ALPHABET) for _ in range(length))
+
+def generate_referral_code() -> str:
+    return "".join(secrets.choice(REFERRAL_ALPHABET) for _ in range(REFERRAL_CODE_LENGTH))

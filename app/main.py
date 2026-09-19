@@ -54,8 +54,10 @@ from app.auth_utils import (
     generate_refresh_token,
     generate_referral_code,
     hash_password,
+    is_valid_personal_referral_code,
     PASSWORD_MAX_LENGTH,
     PASSWORD_MIN_LENGTH,
+    PERSONAL_REFERRAL_CODE_PATTERN,
     password_hash_is_legacy,
     validate_password_length,
     verify_password,
@@ -2274,7 +2276,11 @@ def normalize_referral_code_input(referral_code: str | None) -> str | None:
         return None
 
     normalized = referral_code.strip().upper()
-    return normalized or None
+    if not normalized:
+        return None
+    if not is_valid_personal_referral_code(normalized):
+        raise APIError(400, "REFERRAL_CODE_INVALID", "Invalid referral code")
+    return normalized
 
 
 def resolve_active_referrer_id(cur, referral_code: str) -> int:
@@ -3202,6 +3208,42 @@ def ensure_auth_schema(conn) -> None:
             );
             """
         )
+        cur.execute(
+            """
+            SELECT convalidated
+            FROM pg_constraint
+            WHERE conrelid = 'users'::regclass
+              AND conname = 'users_referral_code_format_check';
+            """
+        )
+        referral_code_constraint = cur.fetchone()
+        if referral_code_constraint is None or not referral_code_constraint[0]:
+            cur.execute(
+                "SELECT COUNT(*) FROM users WHERE referral_code !~ %s;",
+                (PERSONAL_REFERRAL_CODE_PATTERN,),
+            )
+            invalid_referral_code_count = int(cur.fetchone()[0])
+            if invalid_referral_code_count:
+                raise RuntimeError(
+                    "Cannot enforce personal referral code format constraint: "
+                    f"invalid_count={invalid_referral_code_count}"
+                )
+
+            if referral_code_constraint is None:
+                cur.execute(
+                    """
+                    ALTER TABLE users
+                    ADD CONSTRAINT users_referral_code_format_check
+                    CHECK (referral_code ~ %s) NOT VALID;
+                    """,
+                    (PERSONAL_REFERRAL_CODE_PATTERN,),
+                )
+            cur.execute(
+                """
+                ALTER TABLE users
+                VALIDATE CONSTRAINT users_referral_code_format_check;
+                """
+            )
         cur.execute(
             """
             ALTER TABLE users

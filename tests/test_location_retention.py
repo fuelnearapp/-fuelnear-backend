@@ -171,6 +171,7 @@ class LocationRetentionTestCase(unittest.TestCase):
 
     def create_user(self, suffix: str = "user") -> int:
         with self.connect() as conn:
+            referral_code = main.generate_unique_referral_code(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -181,7 +182,7 @@ class LocationRetentionTestCase(unittest.TestCase):
                     VALUES (%s, NULL, 'User', %s, TRUE, TRUE)
                     RETURNING id;
                     """,
-                    (f"{suffix}@example.com", f"RET{suffix.upper()}"[:12]),
+                    (f"{suffix}@example.com", referral_code),
                 )
                 return int(cur.fetchone()[0])
 
