@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -144,10 +145,15 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
     )
 
 
-def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTransactionSaveResult:
+def _save_apple_transaction(
+    conn: Any,
+    transaction: AppleTransaction,
+    *,
+    manage_transaction: bool,
+) -> AppleTransactionSaveResult:
     normalized = validate_apple_transaction(transaction)
 
-    with conn:
+    with (conn if manage_transaction else nullcontext(conn)):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if normalized.guest_id is not None:
                 cur.execute(
@@ -335,6 +341,18 @@ def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTra
         changed=True,
         row=dict(inserted_transaction),
     )
+
+
+def save_apple_transaction(conn: Any, transaction: AppleTransaction) -> AppleTransactionSaveResult:
+    return _save_apple_transaction(conn, transaction, manage_transaction=True)
+
+
+def save_apple_transaction_in_transaction(
+    conn: Any,
+    transaction: AppleTransaction,
+) -> AppleTransactionSaveResult:
+    """Persist using the transaction already owned by the caller."""
+    return _save_apple_transaction(conn, transaction, manage_transaction=False)
 
 
 def save_apple_transaction_with_managed_connection(

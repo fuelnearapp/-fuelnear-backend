@@ -195,6 +195,8 @@ def _to_apple_transaction(
                 else None
             ),
             environment=notification.environment,
+            ownership_type=transaction.ownership_type,
+            transaction_reason=transaction.transaction_reason,
             revocation_date=transaction.revocation_date,
             revocation_reason=(
                 str(transaction.revocation_reason)
@@ -203,6 +205,8 @@ def _to_apple_transaction(
             ),
             app_account_token=transaction.app_account_token,
             signed_date=notification.signed_date,
+            storefront=transaction.storefront,
+            offer_type=transaction.offer_type,
         )
         return apple_subscriptions.validate_apple_transaction(normalized)
     except apple_subscriptions.AppleTransactionValidationError as exc:
@@ -279,7 +283,9 @@ def process_app_store_notification(
     transaction = _to_apple_transaction(notification, owner)
     try:
         processing_result = apple_purchase_processor.process_apple_transaction(
-            transaction
+            transaction,
+            notification_type=notification.notification_type,
+            notification_subtype=notification.subtype,
         )
     except (
         apple_subscriptions.AppleOriginalTransactionOwnershipConflict,

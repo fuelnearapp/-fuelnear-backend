@@ -9,7 +9,7 @@ from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
-from app import apple_subscription_reconciler, apple_subscription_service
+from app import apple_subscription_reconciler, apple_subscription_service, creator_attribution
 from app.auth_utils import hash_token
 from app.db import get_connection
 
@@ -464,19 +464,20 @@ def claim_guest_subscription(user_id: int, guest_token: str) -> GuestClaimResult
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT id, original_transaction_id
+                    SELECT DISTINCT original_transaction_id
                     FROM apple_transactions
                     WHERE guest_id = %s
-                    ORDER BY original_transaction_id, id
-                    FOR UPDATE;
+                    ORDER BY original_transaction_id;
                     """,
                     (guest_id,),
                 )
-                guest_transactions = cur.fetchall()
-                if not guest_transactions:
+                original_ids = [
+                    str(row["original_transaction_id"])
+                    for row in cur.fetchall()
+                ]
+                if not original_ids:
                     raise GuestSubscriptionNotFound("Guest has no Apple subscription")
 
-                original_ids = sorted({str(row["original_transaction_id"]) for row in guest_transactions})
                 for original_transaction_id in original_ids:
                     cur.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0));",
@@ -503,6 +504,20 @@ def claim_guest_subscription(user_id: int, guest_token: str) -> GuestClaimResult
 
                 cur.execute(
                     """
+                    SELECT *
+                    FROM apple_transactions
+                    WHERE guest_id = %s
+                    ORDER BY original_transaction_id, purchase_date, id
+                    FOR UPDATE;
+                    """,
+                    (guest_id,),
+                )
+                guest_transactions = cur.fetchall()
+                if not guest_transactions:
+                    raise GuestSubscriptionNotFound("Guest has no Apple subscription")
+
+                cur.execute(
+                    """
                     UPDATE apple_transactions
                     SET user_id = %s,
                         guest_id = NULL,
@@ -512,6 +527,22 @@ def claim_guest_subscription(user_id: int, guest_token: str) -> GuestClaimResult
                     (user_id, guest_id),
                 )
                 transferred_transactions = cur.rowcount
+
+                for transaction in guest_transactions:
+                    creator_attribution.record_creator_apple_conversion(
+                        conn,
+                        user_id=user_id,
+                        transaction_id=str(transaction["transaction_id"]),
+                        original_transaction_id=str(
+                            transaction["original_transaction_id"]
+                        ),
+                        purchase_date=transaction["purchase_date"],
+                        product_id=str(transaction["product_id"]),
+                        transaction_reason=transaction.get("transaction_reason"),
+                        ownership_type=transaction.get("ownership_type"),
+                        revocation_date=transaction.get("revocation_date"),
+                    )
+
                 cur.execute(
                     """
                     UPDATE guest_identities

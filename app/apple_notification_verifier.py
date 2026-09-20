@@ -84,6 +84,10 @@ class NormalizedAppleNotificationTransaction:
     revocation_date: datetime | None
     revocation_reason: int | None
     app_account_token: UUID | None
+    ownership_type: str | None = None
+    transaction_reason: str | None = None
+    storefront: str | None = None
+    offer_type: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +405,17 @@ def _parse_app_account_token(value: Any) -> UUID | None:
         ) from exc
 
 
+def _optional_transaction_text(value: Any, raw_value: Any, field_name: str) -> str | None:
+    normalized = _enum_or_raw(value, raw_value)
+    if normalized is None:
+        return None
+    if not isinstance(normalized, str) or not normalized.strip():
+        raise AppleNotificationTransactionDataError(
+            f"Apple notification transaction {field_name} is invalid"
+        )
+    return normalized.strip()
+
+
 def _normalize_transaction(
     payload: JWSTransactionDecodedPayload,
 ) -> NormalizedAppleNotificationTransaction:
@@ -423,6 +438,17 @@ def _normalize_transaction(
     ):
         raise AppleNotificationTransactionDataError(
             "Apple notification transaction revocationReason is invalid"
+        )
+
+    offer_type = _enum_or_raw(
+        payload.offerType,
+        getattr(payload, "rawOfferType", None),
+    )
+    if offer_type is not None and (
+        isinstance(offer_type, bool) or not isinstance(offer_type, int)
+    ):
+        raise AppleNotificationTransactionDataError(
+            "Apple notification transaction offerType is invalid"
         )
 
     return NormalizedAppleNotificationTransaction(
@@ -449,6 +475,22 @@ def _normalize_transaction(
         ),
         revocation_reason=revocation_reason,
         app_account_token=_parse_app_account_token(payload.appAccountToken),
+        ownership_type=_optional_transaction_text(
+            payload.inAppOwnershipType,
+            getattr(payload, "rawInAppOwnershipType", None),
+            "inAppOwnershipType",
+        ),
+        transaction_reason=_optional_transaction_text(
+            payload.transactionReason,
+            getattr(payload, "rawTransactionReason", None),
+            "transactionReason",
+        ),
+        storefront=_optional_transaction_text(
+            payload.storefront,
+            None,
+            "storefront",
+        ),
+        offer_type=offer_type,
     )
 
 

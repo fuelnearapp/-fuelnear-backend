@@ -18,6 +18,13 @@ CREATOR_ATTRIBUTION_SOURCES: Final[frozenset[str]] = frozenset(
     }
 )
 _CREATOR_CODE_RE: Final[re.Pattern[str]] = re.compile(CREATOR_CODE_PATTERN)
+_APPLE_NOTIFICATION_REFUND: Final[str] = "REFUND"
+_APPLE_NOTIFICATION_REFUND_REVERSED: Final[str] = "REFUND_REVERSED"
+_APPLE_NOTIFICATION_REVOKE: Final[str] = "REVOKE"
+_APPLE_OWNERSHIP_FAMILY_SHARED: Final[str] = "FAMILY_SHARED"
+_APPLE_OWNERSHIP_PURCHASED: Final[str] = "PURCHASED"
+_APPLE_REASON_PURCHASE: Final[str] = "PURCHASE"
+_APPLE_REASON_RENEWAL: Final[str] = "RENEWAL"
 
 
 class CreatorAttributionError(RuntimeError):
@@ -83,6 +90,11 @@ class CreatorAttributionConcurrencyError(CreatorAttributionError):
     default_message = "Creator attribution could not be resolved atomically"
 
 
+class CreatorAppleConversionConflictError(CreatorAttributionError):
+    error_code = "CREATOR_APPLE_CONVERSION_CONFLICT"
+    default_message = "Apple creator conversion identity conflicts with existing data"
+
+
 @dataclass(frozen=True)
 class CreatorCampaign:
     id: int
@@ -104,6 +116,18 @@ class CreatorAttributionResult:
     attributed_at: datetime
     created: bool
     idempotent: bool
+
+
+@dataclass(frozen=True)
+class CreatorAppleConversionResult:
+    event_id: int
+    attribution_id: int
+    conversion_type: str
+    economic_status: str
+    occurred_at: datetime
+    created: bool
+    changed: bool
+    plus_milestone_set: bool
 
 
 def ensure_creator_attribution_schema(conn: Any) -> None:
@@ -665,3 +689,309 @@ def apply_creator_attribution(
         if concurrent_attribution is None:
             raise CreatorAttributionConcurrencyError
         return _resolve_existing_attribution(concurrent_attribution, campaign.id)
+
+
+def _normalize_apple_conversion_value(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized or None
+
+
+def _apple_conversion_identity(
+    transaction_reason: str | None,
+    ownership_type: str | None,
+) -> tuple[str, str] | None:
+    if transaction_reason not in {_APPLE_REASON_PURCHASE, _APPLE_REASON_RENEWAL}:
+        return None
+    if ownership_type == _APPLE_OWNERSHIP_PURCHASED:
+        return (
+            "purchase" if transaction_reason == _APPLE_REASON_PURCHASE else "renewal",
+            "verified_unknown_value",
+        )
+    if ownership_type == _APPLE_OWNERSHIP_FAMILY_SHARED:
+        return "plus_granted", "non_economic"
+    return None
+
+
+def _next_apple_economic_status(
+    current_status: str,
+    base_status: str,
+    notification_type: str | None,
+) -> str:
+    if notification_type == _APPLE_NOTIFICATION_REVOKE:
+        return "revoked"
+    if notification_type == _APPLE_NOTIFICATION_REFUND:
+        return "revoked" if current_status == "revoked" else "refunded"
+    if notification_type == _APPLE_NOTIFICATION_REFUND_REVERSED:
+        return base_status if current_status == "refunded" else current_status
+    return current_status
+
+
+def _set_plus_conversion_milestone(
+    cur: Any,
+    attribution_id: int,
+    occurred_at: datetime,
+    conversion_type: str,
+    transaction_reason: str | None,
+    economic_status: str,
+) -> bool:
+    if conversion_type not in {"purchase", "plus_granted"}:
+        return False
+    if transaction_reason != _APPLE_REASON_PURCHASE:
+        return False
+    if economic_status in {"refunded", "revoked"}:
+        return False
+
+    cur.execute(
+        """
+        UPDATE creator_attributions
+        SET plus_converted_at = %s,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND status = 'active'
+          AND user_deleted = FALSE
+          AND user_id IS NOT NULL
+          AND plus_converted_at IS NULL
+        RETURNING id;
+        """,
+        (occurred_at, attribution_id),
+    )
+    return cur.fetchone() is not None
+
+
+def record_creator_apple_conversion(
+    conn: Any,
+    *,
+    user_id: int,
+    transaction_id: str,
+    original_transaction_id: str,
+    purchase_date: datetime,
+    product_id: str,
+    transaction_reason: str | None,
+    ownership_type: str | None,
+    revocation_date: datetime | None = None,
+    notification_type: str | None = None,
+    notification_subtype: str | None = None,
+) -> CreatorAppleConversionResult | None:
+    """Record one server-verified Apple event in the caller's transaction."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        raise ValueError("user_id must be a positive integer")
+    if not isinstance(transaction_id, str) or not transaction_id.strip():
+        raise ValueError("transaction_id is required")
+    if not isinstance(original_transaction_id, str) or not original_transaction_id.strip():
+        raise ValueError("original_transaction_id is required")
+    if not isinstance(product_id, str) or not product_id.strip():
+        raise ValueError("product_id is required")
+
+    normalized_transaction_id = transaction_id.strip()
+    normalized_original_transaction_id = original_transaction_id.strip()
+    normalized_product_id = product_id.strip()
+    normalized_purchase_date = _normalize_reference_date(purchase_date, "purchase_date")
+    if revocation_date is not None:
+        _normalize_reference_date(revocation_date, "revocation_date")
+    normalized_reason = _normalize_apple_conversion_value(transaction_reason)
+    normalized_ownership = _normalize_apple_conversion_value(ownership_type)
+    normalized_notification_type = _normalize_apple_conversion_value(notification_type)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, attributed_at, plus_converted_at
+            FROM creator_attributions
+            WHERE user_id = %s
+              AND status = 'active'
+              AND user_deleted = FALSE
+            LIMIT 1
+            FOR UPDATE;
+            """,
+            (user_id,),
+        )
+        attribution = cur.fetchone()
+        if attribution is None:
+            return None
+
+        attributed_at = _normalize_reference_date(
+            attribution["attributed_at"],
+            "attributed_at",
+        )
+        if normalized_purchase_date < attributed_at:
+            return None
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                attribution_id,
+                conversion_type,
+                occurred_at,
+                product_id,
+                economic_status
+            FROM creator_conversion_events
+            WHERE provider = 'apple'
+              AND external_event_key = %s
+            LIMIT 1
+            FOR UPDATE;
+            """,
+            (normalized_transaction_id,),
+        )
+        existing_event = cur.fetchone()
+        if existing_event is not None:
+            if int(existing_event["attribution_id"]) != int(attribution["id"]):
+                raise CreatorAppleConversionConflictError
+
+            base_status = (
+                "non_economic"
+                if existing_event["conversion_type"] == "plus_granted"
+                else "verified_unknown_value"
+            )
+            next_status = _next_apple_economic_status(
+                existing_event["economic_status"],
+                base_status,
+                normalized_notification_type,
+            )
+            status_changed = next_status != existing_event["economic_status"]
+            if status_changed:
+                cur.execute(
+                    """
+                    UPDATE creator_conversion_events
+                    SET economic_status = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s;
+                    """,
+                    (next_status, existing_event["id"]),
+                )
+
+            plus_milestone_set = _set_plus_conversion_milestone(
+                cur,
+                int(attribution["id"]),
+                existing_event["occurred_at"],
+                existing_event["conversion_type"],
+                normalized_reason,
+                next_status,
+            )
+            return CreatorAppleConversionResult(
+                event_id=int(existing_event["id"]),
+                attribution_id=int(attribution["id"]),
+                conversion_type=existing_event["conversion_type"],
+                economic_status=next_status,
+                occurred_at=existing_event["occurred_at"],
+                created=False,
+                changed=status_changed or plus_milestone_set,
+                plus_milestone_set=plus_milestone_set,
+            )
+
+        identity = _apple_conversion_identity(normalized_reason, normalized_ownership)
+        if identity is None:
+            return None
+        conversion_type, base_status = identity
+
+        if revocation_date is not None and normalized_notification_type not in {
+            _APPLE_NOTIFICATION_REFUND,
+            _APPLE_NOTIFICATION_REFUND_REVERSED,
+            _APPLE_NOTIFICATION_REVOKE,
+        }:
+            return None
+
+        if normalized_reason == _APPLE_REASON_RENEWAL:
+            cur.execute(
+                """
+                SELECT purchase_date, transaction_reason
+                FROM apple_transactions
+                WHERE original_transaction_id = %s
+                ORDER BY purchase_date, id;
+                """,
+                (normalized_original_transaction_id,),
+            )
+            purchase_dates = [
+                _normalize_reference_date(row["purchase_date"], "purchase_date")
+                for row in cur.fetchall()
+                if _normalize_apple_conversion_value(row["transaction_reason"])
+                == _APPLE_REASON_PURCHASE
+            ]
+            if any(value < attributed_at for value in purchase_dates):
+                return None
+            if not any(value >= attributed_at for value in purchase_dates):
+                return None
+
+        economic_status = base_status
+        if normalized_notification_type == _APPLE_NOTIFICATION_REVOKE:
+            economic_status = "revoked"
+        elif normalized_notification_type == _APPLE_NOTIFICATION_REFUND:
+            economic_status = "refunded"
+
+        cur.execute(
+            """
+            INSERT INTO creator_conversion_events (
+                attribution_id,
+                conversion_type,
+                provider,
+                external_event_key,
+                occurred_at,
+                product_id,
+                economic_status,
+                amount,
+                currency
+            )
+            VALUES (%s, %s, 'apple', %s, %s, %s, %s, NULL, NULL)
+            ON CONFLICT (provider, external_event_key) DO NOTHING
+            RETURNING id;
+            """,
+            (
+                attribution["id"],
+                conversion_type,
+                normalized_transaction_id,
+                normalized_purchase_date,
+                normalized_product_id,
+                economic_status,
+            ),
+        )
+        inserted_event = cur.fetchone()
+        if inserted_event is None:
+            cur.execute(
+                """
+                SELECT id, attribution_id, conversion_type, occurred_at,
+                       product_id, economic_status
+                FROM creator_conversion_events
+                WHERE provider = 'apple'
+                  AND external_event_key = %s
+                LIMIT 1
+                FOR UPDATE;
+                """,
+                (normalized_transaction_id,),
+            )
+            concurrent_event = cur.fetchone()
+            if (
+                concurrent_event is None
+                or int(concurrent_event["attribution_id"]) != int(attribution["id"])
+            ):
+                raise CreatorAppleConversionConflictError
+            return CreatorAppleConversionResult(
+                event_id=int(concurrent_event["id"]),
+                attribution_id=int(attribution["id"]),
+                conversion_type=concurrent_event["conversion_type"],
+                economic_status=concurrent_event["economic_status"],
+                occurred_at=concurrent_event["occurred_at"],
+                created=False,
+                changed=False,
+                plus_milestone_set=False,
+            )
+
+        plus_milestone_set = _set_plus_conversion_milestone(
+            cur,
+            int(attribution["id"]),
+            normalized_purchase_date,
+            conversion_type,
+            normalized_reason,
+            economic_status,
+        )
+        return CreatorAppleConversionResult(
+            event_id=int(inserted_event["id"]),
+            attribution_id=int(attribution["id"]),
+            conversion_type=conversion_type,
+            economic_status=economic_status,
+            occurred_at=normalized_purchase_date,
+            created=True,
+            changed=True,
+            plus_milestone_set=plus_milestone_set,
+        )

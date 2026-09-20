@@ -8,7 +8,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import psycopg2
 
@@ -16,6 +16,7 @@ import app.apple_purchase_processor as processor
 import app.apple_subscription_reconciler as reconciler
 import app.apple_subscription_service as service
 import app.apple_subscriptions as repository
+import app.creator_attribution as creator_attribution
 
 
 def find_free_port() -> int:
@@ -142,6 +143,7 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
                     );
                     """
                 )
+            creator_attribution.ensure_creator_attribution_schema(conn)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -243,7 +245,7 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
 
         self.assertFalse(result.created)
         self.assertFalse(result.changed)
-        reconcile_mock.assert_called_once_with(user_id)
+        reconcile_mock.assert_called_once_with(user_id, connection=ANY)
         self.assertEqual(self.count_rows("apple_transactions"), 1)
         self.assertEqual(self.count_rows("user_subscriptions"), 1)
 
@@ -284,7 +286,7 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
         ) as reconcile_mock:
             processor.process_apple_transaction(transaction)
 
-        reconcile_mock.assert_called_once_with(user_id)
+        reconcile_mock.assert_called_once_with(user_id, connection=ANY)
 
     def test_processing_is_fully_idempotent(self):
         user_id = self.create_user()
