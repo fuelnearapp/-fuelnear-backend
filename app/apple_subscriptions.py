@@ -5,12 +5,17 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+import hashlib
+import logging
 from typing import Any, Final
 from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
 from app.db import get_connection
+
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_APPLE_PRODUCT_IDS = frozenset(
@@ -284,6 +289,10 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
     )
     _validate_optional_datetime(transaction.revocation_date, "revocation_date")
     _validate_optional_datetime(transaction.signed_date, "signed_date")
+    _validate_optional_datetime(
+        transaction.economic_transaction_signed_at,
+        "economic_transaction_signed_at",
+    )
 
     if transaction.app_account_token is not None and not isinstance(transaction.app_account_token, UUID):
         raise AppleTransactionValidationError("app_account_token must be a UUID")
@@ -291,6 +300,14 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
         isinstance(transaction.offer_type, bool) or not isinstance(transaction.offer_type, int)
     ):
         raise AppleTransactionValidationError("offer_type must be an integer")
+
+    economic_evidence = normalize_apple_economic_evidence(
+        transaction.price_milliunits,
+        transaction.currency,
+    )
+    economic_evidence_is_valid = (
+        economic_evidence.status is AppleEconomicEvidenceStatus.VALID
+    )
 
     return replace(
         transaction,
@@ -302,6 +319,15 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
         transaction_reason=_normalize_optional_text(transaction.transaction_reason, "transaction_reason"),
         revocation_reason=_normalize_optional_text(transaction.revocation_reason, "revocation_reason"),
         storefront=_normalize_optional_text(transaction.storefront, "storefront"),
+        price_milliunits=(
+            economic_evidence.price_milliunits if economic_evidence_is_valid else None
+        ),
+        currency=economic_evidence.currency if economic_evidence_is_valid else None,
+        economic_transaction_signed_at=(
+            transaction.economic_transaction_signed_at
+            if economic_evidence_is_valid
+            else None
+        ),
     )
 
 
@@ -361,7 +387,9 @@ def _save_apple_transaction(
                         "transaction_id is already associated with a different Apple subscription"
                     )
 
-                existing_signed_date = existing_transaction["signed_date"]
+                current_transaction = dict(existing_transaction)
+                changed = False
+                existing_signed_date = current_transaction["signed_date"]
                 if normalized.signed_date is not None and (
                     existing_signed_date is None
                     or normalized.signed_date > existing_signed_date
@@ -408,15 +436,79 @@ def _save_apple_transaction(
                         ),
                     )
                     updated_transaction = cur.fetchone()
-                    return AppleTransactionSaveResult(
-                        created=False,
-                        changed=True,
-                        row=dict(updated_transaction),
+                    current_transaction = dict(updated_transaction)
+                    changed = True
+
+                incoming_price = normalized.price_milliunits
+                incoming_currency = normalized.currency
+                if incoming_price is not None and incoming_currency is not None:
+                    existing_price = current_transaction.get("price_milliunits")
+                    existing_currency = current_transaction.get("currency")
+                    existing_economic_signed_at = current_transaction.get(
+                        "economic_transaction_signed_at"
                     )
+                    incoming_economic_signed_at = (
+                        normalized.economic_transaction_signed_at
+                    )
+
+                    if existing_price is None and existing_currency is None:
+                        cur.execute(
+                            """
+                            UPDATE apple_transactions
+                            SET price_milliunits = %s,
+                                currency = %s,
+                                economic_transaction_signed_at = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING *;
+                            """,
+                            (
+                                incoming_price,
+                                incoming_currency,
+                                incoming_economic_signed_at,
+                                current_transaction["id"],
+                            ),
+                        )
+                        current_transaction = dict(cur.fetchone())
+                        changed = True
+                    elif (
+                        existing_price == incoming_price
+                        and existing_currency == incoming_currency
+                    ):
+                        if incoming_economic_signed_at is not None and (
+                            existing_economic_signed_at is None
+                            or incoming_economic_signed_at
+                            > existing_economic_signed_at
+                        ):
+                            cur.execute(
+                                """
+                                UPDATE apple_transactions
+                                SET economic_transaction_signed_at = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                RETURNING *;
+                                """,
+                                (
+                                    incoming_economic_signed_at,
+                                    current_transaction["id"],
+                                ),
+                            )
+                            current_transaction = dict(cur.fetchone())
+                            changed = True
+                    else:
+                        transaction_reference = hashlib.sha256(
+                            normalized.transaction_id.encode("utf-8")
+                        ).hexdigest()[:12]
+                        logger.warning(
+                            "Apple economic evidence conflict ignored "
+                            "transaction_ref=%s",
+                            transaction_reference,
+                        )
+
                 return AppleTransactionSaveResult(
                     created=False,
-                    changed=False,
-                    row=dict(existing_transaction),
+                    changed=changed,
+                    row=current_transaction,
                 )
 
             cur.execute(
@@ -462,9 +554,12 @@ def _save_apple_transaction(
                     app_account_token,
                     signed_date,
                     storefront,
-                    offer_type
+                    offer_type,
+                    price_milliunits,
+                    currency,
+                    economic_transaction_signed_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *;
                 """,
                 (
@@ -489,6 +584,9 @@ def _save_apple_transaction(
                     normalized.signed_date,
                     normalized.storefront,
                     normalized.offer_type,
+                    normalized.price_milliunits,
+                    normalized.currency,
+                    normalized.economic_transaction_signed_at,
                 ),
             )
             inserted_transaction = cur.fetchone()

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
+import jwt
 from appstoreserverlibrary.models.Environment import Environment
 from appstoreserverlibrary.signed_data_verifier import (
     SignedDataVerifier,
@@ -33,6 +34,7 @@ from app.apple_jws_verifier import (
     load_apple_root_certificates,
     verify_apple_signed_transaction,
 )
+from app.apple_subscriptions import AppleEconomicEvidenceStatus
 
 
 REPOSITORY_APPLE_CERTIFICATES = (
@@ -115,6 +117,9 @@ class AppleJWSVerifierTestCase(unittest.TestCase):
         }
         values.update(changes)
         return SimpleNamespace(**values)
+
+    def raw_transaction_jws(self, **payload):
+        return jwt.encode(payload, key="", algorithm="none")
 
     def test_initializes_sandbox_verifier_with_expected_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -265,6 +270,38 @@ class AppleJWSVerifierTestCase(unittest.TestCase):
         self.assertEqual(result.environment, "Sandbox")
         self.assertEqual(result.app_account_token, UUID(payload.appAccountToken))
         self.assertEqual(result.offer_type, 1)
+
+    def test_economic_evidence_uses_raw_types_from_the_verified_jws(self):
+        cases = (
+            ({"price": 4990, "currency": "eur"}, AppleEconomicEvidenceStatus.VALID, 4990, "EUR"),
+            ({"price": 0, "currency": "EUR"}, AppleEconomicEvidenceStatus.VALID, 0, "EUR"),
+            ({"price": True, "currency": "EUR"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": 1.9, "currency": "EUR"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": "4990", "currency": "EUR"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": -1, "currency": "EUR"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": 1_000_000_000_000_000, "currency": "EUR"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": 4990, "currency": "ZZZ"}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({"price": 4990}, AppleEconomicEvidenceStatus.INVALID, None, None),
+            ({}, AppleEconomicEvidenceStatus.ABSENT, None, None),
+        )
+
+        for raw_payload, expected_status, expected_price, expected_currency in cases:
+            with self.subTest(raw_payload=raw_payload):
+                signed_jws = self.raw_transaction_jws(**raw_payload)
+                verifier = FakeVerifier(self.payload())
+
+                result = verify_apple_signed_transaction(
+                    signed_jws,
+                    verifier=verifier,
+                )
+
+                self.assertEqual(verifier.calls, [signed_jws])
+                self.assertEqual(result.economic_evidence.status, expected_status)
+                self.assertEqual(
+                    result.economic_evidence.price_milliunits,
+                    expected_price,
+                )
+                self.assertEqual(result.economic_evidence.currency, expected_currency)
 
     def test_empty_jws_is_rejected(self):
         with self.assertRaises(AppleJWSInvalidError):

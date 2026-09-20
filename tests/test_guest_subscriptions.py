@@ -293,10 +293,95 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["status"], "active")
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT price_milliunits, currency
+                    FROM apple_transactions
+                    WHERE guest_id = %s;
+                    """,
+                    (guest.guest_id,),
+                )
+                self.assertEqual(cur.fetchone(), (None, None))
         verifier.assert_called_once_with(
             signed_transaction="signed-guest-transaction",
             expected_app_account_token=str(guest.app_account_token),
         )
+
+    def test_04b_guest_apple_verify_persists_verified_economic_evidence(self):
+        guest = self.create_guest()
+        verified = replace(
+            self.verified_transaction(guest),
+            economic_evidence=apple_subscriptions.AppleEconomicEvidence(
+                apple_subscriptions.AppleEconomicEvidenceStatus.VALID,
+                price_milliunits=4990,
+                currency="EUR",
+            ),
+        )
+        with patch.object(
+            main.apple_jws_verifier,
+            "verify_apple_signed_transaction",
+            return_value=verified,
+        ):
+            response = self.client.post(
+                "/guest/subscription/apple/verify",
+                json={"signed_transaction": "signed-guest-transaction"},
+                headers={"Authorization": f"Bearer {guest.access_token}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT price_milliunits, currency,
+                           economic_transaction_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (verified.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row, (4990, "EUR", verified.signed_date))
+
+    def test_04c_invalid_economic_evidence_values_are_not_persisted(self):
+        guest = self.create_guest()
+        verified = replace(
+            self.verified_transaction(guest),
+            economic_evidence=apple_subscriptions.AppleEconomicEvidence(
+                apple_subscriptions.AppleEconomicEvidenceStatus.INVALID,
+                price_milliunits=4990,
+                currency="EUR",
+                invalid_reason="test_inconsistent_value_object",
+            ),
+        )
+        with patch.object(
+            main.apple_jws_verifier,
+            "verify_apple_signed_transaction",
+            return_value=verified,
+        ):
+            response = self.client.post(
+                "/guest/subscription/apple/verify",
+                json={"signed_transaction": "signed-guest-transaction"},
+                headers={"Authorization": f"Bearer {guest.access_token}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_plus"])
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT price_milliunits, currency,
+                           economic_transaction_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (verified.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row, (None, None, None))
 
     def test_guest_subscription_remains_active_during_grace_period(self):
         guest = self.create_guest()
@@ -346,6 +431,43 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
             guest_subscriptions.get_guest_subscription_status(guest.guest_id).status,
             "active",
         )
+
+    def test_06b_notification_persists_verified_economic_evidence(self):
+        guest = self.create_guest()
+        apple_purchase_processor.process_apple_transaction(self.transaction(guest))
+        notification = self.notification(
+            guest,
+            transaction_id="guest-economic-renewal",
+        )
+        transaction_signed_date = notification.signed_date - timedelta(seconds=1)
+        notification = replace(
+            notification,
+            transaction=replace(
+                notification.transaction,
+                signed_date=transaction_signed_date,
+                economic_evidence=apple_subscriptions.AppleEconomicEvidence(
+                    apple_subscriptions.AppleEconomicEvidenceStatus.VALID,
+                    price_milliunits=4990,
+                    currency="EUR",
+                ),
+            ),
+        )
+
+        apple_notification_processor.process_app_store_notification(notification)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT price_milliunits, currency,
+                           economic_transaction_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (notification.transaction.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row, (4990, "EUR", transaction_signed_date))
 
     def test_07_refund_revokes_guest_subscription(self):
         guest = self.create_guest()
@@ -546,6 +668,40 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
                 )
         result = guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
         self.assertEqual(result.expires_at, referral_expiry)
+
+    def test_13b_claim_preserves_apple_economic_evidence(self):
+        guest = self.create_guest()
+        user_id = self.create_user()
+        economic_signed_date = datetime.now(timezone.utc)
+        transaction = replace(
+            self.transaction(guest),
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=economic_signed_date,
+        )
+        apple_purchase_processor.process_apple_transaction(transaction)
+
+        guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, guest_id, price_milliunits, currency,
+                           economic_transaction_signed_at, purchase_date,
+                           transaction_id, original_transaction_id
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row[0], user_id)
+        self.assertIsNone(row[1])
+        self.assertEqual(row[2:5], (4990, "EUR", economic_signed_date))
+        self.assertEqual(row[5], transaction.purchase_date)
+        self.assertEqual(row[6], transaction.transaction_id)
+        self.assertEqual(row[7], transaction.original_transaction_id)
 
     def test_14_claim_rejects_original_transaction_owned_elsewhere(self):
         guest = self.create_guest()

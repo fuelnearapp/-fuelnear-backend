@@ -207,6 +207,24 @@ def _to_apple_transaction(
             signed_date=notification.signed_date,
             storefront=transaction.storefront,
             offer_type=transaction.offer_type,
+            price_milliunits=(
+                transaction.economic_evidence.price_milliunits
+                if transaction.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
+            currency=(
+                transaction.economic_evidence.currency
+                if transaction.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
+            economic_transaction_signed_at=(
+                transaction.signed_date
+                if transaction.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
         )
         return apple_subscriptions.validate_apple_transaction(normalized)
     except apple_subscriptions.AppleTransactionValidationError as exc:

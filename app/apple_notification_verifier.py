@@ -33,6 +33,11 @@ from app.apple_config import (
     normalize_apple_subscription_environment,
     validate_apple_subscriptions_config,
 )
+from app.apple_subscriptions import (
+    AppleEconomicEvidence,
+    AppleEconomicEvidenceStatus,
+)
+from app.apple_verified_transaction import verify_apple_transaction_payload
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,10 @@ class NormalizedAppleNotificationTransaction:
     transaction_reason: str | None = None
     storefront: str | None = None
     offer_type: int | None = None
+    signed_date: datetime | None = None
+    economic_evidence: AppleEconomicEvidence = AppleEconomicEvidence(
+        AppleEconomicEvidenceStatus.ABSENT
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +427,7 @@ def _optional_transaction_text(value: Any, raw_value: Any, field_name: str) -> s
 
 def _normalize_transaction(
     payload: JWSTransactionDecodedPayload,
+    economic_evidence: AppleEconomicEvidence,
 ) -> NormalizedAppleNotificationTransaction:
     try:
         product_id = _required_text(payload.productId, "transaction productId")
@@ -491,6 +501,13 @@ def _normalize_transaction(
             "storefront",
         ),
         offer_type=offer_type,
+        signed_date=_milliseconds_datetime(
+            payload.signedDate,
+            "signedDate",
+            required=False,
+            error_type=AppleNotificationTransactionDataError,
+        ),
+        economic_evidence=economic_evidence,
     )
 
 
@@ -662,9 +679,11 @@ def verify_app_store_notification(
     transaction = None
     if signed_transaction_info:
         try:
-            transaction_payload = selected_verifier.verify_and_decode_signed_transaction(
-                signed_transaction_info
+            verified_transaction = verify_apple_transaction_payload(
+                selected_verifier,
+                signed_transaction_info,
             )
+            transaction_payload = verified_transaction.payload
         except VerificationException as exc:
             if _is_retryable_verification_error(exc):
                 raise AppleNotificationVerificationUnavailableError(
@@ -682,7 +701,10 @@ def verify_app_store_notification(
             normalized_environment,
             "transaction",
         )
-        transaction = _normalize_transaction(transaction_payload)
+        transaction = _normalize_transaction(
+            transaction_payload,
+            verified_transaction.economic_evidence,
+        )
 
     renewal = None
     if signed_renewal_info:

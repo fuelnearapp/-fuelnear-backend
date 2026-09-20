@@ -7258,6 +7258,24 @@ def _verify_and_process_apple_subscription(
             signed_date=verified.signed_date,
             storefront=verified.storefront,
             offer_type=verified.offer_type,
+            price_milliunits=(
+                verified.economic_evidence.price_milliunits
+                if verified.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
+            currency=(
+                verified.economic_evidence.currency
+                if verified.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
+            economic_transaction_signed_at=(
+                verified.signed_date
+                if verified.economic_evidence.status
+                is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
         )
         result = apple_purchase_processor.process_apple_transaction(transaction)
         return AppleSubscriptionVerifyResponse(

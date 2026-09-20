@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
+import jwt
 from appstoreserverlibrary.models.AutoRenewStatus import AutoRenewStatus
 from appstoreserverlibrary.models.Data import Data
 from appstoreserverlibrary.models.Environment import Environment
@@ -42,6 +43,7 @@ from app.apple_notification_verifier import (
     create_app_store_notification_verifier,
     verify_app_store_notification,
 )
+from app.apple_subscriptions import AppleEconomicEvidenceStatus
 
 
 class FakeVerifier:
@@ -149,6 +151,7 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             appAccountToken=str(app_account_token or uuid4()),
             environment=environment,
             bundleId="MB.FuelNear",
+            signedDate=1_700_000_001_000,
         )
 
     def renewal(
@@ -199,6 +202,28 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
         self.assertEqual(fake.notification_calls, ["signed-notification"])
         self.assertEqual(fake.transaction_calls, ["signed-transaction"])
         self.assertEqual(fake.renewal_calls, ["signed-renewal"])
+
+    def test_transaction_economic_evidence_comes_from_verified_inner_jws(self):
+        signed_transaction = jwt.encode(
+            {"price": 4990, "currency": "eur"},
+            key="",
+            algorithm="none",
+        )
+        result, fake = self.verify(
+            notification=self.notification(transaction_info=signed_transaction),
+        )
+
+        self.assertEqual(fake.transaction_calls, [signed_transaction])
+        self.assertEqual(
+            result.transaction.economic_evidence.status,
+            AppleEconomicEvidenceStatus.VALID,
+        )
+        self.assertEqual(result.transaction.economic_evidence.price_milliunits, 4990)
+        self.assertEqual(result.transaction.economic_evidence.currency, "EUR")
+        self.assertEqual(
+            result.transaction.signed_date,
+            datetime.fromtimestamp(1_700_000_001, tz=timezone.utc),
+        )
 
     def test_grace_period_expiration_is_normalized(self):
         result, _ = self.verify(

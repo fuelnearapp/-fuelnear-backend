@@ -168,6 +168,20 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
                 )
                 return cur.fetchone()
 
+    def economic_row(self, transaction_id: str) -> tuple:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT price_milliunits, currency,
+                           economic_transaction_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction_id,),
+                )
+                return cur.fetchone()
+
     def test_supported_product_id_is_valid(self):
         transaction = self.transaction(self.create_user())
         self.assertEqual(validate_apple_transaction(transaction), transaction)
@@ -376,6 +390,129 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
         with self.assertRaises(AppleOriginalTransactionOwnershipConflict):
             self.save(self.transaction(second_user_id, transaction_id="transaction-2"))
         self.assertEqual(self.row_count(), 1)
+
+    def test_new_transaction_persists_valid_economic_evidence(self):
+        signed_date = datetime.now(timezone.utc)
+        result = self.save(
+            self.transaction(
+                self.create_user(),
+                price_milliunits=4990,
+                currency="eur",
+                economic_transaction_signed_at=signed_date,
+            )
+        )
+
+        self.assertEqual(result.row["price_milliunits"], 4990)
+        self.assertEqual(result.row["currency"], "EUR")
+        self.assertEqual(result.row["economic_transaction_signed_at"], signed_date)
+
+    def test_replay_enriches_historical_null_economic_evidence(self):
+        user_id = self.create_user()
+        transaction = self.transaction(user_id)
+        first = self.save(transaction)
+        signed_date = datetime.now(timezone.utc)
+
+        second = self.save(
+            replace(
+                transaction,
+                price_milliunits=4990,
+                currency="EUR",
+                economic_transaction_signed_at=signed_date,
+            )
+        )
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertTrue(second.changed)
+        self.assertEqual(self.economic_row(transaction.transaction_id), (4990, "EUR", signed_date))
+
+    def test_same_economic_pair_is_idempotent(self):
+        signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(
+            self.create_user(),
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=signed_date,
+        )
+        self.save(transaction)
+
+        result = self.save(transaction)
+
+        self.assertFalse(result.created)
+        self.assertFalse(result.changed)
+        self.assertEqual(self.economic_row(transaction.transaction_id), (4990, "EUR", signed_date))
+
+    def test_absent_economic_evidence_does_not_clear_persisted_pair(self):
+        transaction = self.transaction(
+            self.create_user(),
+            price_milliunits=4990,
+            currency="EUR",
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(transaction, price_milliunits=None, currency=None)
+        )
+
+        self.assertFalse(result.changed)
+        self.assertEqual(self.economic_row(transaction.transaction_id)[:2], (4990, "EUR"))
+
+    def test_invalid_economic_evidence_does_not_clear_persisted_pair(self):
+        transaction = self.transaction(
+            self.create_user(),
+            price_milliunits=4990,
+            currency="EUR",
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(transaction, price_milliunits=True, currency="EUR")
+        )
+
+        self.assertFalse(result.changed)
+        self.assertEqual(self.economic_row(transaction.transaction_id)[:2], (4990, "EUR"))
+
+    def test_conflicting_valid_economic_pair_is_preserved(self):
+        transaction = self.transaction(
+            self.create_user(),
+            price_milliunits=4990,
+            currency="EUR",
+        )
+        self.save(transaction)
+
+        with self.assertLogs("app.apple_subscriptions", level="WARNING") as logs:
+            result = self.save(
+                replace(transaction, price_milliunits=5990, currency="EUR")
+            )
+
+        self.assertFalse(result.changed)
+        self.assertEqual(self.economic_row(transaction.transaction_id)[:2], (4990, "EUR"))
+        self.assertIn("economic evidence conflict ignored", logs.output[0])
+        self.assertNotIn(transaction.transaction_id, logs.output[0])
+
+    def test_older_replay_does_not_degrade_economic_watermark(self):
+        newer_signed_date = datetime.now(timezone.utc)
+        transaction = self.transaction(
+            self.create_user(),
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=newer_signed_date,
+        )
+        self.save(transaction)
+
+        result = self.save(
+            replace(
+                transaction,
+                economic_transaction_signed_at=newer_signed_date
+                - timedelta(minutes=1),
+            )
+        )
+
+        self.assertFalse(result.changed)
+        self.assertEqual(
+            self.economic_row(transaction.transaction_id),
+            (4990, "EUR", newer_signed_date),
+        )
 
     def test_required_fields_are_validated(self):
         user_id = self.create_user()

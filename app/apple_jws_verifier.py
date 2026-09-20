@@ -23,7 +23,12 @@ from app.apple_config import (
     normalize_apple_subscription_environment,
     validate_apple_subscriptions_config,
 )
-from app.apple_subscriptions import SUPPORTED_APPLE_PRODUCT_IDS
+from app.apple_subscriptions import (
+    AppleEconomicEvidence,
+    AppleEconomicEvidenceStatus,
+    SUPPORTED_APPLE_PRODUCT_IDS,
+)
+from app.apple_verified_transaction import verify_apple_transaction_payload
 
 
 class AppleJWSVerificationError(RuntimeError):
@@ -86,6 +91,9 @@ class VerifiedAppleTransaction:
     signed_date: datetime | None
     storefront: str | None
     offer_type: int | None
+    economic_evidence: AppleEconomicEvidence = AppleEconomicEvidence(
+        AppleEconomicEvidenceStatus.ABSENT
+    )
 
 
 VerifierFactory = Callable[..., SignedDataVerifier]
@@ -335,9 +343,11 @@ def verify_apple_signed_transaction(
     last_verification_error: VerificationException | None = None
     for expected_environment, selected_verifier in verifier_candidates:
         try:
-            candidate_payload = selected_verifier.verify_and_decode_signed_transaction(
-                signed_transaction.strip()
+            verified_payload = verify_apple_transaction_payload(
+                selected_verifier,
+                signed_transaction.strip(),
             )
+            candidate_payload = verified_payload.payload
         except VerificationException as exc:
             if exc.status == VerificationStatus.RETRYABLE_VERIFICATION_FAILURE:
                 raise AppleJWSVerificationUnavailableError(
@@ -367,6 +377,7 @@ def verify_apple_signed_transaction(
             continue
 
         payload = candidate_payload
+        economic_evidence = verified_payload.economic_evidence
         break
 
     if payload is None:
@@ -438,4 +449,5 @@ def verify_apple_signed_transaction(
         ),
         storefront=_optional_text_value(payload.storefront),
         offer_type=_optional_integer_value(payload.offerType, "offerType"),
+        economic_evidence=economic_evidence,
     )

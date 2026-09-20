@@ -14,7 +14,11 @@ from app.apple_notification_verifier import (
     VerifiedAppStoreNotification,
 )
 from app.apple_purchase_processor import ApplePurchaseProcessingResult
-from app.apple_subscriptions import AppleOriginalTransactionOwnershipConflict
+from app.apple_subscriptions import (
+    AppleEconomicEvidence,
+    AppleEconomicEvidenceStatus,
+    AppleOriginalTransactionOwnershipConflict,
+)
 
 
 class AppleNotificationProcessorTestCase(unittest.TestCase):
@@ -122,10 +126,62 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         self.assertEqual(result.action, "transaction_processed")
         self.assertEqual(result.user_id, 7)
         process_mock.assert_called_once()
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertIsNone(apple_transaction.price_milliunits)
+        self.assertIsNone(apple_transaction.currency)
 
     def test_did_renew_is_processed(self):
         result, _ = self.process_with_owner(self.notification("DID_RENEW"))
         self.assertEqual(result.action, "transaction_processed")
+
+    def test_verified_transaction_economic_evidence_is_passed_to_processor(self):
+        transaction_signed_date = self.now - timedelta(seconds=1)
+        notification = self.notification("DID_RENEW")
+        notification = replace(
+            notification,
+            transaction=replace(
+                notification.transaction,
+                signed_date=transaction_signed_date,
+                economic_evidence=AppleEconomicEvidence(
+                    AppleEconomicEvidenceStatus.VALID,
+                    price_milliunits=4990,
+                    currency="EUR",
+                ),
+            ),
+        )
+
+        _, process_mock = self.process_with_owner(notification)
+
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertEqual(apple_transaction.price_milliunits, 4990)
+        self.assertEqual(apple_transaction.currency, "EUR")
+        self.assertEqual(
+            apple_transaction.economic_transaction_signed_at,
+            transaction_signed_date,
+        )
+        self.assertEqual(apple_transaction.signed_date, notification.signed_date)
+
+    def test_invalid_economic_evidence_values_are_not_passed_to_processor(self):
+        notification = self.notification("DID_RENEW")
+        notification = replace(
+            notification,
+            transaction=replace(
+                notification.transaction,
+                economic_evidence=AppleEconomicEvidence(
+                    AppleEconomicEvidenceStatus.INVALID,
+                    price_milliunits=4990,
+                    currency="EUR",
+                    invalid_reason="test_inconsistent_value_object",
+                ),
+            ),
+        )
+
+        _, process_mock = self.process_with_owner(notification)
+
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertIsNone(apple_transaction.price_milliunits)
+        self.assertIsNone(apple_transaction.currency)
+        self.assertIsNone(apple_transaction.economic_transaction_signed_at)
 
     def test_did_fail_to_renew_passes_active_grace_period(self):
         grace_expiry = self.now + timedelta(days=5)

@@ -146,6 +146,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                     """
                 )
             creator_attribution.ensure_creator_attribution_schema(conn)
+            repository.ensure_apple_economic_ledger_schema(conn)
 
     @classmethod
     def tearDownClass(cls) -> None:
