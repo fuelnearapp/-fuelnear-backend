@@ -3,7 +3,9 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Final
 from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
@@ -17,6 +19,29 @@ SUPPORTED_APPLE_PRODUCT_IDS = frozenset(
         "MB.FuelNear.plus.sixmonths",
         "MB.FuelNear.plus.yearly",
     }
+)
+
+MAX_APPLE_PRICE_MILLIUNITS: Final[int] = 999_999_999_999_999
+APPLE_ECONOMIC_ADJUSTMENTS: Final[frozenset[str]] = frozenset(
+    {"refund", "revoke", "refund_reversed", "revocation_unknown"}
+)
+
+# ISO 4217 alphabetic codes accepted for Apple transaction prices. This local
+# set keeps validation deterministic without adding a runtime dependency.
+ISO_4217_CURRENCY_CODES: Final[frozenset[str]] = frozenset(
+    """
+    AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND
+    BOB BOV BRL BSD BTN BWP BYN BZD CAD CDF CHE CHF CHW CLF CLP CNY COP COU
+    CRC CUC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS
+    GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY
+    KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA
+    MKD MMK MNT MOP MRU MUR MVR MWK MXN MXV MYR MZN NAD NGN NIO NOK NPR NZD
+    OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK
+    SGD SHP SLE SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD
+    TZS UAH UGX USD USN UYI UYU UYW UZS VED VES VND VUV WST XAF XCD XCG XDR
+    XOF
+    XPF XSU XUA YER ZAR ZMW ZWG
+    """.split()
 )
 
 
@@ -34,6 +59,28 @@ class AppleOriginalTransactionOwnershipConflict(AppleSubscriptionRepositoryError
 
 class AppleTransactionIdentityConflict(AppleSubscriptionRepositoryError):
     pass
+
+
+class AppleEconomicEvidenceStatus(str, Enum):
+    ABSENT = "absent"
+    VALID = "valid"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class AppleEconomicEvidence:
+    status: AppleEconomicEvidenceStatus
+    price_milliunits: int | None = None
+    currency: str | None = None
+    invalid_reason: str | None = None
+
+    @property
+    def amount(self) -> Decimal | None:
+        if self.status is not AppleEconomicEvidenceStatus.VALID:
+            return None
+        if self.price_milliunits is None:
+            return None
+        return Decimal(self.price_milliunits) / Decimal(1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +102,11 @@ class AppleTransaction:
     signed_date: datetime | None = None
     storefront: str | None = None
     offer_type: int | None = None
+    price_milliunits: int | None = None
+    currency: str | None = None
+    economic_transaction_signed_at: datetime | None = None
+    economic_adjustment: str | None = None
+    economic_notification_signed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +114,114 @@ class AppleTransactionSaveResult:
     created: bool
     changed: bool
     row: dict[str, Any]
+
+
+def normalize_apple_economic_evidence(
+    price: object | None,
+    currency: object | None,
+) -> AppleEconomicEvidence:
+    if price is None and currency is None:
+        return AppleEconomicEvidence(AppleEconomicEvidenceStatus.ABSENT)
+    if price is None or currency is None:
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="incomplete_pair",
+        )
+    if type(price) is not int:
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="invalid_price_type",
+        )
+    if price < 0 or price > MAX_APPLE_PRICE_MILLIUNITS:
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="price_out_of_range",
+        )
+    if type(currency) is not str:
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="invalid_currency_type",
+        )
+
+    normalized_currency = currency.strip().upper()
+    if (
+        len(normalized_currency) != 3
+        or not normalized_currency.isascii()
+        or not normalized_currency.isalpha()
+    ):
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="invalid_currency_format",
+        )
+    if normalized_currency not in ISO_4217_CURRENCY_CODES:
+        return AppleEconomicEvidence(
+            AppleEconomicEvidenceStatus.INVALID,
+            invalid_reason="unknown_currency",
+        )
+    return AppleEconomicEvidence(
+        AppleEconomicEvidenceStatus.VALID,
+        price_milliunits=price,
+        currency=normalized_currency,
+    )
+
+
+def ensure_apple_economic_ledger_schema(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            ALTER TABLE apple_transactions
+                ADD COLUMN IF NOT EXISTS price_milliunits BIGINT NULL,
+                ADD COLUMN IF NOT EXISTS currency VARCHAR(3) NULL,
+                ADD COLUMN IF NOT EXISTS economic_transaction_signed_at TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS economic_adjustment TEXT NULL,
+                ADD COLUMN IF NOT EXISTS economic_notification_signed_at TIMESTAMPTZ NULL;
+            """
+        )
+        constraints = (
+            (
+                "apple_transactions_price_milliunits_check",
+                "price_milliunits IS NULL OR "
+                f"(price_milliunits >= 0 AND price_milliunits <= {MAX_APPLE_PRICE_MILLIUNITS})",
+            ),
+            (
+                "apple_transactions_economic_pair_check",
+                "((price_milliunits IS NULL AND currency IS NULL) OR "
+                "(price_milliunits IS NOT NULL AND currency IS NOT NULL))",
+            ),
+            (
+                "apple_transactions_currency_format_check",
+                "currency IS NULL OR currency ~ '^[A-Z]{3}$'",
+            ),
+            (
+                "apple_transactions_economic_adjustment_check",
+                "economic_adjustment IS NULL OR economic_adjustment IN "
+                "('refund', 'revoke', 'refund_reversed', 'revocation_unknown')",
+            ),
+        )
+        for constraint_name, expression in constraints:
+            cur.execute(
+                """
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'apple_transactions'::regclass
+                  AND conname = %s;
+                """,
+                (constraint_name,),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    f"""
+                    ALTER TABLE apple_transactions
+                    ADD CONSTRAINT {constraint_name}
+                    CHECK ({expression}) NOT VALID;
+                    """
+                )
+            cur.execute(
+                f"""
+                ALTER TABLE apple_transactions
+                VALIDATE CONSTRAINT {constraint_name};
+                """
+            )
 
 
 def _normalize_required_text(value: str, field_name: str) -> str:

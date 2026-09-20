@@ -17,6 +17,7 @@ from app.apple_subscriptions import (
     AppleOriginalTransactionOwnershipConflict,
     AppleTransaction,
     AppleTransactionValidationError,
+    ensure_apple_economic_ledger_schema,
     save_apple_transaction,
     validate_apple_transaction,
 )
@@ -102,6 +103,7 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
                     );
                     """
                 )
+            ensure_apple_economic_ledger_schema(conn)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -179,6 +181,14 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
         result = self.save(self.transaction(self.create_user()))
         self.assertTrue(result.created)
         self.assertEqual(self.row_count(), 1)
+
+    def test_normal_transaction_leaves_economic_fields_null(self):
+        result = self.save(self.transaction(self.create_user()))
+        self.assertIsNone(result.row["price_milliunits"])
+        self.assertIsNone(result.row["currency"])
+        self.assertIsNone(result.row["economic_transaction_signed_at"])
+        self.assertIsNone(result.row["economic_adjustment"])
+        self.assertIsNone(result.row["economic_notification_signed_at"])
 
     def test_new_transaction_accepts_app_account_token_uuid(self):
         app_account_token = uuid4()

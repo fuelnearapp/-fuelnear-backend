@@ -3832,6 +3832,11 @@ def ensure_auth_schema(conn) -> None:
                 signed_date TIMESTAMPTZ NULL,
                 storefront TEXT NULL,
                 offer_type INTEGER NULL,
+                price_milliunits BIGINT NULL,
+                currency VARCHAR(3) NULL,
+                economic_transaction_signed_at TIMESTAMPTZ NULL,
+                economic_adjustment TEXT NULL,
+                economic_notification_signed_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -3843,6 +3848,7 @@ def ensure_auth_schema(conn) -> None:
             ADD COLUMN IF NOT EXISTS grace_period_expires_date TIMESTAMPTZ NULL;
             """
         )
+        apple_subscriptions.ensure_apple_economic_ledger_schema(conn)
         guest_subscriptions.ensure_guest_subscription_schema(conn)
         cur.execute(
             """
