@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
-from typing import Any, Final
+from typing import Any, Final, Mapping
 
 from psycopg2.extras import RealDictCursor
 
@@ -95,6 +95,11 @@ class CreatorAppleConversionConflictError(CreatorAttributionError):
     default_message = "Apple creator conversion identity conflicts with existing data"
 
 
+class CreatorReferralConversionConflictError(CreatorAttributionError):
+    error_code = "CREATOR_REFERRAL_CONVERSION_CONFLICT"
+    default_message = "Referral creator conversion identity conflicts with existing data"
+
+
 @dataclass(frozen=True)
 class CreatorCampaign:
     id: int
@@ -124,6 +129,16 @@ class CreatorAppleConversionResult:
     attribution_id: int
     conversion_type: str
     economic_status: str
+    occurred_at: datetime
+    created: bool
+    changed: bool
+    plus_milestone_set: bool
+
+
+@dataclass(frozen=True)
+class CreatorReferralConversionResult:
+    event_id: int
+    attribution_id: int
     occurred_at: datetime
     created: bool
     changed: bool
@@ -689,6 +704,135 @@ def apply_creator_attribution(
         if concurrent_attribution is None:
             raise CreatorAttributionConcurrencyError
         return _resolve_existing_attribution(concurrent_attribution, campaign.id)
+
+
+def record_creator_referral_conversion(
+    conn: Any,
+    reward: Mapping[str, Any],
+) -> CreatorReferralConversionResult | None:
+    """Record an eligible persisted referral reward in the caller's transaction."""
+    if not isinstance(reward, Mapping):
+        raise ValueError("reward must be a mapping")
+
+    reward_id = reward.get("id")
+    user_id = reward.get("user_id")
+    granted_at = reward.get("granted_at")
+    if (
+        isinstance(reward_id, bool)
+        or not isinstance(reward_id, int)
+        or reward_id <= 0
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+        or reward.get("reward_type") != "plus_days"
+        or reward.get("status") != "granted"
+        or not isinstance(granted_at, datetime)
+        or granted_at.tzinfo is None
+        or granted_at.utcoffset() is None
+    ):
+        return None
+
+    external_event_key = f"reward:{reward_id}"
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, attributed_at
+            FROM creator_attributions
+            WHERE user_id = %s
+              AND status = 'active'
+              AND user_deleted = FALSE
+              AND user_id IS NOT NULL
+            LIMIT 1
+            FOR UPDATE;
+            """,
+            (user_id,),
+        )
+        attribution = cur.fetchone()
+        if attribution is None:
+            return None
+
+        attributed_at = _normalize_reference_date(
+            attribution["attributed_at"],
+            "attributed_at",
+        )
+        normalized_granted_at = _normalize_reference_date(granted_at, "granted_at")
+        if normalized_granted_at < attributed_at:
+            return None
+
+        cur.execute(
+            """
+            INSERT INTO creator_conversion_events (
+                attribution_id,
+                conversion_type,
+                provider,
+                external_event_key,
+                occurred_at,
+                product_id,
+                economic_status,
+                amount,
+                currency
+            )
+            VALUES (%s, 'plus_granted', 'internal_referral', %s, %s,
+                    NULL, 'non_economic', NULL, NULL)
+            ON CONFLICT (provider, external_event_key) DO NOTHING
+            RETURNING id;
+            """,
+            (attribution["id"], external_event_key, normalized_granted_at),
+        )
+        inserted_event = cur.fetchone()
+        created = inserted_event is not None
+
+        if created:
+            event_id = int(inserted_event["id"])
+        else:
+            cur.execute(
+                """
+                SELECT id, attribution_id, conversion_type, occurred_at,
+                       product_id, economic_status
+                FROM creator_conversion_events
+                WHERE provider = 'internal_referral'
+                  AND external_event_key = %s
+                LIMIT 1
+                FOR UPDATE;
+                """,
+                (external_event_key,),
+            )
+            existing_event = cur.fetchone()
+            if (
+                existing_event is None
+                or int(existing_event["attribution_id"]) != int(attribution["id"])
+                or existing_event["conversion_type"] != "plus_granted"
+                or existing_event["occurred_at"] != normalized_granted_at
+                or existing_event["product_id"] is not None
+                or existing_event["economic_status"] != "non_economic"
+            ):
+                raise CreatorReferralConversionConflictError
+            event_id = int(existing_event["id"])
+
+        cur.execute(
+            """
+            UPDATE creator_attributions
+            SET plus_converted_at = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND status = 'active'
+              AND user_deleted = FALSE
+              AND user_id IS NOT NULL
+              AND plus_converted_at IS NULL
+            RETURNING id;
+            """,
+            (normalized_granted_at, attribution["id"]),
+        )
+        plus_milestone_set = cur.fetchone() is not None
+
+    return CreatorReferralConversionResult(
+        event_id=event_id,
+        attribution_id=int(attribution["id"]),
+        occurred_at=normalized_granted_at,
+        created=created,
+        changed=created or plus_milestone_set,
+        plus_milestone_set=plus_milestone_set,
+    )
 
 
 def _normalize_apple_conversion_value(value: str | None) -> str | None:

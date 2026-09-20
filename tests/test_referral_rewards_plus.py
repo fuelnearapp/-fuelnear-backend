@@ -201,6 +201,10 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
                 cur.execute(
                     """
                     TRUNCATE
+                        creator_conversion_events,
+                        creator_attributions,
+                        creator_campaigns,
+                        creators,
                         auth_rate_limits,
                         user_device_tokens,
                         user_auth_providers,
@@ -354,6 +358,88 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
         referred = self.create_user(f"referred-{suffix}@example.com")
         referral_id = self.make_referral(referrer["id"], referred["id"])
         return referrer, referred, referral_id
+
+    def create_creator_attribution(
+        self,
+        user_id: int,
+        *,
+        attributed_at: datetime | None = None,
+        status: str = "active",
+        user_deleted: bool = False,
+        plus_converted_at: datetime | None = None,
+        paid_plus_converted_at: datetime | None = None,
+    ) -> int:
+        attributed_at = attributed_at or datetime.now(timezone.utc) - timedelta(days=1)
+        creator_slug = f"test-creator-{user_id}"
+        creator_code = f"CREATOR{user_id:04d}"
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO creators (name, slug, status)
+                    VALUES ('Test Creator', %s, 'active')
+                    RETURNING id;
+                    """,
+                    (creator_slug,),
+                )
+                creator_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (
+                        creator_id, name, code, status,
+                        compensation_type, compensation_value
+                    )
+                    VALUES (%s, 'Test Campaign', %s, 'active', 'none', NULL)
+                    RETURNING id;
+                    """,
+                    (creator_id, creator_code),
+                )
+                campaign_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO creator_attributions (
+                        campaign_id, user_id, code_used, source, attributed_at,
+                        plus_converted_at, paid_plus_converted_at, status, user_deleted
+                    )
+                    VALUES (%s, %s, %s, 'email_registration', %s,
+                            %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        campaign_id,
+                        user_id,
+                        creator_code,
+                        attributed_at,
+                        plus_converted_at,
+                        paid_plus_converted_at,
+                        status,
+                        user_deleted,
+                    ),
+                )
+                return int(cur.fetchone()[0])
+
+    def create_reward_row(
+        self,
+        user_id: int,
+        granted_at: datetime,
+        *,
+        reward_type: str = "plus_days",
+        status: str = "granted",
+    ) -> dict:
+        with main.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO rewards (
+                        user_id, referral_id, reward_type, reward_value,
+                        status, granted_at, created_at, updated_at
+                    )
+                    VALUES (%s, NULL, %s, '7', %s, %s, %s, %s)
+                    RETURNING *;
+                    """,
+                    (user_id, reward_type, status, granted_at, granted_at, granted_at),
+                )
+                return dict(cur.fetchone())
 
     def test_01_registration_without_referral_code(self):
         response = self.register("plain@example.com")
@@ -864,6 +950,254 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 500)
         self.assertEqual(cm.exception.detail, "Referral processing failed")
         self.assertNotIn("SELECT", cm.exception.detail)
+
+    def test_54_invitee_attribution_does_not_receive_referrer_conversion(self):
+        referrer, invitee, _ = self.create_mature_referral_pair()
+        invitee_attribution_id = self.create_creator_attribution(invitee["id"])
+
+        self.process()
+
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT COUNT(*) FROM creator_conversion_events WHERE attribution_id = %s;",
+                (invitee_attribution_id,),
+            ),
+            0,
+        )
+        self.assertIsNone(
+            self.fetch_value(
+                "SELECT plus_converted_at FROM creator_attributions WHERE id = %s;",
+                (invitee_attribution_id,),
+            )
+        )
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM rewards WHERE user_id = %s;", (referrer["id"],)), 1)
+
+    def test_55_conversion_belongs_only_to_persisted_reward_beneficiary(self):
+        referrer, invitee, _ = self.create_mature_referral_pair()
+        referrer_attribution_id = self.create_creator_attribution(referrer["id"])
+        invitee_attribution_id = self.create_creator_attribution(invitee["id"])
+
+        self.process()
+
+        event = self.fetch_one(
+            """
+            SELECT attribution_id, conversion_type, provider, external_event_key,
+                   occurred_at, product_id, economic_status, amount, currency
+            FROM creator_conversion_events;
+            """
+        )
+        reward = self.fetch_one("SELECT id, user_id, granted_at FROM rewards;")
+        self.assertEqual(event["attribution_id"], referrer_attribution_id)
+        self.assertNotEqual(event["attribution_id"], invitee_attribution_id)
+        self.assertEqual(reward["user_id"], referrer["id"])
+        self.assertEqual(event["external_event_key"], f"reward:{reward['id']}")
+        self.assertEqual(event["occurred_at"], reward["granted_at"])
+        self.assertEqual(event["conversion_type"], "plus_granted")
+        self.assertEqual(event["provider"], "internal_referral")
+        self.assertEqual(event["economic_status"], "non_economic")
+        self.assertIsNone(event["product_id"])
+        self.assertIsNone(event["amount"])
+        self.assertIsNone(event["currency"])
+
+    def test_56_invalid_and_anonymized_attributions_are_ignored(self):
+        invalid_user = self.create_user("invalid-creator@example.com")
+        anonymized_user = self.create_user("anonymized-creator@example.com")
+        self.create_creator_attribution(invalid_user["id"], status="invalid")
+        self.create_creator_attribution(
+            anonymized_user["id"],
+            status="anonymized",
+            user_deleted=True,
+        )
+        now = datetime.now(timezone.utc)
+
+        for user in (invalid_user, anonymized_user):
+            reward = self.create_reward_row(user["id"], now)
+            with main.get_connection() as conn:
+                result = main.creator_attribution.record_creator_referral_conversion(
+                    conn,
+                    reward,
+                )
+            self.assertIsNone(result)
+
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 0)
+
+    def test_57_referral_conversion_temporal_boundary_is_inclusive(self):
+        user = self.create_user("boundary@example.com")
+        attributed_at = datetime.now(timezone.utc) - timedelta(days=1)
+        attribution_id = self.create_creator_attribution(
+            user["id"],
+            attributed_at=attributed_at,
+        )
+        earlier_reward = self.create_reward_row(
+            user["id"],
+            attributed_at - timedelta(microseconds=1),
+        )
+        boundary_reward = self.create_reward_row(user["id"], attributed_at)
+
+        with main.get_connection() as conn:
+            earlier_result = main.creator_attribution.record_creator_referral_conversion(
+                conn,
+                earlier_reward,
+            )
+            boundary_result = main.creator_attribution.record_creator_referral_conversion(
+                conn,
+                boundary_reward,
+            )
+
+        self.assertIsNone(earlier_result)
+        self.assertTrue(boundary_result.created)
+        self.assertEqual(boundary_result.occurred_at, attributed_at)
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT plus_converted_at FROM creator_attributions WHERE id = %s;",
+                (attribution_id,),
+            ),
+            attributed_at,
+        )
+
+    def test_58_referral_conversion_is_idempotent(self):
+        referrer, _, referral_id = self.create_mature_referral_pair()
+        self.create_creator_attribution(referrer["id"])
+
+        with main.get_connection() as conn:
+            first = main.grant_plus_days_reward(conn, referrer["id"], referral_id, 7)
+            second = main.grant_plus_days_reward(conn, referrer["id"], referral_id, 7)
+        reward = self.fetch_one("SELECT * FROM rewards WHERE referral_id = %s;", (referral_id,))
+        with main.get_connection() as conn:
+            replay = main.creator_attribution.record_creator_referral_conversion(
+                conn,
+                reward,
+            )
+
+        self.assertFalse(first["already_granted"])
+        self.assertTrue(second["already_granted"])
+        self.assertFalse(replay.created)
+        self.assertFalse(replay.changed)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 1)
+
+    def test_59_existing_reward_is_not_implicitly_backfilled(self):
+        referrer, _, referral_id = self.create_mature_referral_pair()
+        self.create_creator_attribution(referrer["id"])
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO rewards (
+                        user_id, referral_id, reward_type, reward_value,
+                        status, granted_at, created_at, updated_at
+                    )
+                    VALUES (%s, %s, 'plus_days', '7', 'granted', NOW(), NOW(), NOW());
+                    """,
+                    (referrer["id"], referral_id),
+                )
+
+        with main.get_connection() as conn:
+            result = main.grant_plus_days_reward(conn, referrer["id"], referral_id, 7)
+
+        self.assertTrue(result["already_granted"])
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 0)
+
+    def test_60_apple_first_preserves_milestones_and_records_referral(self):
+        referrer, _, _ = self.create_mature_referral_pair()
+        attributed_at = datetime.now(timezone.utc) - timedelta(days=2)
+        apple_occurred_at = datetime.now(timezone.utc) - timedelta(days=1)
+        paid_milestone = apple_occurred_at + timedelta(hours=1)
+        attribution_id = self.create_creator_attribution(
+            referrer["id"],
+            attributed_at=attributed_at,
+            plus_converted_at=apple_occurred_at,
+            paid_plus_converted_at=paid_milestone,
+        )
+
+        self.process()
+
+        attribution = self.fetch_one(
+            """
+            SELECT plus_converted_at, paid_plus_converted_at
+            FROM creator_attributions
+            WHERE id = %s;
+            """,
+            (attribution_id,),
+        )
+        self.assertEqual(attribution["plus_converted_at"], apple_occurred_at)
+        self.assertEqual(attribution["paid_plus_converted_at"], paid_milestone)
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT COUNT(*) FROM creator_conversion_events WHERE provider = 'internal_referral';"
+            ),
+            1,
+        )
+
+    def test_61_referral_first_is_not_rewritten_by_later_apple_event(self):
+        referrer, _, _ = self.create_mature_referral_pair()
+        attribution_id = self.create_creator_attribution(referrer["id"])
+        self.process()
+        referral_milestone = self.fetch_value(
+            "SELECT plus_converted_at FROM creator_attributions WHERE id = %s;",
+            (attribution_id,),
+        )
+        apple_purchase_date = referral_milestone + timedelta(hours=1)
+
+        with main.get_connection() as conn:
+            main.creator_attribution.record_creator_apple_conversion(
+                conn,
+                user_id=referrer["id"],
+                transaction_id="creator-apple-after-referral",
+                original_transaction_id="creator-apple-original",
+                purchase_date=apple_purchase_date,
+                product_id="MB.FuelNear.plus.monthly",
+                transaction_reason="PURCHASE",
+                ownership_type="PURCHASED",
+            )
+
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT plus_converted_at FROM creator_attributions WHERE id = %s;",
+                (attribution_id,),
+            ),
+            referral_milestone,
+        )
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 2)
+
+    def test_62_non_plus_or_non_granted_rewards_are_ignored(self):
+        user = self.create_user("ineligible-reward@example.com")
+        self.create_creator_attribution(user["id"])
+        now = datetime.now(timezone.utc)
+        rewards = [
+            self.create_reward_row(user["id"], now, reward_type="other"),
+            self.create_reward_row(user["id"], now, status="pending"),
+        ]
+
+        with main.get_connection() as conn:
+            results = [
+                main.creator_attribution.record_creator_referral_conversion(conn, reward)
+                for reward in rewards
+            ]
+
+        self.assertEqual(results, [None, None])
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 0)
+
+    def test_63_creator_failure_rolls_back_reward_and_referral_item(self):
+        _, _, referral_id = self.create_mature_referral_pair()
+        original = main.creator_attribution.record_creator_referral_conversion
+
+        def fail(_conn, _reward):
+            raise RuntimeError("simulated creator conversion failure")
+
+        main.creator_attribution.record_creator_referral_conversion = fail
+        try:
+            result = self.process()
+        finally:
+            main.creator_attribution.record_creator_referral_conversion = original
+
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM rewards;"), 0)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 0)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_subscriptions;"), 0)
+        self.assertEqual(
+            self.fetch_value("SELECT status FROM referrals WHERE id = %s;", (referral_id,)),
+            "pending",
+        )
 
 
 if __name__ == "__main__":

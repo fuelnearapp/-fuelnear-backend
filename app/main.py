@@ -1524,7 +1524,8 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
             )
             VALUES (%s, %s, 'plus_days', %s, 'granted', NOW(), NOW(), NOW())
             ON CONFLICT (referral_id) WHERE referral_id IS NOT NULL DO NOTHING
-            RETURNING id, referral_id, reward_type, reward_value, status, granted_at, expires_at, created_at, updated_at;
+            RETURNING id, user_id, referral_id, reward_type, reward_value, status,
+                      granted_at, expires_at, created_at, updated_at;
             """,
             (user_id, referral_id, str(days)),
         )
@@ -1533,7 +1534,7 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
         if reward_row is None:
             cur.execute(
                 """
-                SELECT id, referral_id, reward_type, reward_value, status,
+                SELECT id, user_id, referral_id, reward_type, reward_value, status,
                        granted_at, expires_at, created_at, updated_at
                 FROM rewards
                 WHERE referral_id = %s
@@ -1552,9 +1553,11 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
             )
             print("[PLUS] subscription_extended=false")
             print("[PLUS] subscription_created=false")
+            existing_reward_payload = dict(existing_reward)
+            existing_reward_payload.pop("user_id", None)
             return {
                 "reward": serialize_datetime_fields(
-                    [dict(existing_reward)],
+                    [existing_reward_payload],
                     ["granted_at", "expires_at", "created_at", "updated_at"],
                 )[0],
                 "subscription": (
@@ -1568,6 +1571,10 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
                 "already_granted": True,
             }
 
+        creator_attribution.record_creator_referral_conversion(
+            conn,
+            dict(reward_row),
+        )
         components = plus_entitlements.reconcile_user_plus_entitlement(
             conn,
             user_id,
@@ -1582,8 +1589,10 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
         print(f"[PLUS] subscription_extended={str(subscription_extended).lower()}")
         print(f"[PLUS] subscription_created={str(subscription_created).lower()}")
 
+    reward_payload = dict(reward_row)
+    reward_payload.pop("user_id", None)
     return {
-        "reward": serialize_datetime_fields([dict(reward_row)], ["granted_at", "expires_at", "created_at", "updated_at"])[0],
+        "reward": serialize_datetime_fields([reward_payload], ["granted_at", "expires_at", "created_at", "updated_at"])[0],
         "subscription": serialize_datetime_fields([dict(subscription_row)], ["starts_at", "expires_at", "created_at", "updated_at"])[0],
         "already_granted": False,
     }

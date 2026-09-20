@@ -18,6 +18,7 @@ from app import main
 import app.apple_subscription_reconciler as reconciler
 import app.apple_subscription_service as service
 import app.apple_subscriptions as repository
+import app.creator_attribution as creator_attribution
 from app import plus_entitlements
 
 
@@ -144,6 +145,7 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
                     WHERE referral_id IS NOT NULL;
                     """
                 )
+            creator_attribution.ensure_creator_attribution_schema(conn)
 
     @classmethod
     def tearDownClass(cls) -> None:
