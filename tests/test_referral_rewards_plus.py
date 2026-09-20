@@ -441,6 +441,24 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
                 )
                 return dict(cur.fetchone())
 
+    def apple_economic_state(
+        self,
+        *,
+        price_milliunits: int | None = None,
+        currency: str | None = None,
+        economic_adjustment: str | None = None,
+    ):
+        return main.apple_subscriptions.derive_apple_creator_economic_state(
+            {
+                "environment": "Production",
+                "ownership_type": "PURCHASED",
+                "transaction_reason": "PURCHASE",
+                "price_milliunits": price_milliunits,
+                "currency": currency,
+                "economic_adjustment": economic_adjustment,
+            }
+        )
+
     def test_01_registration_without_referral_code(self):
         response = self.register("plain@example.com")
         self.assertIsNone(response["user"]["referred_by_user_id"])
@@ -1148,6 +1166,10 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
                 product_id="MB.FuelNear.plus.monthly",
                 transaction_reason="PURCHASE",
                 ownership_type="PURCHASED",
+                economic_state=self.apple_economic_state(
+                    price_milliunits=4990,
+                    currency="EUR",
+                ),
             )
 
         self.assertEqual(
@@ -1202,7 +1224,7 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
     def test_64_apple_adjustments_preserve_existing_creator_semantics(self):
         user = self.create_user("apple-adjustment@example.com")
         occurred_at = datetime.now(timezone.utc)
-        paid_milestone = occurred_at + timedelta(minutes=1)
+        paid_milestone = occurred_at - timedelta(minutes=1)
         attribution_id = self.create_creator_attribution(
             user["id"],
             attributed_at=occurred_at - timedelta(days=1),
@@ -1222,33 +1244,50 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
             initial = main.creator_attribution.record_creator_apple_conversion(
                 conn,
                 **common,
+                economic_state=self.apple_economic_state(),
             )
             refunded = main.creator_attribution.record_creator_apple_conversion(
                 conn,
                 **common,
-                notification_type="REFUND",
+                economic_state=self.apple_economic_state(
+                    price_milliunits=4990,
+                    currency="EUR",
+                    economic_adjustment="refund",
+                ),
             )
             reversed_result = main.creator_attribution.record_creator_apple_conversion(
                 conn,
                 **common,
-                notification_type="REFUND_REVERSED",
+                economic_state=self.apple_economic_state(
+                    price_milliunits=4990,
+                    currency="EUR",
+                    economic_adjustment="refund_reversed",
+                ),
             )
             revoked = main.creator_attribution.record_creator_apple_conversion(
                 conn,
                 **common,
-                notification_type="REVOKE",
+                economic_state=self.apple_economic_state(
+                    price_milliunits=4990,
+                    currency="EUR",
+                    economic_adjustment="revoke",
+                ),
             )
             reversal_after_revoke = (
                 main.creator_attribution.record_creator_apple_conversion(
                     conn,
                     **common,
-                    notification_type="REFUND_REVERSED",
+                    economic_state=self.apple_economic_state(
+                        price_milliunits=4990,
+                        currency="EUR",
+                        economic_adjustment="revoke",
+                    ),
                 )
             )
 
         self.assertEqual(initial.economic_status, "verified_unknown_value")
         self.assertEqual(refunded.economic_status, "refunded")
-        self.assertEqual(reversed_result.economic_status, "verified_unknown_value")
+        self.assertEqual(reversed_result.economic_status, "confirmed")
         self.assertEqual(revoked.economic_status, "revoked")
         self.assertEqual(reversal_after_revoke.economic_status, "revoked")
         self.assertEqual(

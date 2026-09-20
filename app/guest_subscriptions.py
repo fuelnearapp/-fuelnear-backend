@@ -9,7 +9,12 @@ from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
-from app import apple_subscription_reconciler, apple_subscription_service, creator_attribution
+from app import (
+    apple_subscription_reconciler,
+    apple_subscription_service,
+    apple_subscriptions,
+    creator_attribution,
+)
 from app.auth_utils import hash_token
 from app.db import get_connection
 
@@ -529,6 +534,11 @@ def claim_guest_subscription(user_id: int, guest_token: str) -> GuestClaimResult
                 transferred_transactions = cur.rowcount
 
                 for transaction in guest_transactions:
+                    economic_state = (
+                        apple_subscriptions.derive_apple_creator_economic_state(
+                            transaction
+                        )
+                    )
                     creator_attribution.record_creator_apple_conversion(
                         conn,
                         user_id=user_id,
@@ -540,6 +550,7 @@ def claim_guest_subscription(user_id: int, guest_token: str) -> GuestClaimResult
                         product_id=str(transaction["product_id"]),
                         transaction_reason=transaction.get("transaction_reason"),
                         ownership_type=transaction.get("ownership_type"),
+                        economic_state=economic_state,
                         revocation_date=transaction.get("revocation_date"),
                     )
 

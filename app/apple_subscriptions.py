@@ -85,6 +85,14 @@ class AppleBaseEconomicStatus(str, Enum):
     VERIFIED_UNKNOWN_VALUE = "verified_unknown_value"
 
 
+class AppleCreatorEconomicStatus(str, Enum):
+    CONFIRMED = "confirmed"
+    NON_ECONOMIC = "non_economic"
+    VERIFIED_UNKNOWN_VALUE = "verified_unknown_value"
+    REFUNDED = "refunded"
+    REVOKED = "revoked"
+
+
 @dataclass(frozen=True, slots=True)
 class AppleEconomicEvidence:
     status: AppleEconomicEvidenceStatus
@@ -99,6 +107,13 @@ class AppleEconomicEvidence:
         if self.price_milliunits is None:
             return None
         return Decimal(self.price_milliunits) / Decimal(1000)
+
+
+@dataclass(frozen=True, slots=True)
+class AppleCreatorEconomicState:
+    status: AppleCreatorEconomicStatus
+    amount: Decimal | None = None
+    currency: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +187,55 @@ def derive_apple_base_economic_status(
     if transaction_reason not in {"PURCHASE", "RENEWAL"}:
         return AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE
     return AppleBaseEconomicStatus.CONFIRMED_CANDIDATE
+
+
+def derive_apple_creator_economic_state(
+    transaction: Mapping[str, Any],
+) -> AppleCreatorEconomicState:
+    base_status = derive_apple_base_economic_status(transaction)
+    adjustment = transaction.get("economic_adjustment")
+    if adjustment is not None:
+        if not isinstance(adjustment, str):
+            raise AppleTransactionValidationError("economic_adjustment is invalid")
+        adjustment = adjustment.strip().lower()
+        if adjustment not in APPLE_ECONOMIC_ADJUSTMENTS:
+            raise AppleTransactionValidationError("economic_adjustment is invalid")
+
+    if base_status is AppleBaseEconomicStatus.CONFIRMED_CANDIDATE:
+        evidence = normalize_apple_economic_evidence(
+            transaction.get("price_milliunits"),
+            transaction.get("currency"),
+        )
+        amount = evidence.amount
+        currency = evidence.currency
+    else:
+        amount = None
+        currency = None
+
+    if adjustment == "revoke":
+        status = AppleCreatorEconomicStatus.REVOKED
+    elif adjustment == "refund":
+        status = AppleCreatorEconomicStatus.REFUNDED
+    elif adjustment == "revocation_unknown":
+        status = (
+            AppleCreatorEconomicStatus.NON_ECONOMIC
+            if base_status is AppleBaseEconomicStatus.NON_ECONOMIC
+            else AppleCreatorEconomicStatus.VERIFIED_UNKNOWN_VALUE
+        )
+        amount = None
+        currency = None
+    elif base_status is AppleBaseEconomicStatus.CONFIRMED_CANDIDATE:
+        status = AppleCreatorEconomicStatus.CONFIRMED
+    elif base_status is AppleBaseEconomicStatus.NON_ECONOMIC:
+        status = AppleCreatorEconomicStatus.NON_ECONOMIC
+    else:
+        status = AppleCreatorEconomicStatus.VERIFIED_UNKNOWN_VALUE
+
+    return AppleCreatorEconomicState(
+        status=status,
+        amount=amount,
+        currency=currency,
+    )
 
 
 def _next_apple_economic_adjustment(

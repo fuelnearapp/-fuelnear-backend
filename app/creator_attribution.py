@@ -7,6 +7,8 @@ from typing import Any, Final, Mapping
 
 from psycopg2.extras import RealDictCursor
 
+from app import apple_subscriptions
+
 
 CREATOR_CODE_PATTERN: Final[str] = r"^[A-Z0-9]{9,32}$"
 CREATOR_ATTRIBUTION_SOURCES: Final[frozenset[str]] = frozenset(
@@ -18,9 +20,6 @@ CREATOR_ATTRIBUTION_SOURCES: Final[frozenset[str]] = frozenset(
     }
 )
 _CREATOR_CODE_RE: Final[re.Pattern[str]] = re.compile(CREATOR_CODE_PATTERN)
-_APPLE_NOTIFICATION_REFUND: Final[str] = "REFUND"
-_APPLE_NOTIFICATION_REFUND_REVERSED: Final[str] = "REFUND_REVERSED"
-_APPLE_NOTIFICATION_REVOKE: Final[str] = "REVOKE"
 _APPLE_OWNERSHIP_FAMILY_SHARED: Final[str] = "FAMILY_SHARED"
 _APPLE_OWNERSHIP_PURCHASED: Final[str] = "PURCHASED"
 _APPLE_REASON_PURCHASE: Final[str] = "PURCHASE"
@@ -133,6 +132,7 @@ class CreatorAppleConversionResult:
     created: bool
     changed: bool
     plus_milestone_set: bool
+    paid_milestone_changed: bool
 
 
 @dataclass(frozen=True)
@@ -858,20 +858,6 @@ def _apple_conversion_identity(
     return None
 
 
-def _next_apple_economic_status(
-    current_status: str,
-    base_status: str,
-    notification_type: str | None,
-) -> str:
-    if notification_type == _APPLE_NOTIFICATION_REVOKE:
-        return "revoked"
-    if notification_type == _APPLE_NOTIFICATION_REFUND:
-        return "revoked" if current_status == "revoked" else "refunded"
-    if notification_type == _APPLE_NOTIFICATION_REFUND_REVERSED:
-        return base_status if current_status == "refunded" else current_status
-    return current_status
-
-
 def _set_plus_conversion_milestone(
     cur: Any,
     attribution_id: int,
@@ -904,6 +890,34 @@ def _set_plus_conversion_milestone(
     return cur.fetchone() is not None
 
 
+def _update_paid_plus_conversion_milestone(
+    cur: Any,
+    attribution_id: int,
+    occurred_at: datetime,
+) -> bool:
+    cur.execute(
+        """
+        UPDATE creator_attributions
+        SET paid_plus_converted_at = CASE
+                WHEN paid_plus_converted_at IS NULL THEN %s
+                ELSE LEAST(paid_plus_converted_at, %s)
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND status = 'active'
+          AND user_deleted = FALSE
+          AND user_id IS NOT NULL
+          AND (
+              paid_plus_converted_at IS NULL
+              OR %s < paid_plus_converted_at
+          )
+        RETURNING id;
+        """,
+        (occurred_at, occurred_at, attribution_id, occurred_at),
+    )
+    return cur.fetchone() is not None
+
+
 def record_creator_apple_conversion(
     conn: Any,
     *,
@@ -914,9 +928,8 @@ def record_creator_apple_conversion(
     product_id: str,
     transaction_reason: str | None,
     ownership_type: str | None,
+    economic_state: apple_subscriptions.AppleCreatorEconomicState,
     revocation_date: datetime | None = None,
-    notification_type: str | None = None,
-    notification_subtype: str | None = None,
 ) -> CreatorAppleConversionResult | None:
     """Record one server-verified Apple event in the caller's transaction."""
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
@@ -927,6 +940,11 @@ def record_creator_apple_conversion(
         raise ValueError("original_transaction_id is required")
     if not isinstance(product_id, str) or not product_id.strip():
         raise ValueError("product_id is required")
+    if not isinstance(
+        economic_state,
+        apple_subscriptions.AppleCreatorEconomicState,
+    ):
+        raise ValueError("economic_state must be an AppleCreatorEconomicState")
 
     normalized_transaction_id = transaction_id.strip()
     normalized_original_transaction_id = original_transaction_id.strip()
@@ -936,12 +954,19 @@ def record_creator_apple_conversion(
         _normalize_reference_date(revocation_date, "revocation_date")
     normalized_reason = _normalize_apple_conversion_value(transaction_reason)
     normalized_ownership = _normalize_apple_conversion_value(ownership_type)
-    normalized_notification_type = _normalize_apple_conversion_value(notification_type)
+    effective_status = economic_state.status.value
+    effective_amount = economic_state.amount
+    effective_currency = economic_state.currency
+    if revocation_date is not None and effective_status not in {
+        "refunded",
+        "revoked",
+    }:
+        return None
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT id, attributed_at, plus_converted_at
+            SELECT id, attributed_at, plus_converted_at, paid_plus_converted_at
             FROM creator_attributions
             WHERE user_id = %s
               AND status = 'active'
@@ -970,7 +995,9 @@ def record_creator_apple_conversion(
                 conversion_type,
                 occurred_at,
                 product_id,
-                economic_status
+                economic_status,
+                amount,
+                currency
             FROM creator_conversion_events
             WHERE provider = 'apple'
               AND external_event_key = %s
@@ -984,26 +1011,38 @@ def record_creator_apple_conversion(
             if int(existing_event["attribution_id"]) != int(attribution["id"]):
                 raise CreatorAppleConversionConflictError
 
-            base_status = (
-                "non_economic"
-                if existing_event["conversion_type"] == "plus_granted"
-                else "verified_unknown_value"
+            desired_amount = effective_amount
+            desired_currency = effective_currency
+            if (
+                effective_status in {"refunded", "revoked"}
+                and desired_amount is None
+                and existing_event["amount"] is not None
+                and existing_event["currency"] is not None
+            ):
+                desired_amount = existing_event["amount"]
+                desired_currency = existing_event["currency"]
+
+            event_changed = (
+                effective_status != existing_event["economic_status"]
+                or desired_amount != existing_event["amount"]
+                or desired_currency != existing_event["currency"]
             )
-            next_status = _next_apple_economic_status(
-                existing_event["economic_status"],
-                base_status,
-                normalized_notification_type,
-            )
-            status_changed = next_status != existing_event["economic_status"]
-            if status_changed:
+            if event_changed:
                 cur.execute(
                     """
                     UPDATE creator_conversion_events
                     SET economic_status = %s,
+                        amount = %s,
+                        currency = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s;
                     """,
-                    (next_status, existing_event["id"]),
+                    (
+                        effective_status,
+                        desired_amount,
+                        desired_currency,
+                        existing_event["id"],
+                    ),
                 )
 
             plus_milestone_set = _set_plus_conversion_milestone(
@@ -1012,30 +1051,37 @@ def record_creator_apple_conversion(
                 existing_event["occurred_at"],
                 existing_event["conversion_type"],
                 normalized_reason,
-                next_status,
+                effective_status,
+            )
+            paid_milestone_changed = (
+                _update_paid_plus_conversion_milestone(
+                    cur,
+                    int(attribution["id"]),
+                    existing_event["occurred_at"],
+                )
+                if effective_status == "confirmed"
+                else False
             )
             return CreatorAppleConversionResult(
                 event_id=int(existing_event["id"]),
                 attribution_id=int(attribution["id"]),
                 conversion_type=existing_event["conversion_type"],
-                economic_status=next_status,
+                economic_status=effective_status,
                 occurred_at=existing_event["occurred_at"],
                 created=False,
-                changed=status_changed or plus_milestone_set,
+                changed=(
+                    event_changed
+                    or plus_milestone_set
+                    or paid_milestone_changed
+                ),
                 plus_milestone_set=plus_milestone_set,
+                paid_milestone_changed=paid_milestone_changed,
             )
 
         identity = _apple_conversion_identity(normalized_reason, normalized_ownership)
         if identity is None:
             return None
-        conversion_type, base_status = identity
-
-        if revocation_date is not None and normalized_notification_type not in {
-            _APPLE_NOTIFICATION_REFUND,
-            _APPLE_NOTIFICATION_REFUND_REVERSED,
-            _APPLE_NOTIFICATION_REVOKE,
-        }:
-            return None
+        conversion_type, _ = identity
 
         if normalized_reason == _APPLE_REASON_RENEWAL:
             cur.execute(
@@ -1058,12 +1104,6 @@ def record_creator_apple_conversion(
             if not any(value >= attributed_at for value in purchase_dates):
                 return None
 
-        economic_status = base_status
-        if normalized_notification_type == _APPLE_NOTIFICATION_REVOKE:
-            economic_status = "revoked"
-        elif normalized_notification_type == _APPLE_NOTIFICATION_REFUND:
-            economic_status = "refunded"
-
         cur.execute(
             """
             INSERT INTO creator_conversion_events (
@@ -1077,7 +1117,7 @@ def record_creator_apple_conversion(
                 amount,
                 currency
             )
-            VALUES (%s, %s, 'apple', %s, %s, %s, %s, NULL, NULL)
+            VALUES (%s, %s, 'apple', %s, %s, %s, %s, %s, %s)
             ON CONFLICT (provider, external_event_key) DO NOTHING
             RETURNING id;
             """,
@@ -1087,7 +1127,9 @@ def record_creator_apple_conversion(
                 normalized_transaction_id,
                 normalized_purchase_date,
                 normalized_product_id,
-                economic_status,
+                effective_status,
+                effective_amount,
+                effective_currency,
             ),
         )
         inserted_event = cur.fetchone()
@@ -1119,6 +1161,7 @@ def record_creator_apple_conversion(
                 created=False,
                 changed=False,
                 plus_milestone_set=False,
+                paid_milestone_changed=False,
             )
 
         plus_milestone_set = _set_plus_conversion_milestone(
@@ -1127,15 +1170,25 @@ def record_creator_apple_conversion(
             normalized_purchase_date,
             conversion_type,
             normalized_reason,
-            economic_status,
+            effective_status,
+        )
+        paid_milestone_changed = (
+            _update_paid_plus_conversion_milestone(
+                cur,
+                int(attribution["id"]),
+                normalized_purchase_date,
+            )
+            if effective_status == "confirmed"
+            else False
         )
         return CreatorAppleConversionResult(
             event_id=int(inserted_event["id"]),
             attribution_id=int(attribution["id"]),
             conversion_type=conversion_type,
-            economic_status=economic_status,
+            economic_status=effective_status,
             occurred_at=normalized_purchase_date,
             created=True,
             changed=True,
             plus_milestone_set=plus_milestone_set,
+            paid_milestone_changed=paid_milestone_changed,
         )

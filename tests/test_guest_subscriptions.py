@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 import shutil
 import socket
@@ -123,6 +124,10 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
                 cur.execute(
                     """
                     TRUNCATE
+                        creator_conversion_events,
+                        creator_attributions,
+                        creator_campaigns,
+                        creators,
                         auth_rate_limits,
                         user_subscriptions,
                         apple_transactions,
@@ -156,6 +161,74 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
                     (f"{suffix}@example.com", referral_code),
                 )
                 return int(cur.fetchone()[0])
+
+    def create_creator_attribution(
+        self,
+        user_id: int,
+        attributed_at: datetime,
+    ) -> int:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO creators (name, slug, status)
+                    VALUES ('Guest Creator', %s, 'active')
+                    RETURNING id;
+                    """,
+                    (f"guest-creator-{user_id}",),
+                )
+                creator_id = int(cur.fetchone()[0])
+                creator_code = f"GCREATOR{user_id:04d}"
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (
+                        creator_id, name, code, status,
+                        compensation_type, compensation_value
+                    )
+                    VALUES (%s, 'Guest Campaign', %s, 'active', 'none', NULL)
+                    RETURNING id;
+                    """,
+                    (creator_id, creator_code),
+                )
+                campaign_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO creator_attributions (
+                        campaign_id, user_id, code_used, source, attributed_at,
+                        status, user_deleted
+                    )
+                    VALUES (%s, %s, %s, 'email_registration', %s, 'active', FALSE)
+                    RETURNING id;
+                    """,
+                    (campaign_id, user_id, creator_code, attributed_at),
+                )
+                return int(cur.fetchone()[0])
+
+    def creator_event(self, transaction_id: str):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT occurred_at, economic_status, amount, currency
+                    FROM creator_conversion_events
+                    WHERE provider = 'apple' AND external_event_key = %s;
+                    """,
+                    (transaction_id,),
+                )
+                return cur.fetchone()
+
+    def paid_milestone(self, attribution_id: int):
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT paid_plus_converted_at
+                    FROM creator_attributions
+                    WHERE id = %s;
+                    """,
+                    (attribution_id,),
+                )
+                return cur.fetchone()[0]
 
     def transaction(
         self,
@@ -783,6 +856,92 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
                 )
                 row = cur.fetchone()
         self.assertEqual(row, (user_id, None, "revoke", revoke_at))
+
+    def test_guest_paid_purchase_claim_uses_original_verified_ledger_values(self):
+        guest = self.create_guest()
+        user_id = self.create_user("creator-claim")
+        purchase_at = datetime.now(timezone.utc)
+        attribution_id = self.create_creator_attribution(
+            user_id,
+            purchase_at - timedelta(minutes=1),
+        )
+        transaction = replace(
+            self.transaction(guest, signed_date=purchase_at),
+            purchase_date=purchase_at,
+            environment="Production",
+            ownership_type="PURCHASED",
+            transaction_reason="PURCHASE",
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=purchase_at,
+        )
+        apple_purchase_processor.process_apple_transaction(transaction)
+
+        guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+
+        self.assertEqual(
+            self.creator_event(transaction.transaction_id),
+            (purchase_at, "confirmed", Decimal("4.990000"), "EUR"),
+        )
+        self.assertEqual(self.paid_milestone(attribution_id), purchase_at)
+
+    def test_guest_refund_or_revoke_before_claim_is_never_confirmed(self):
+        for adjustment, expected_status, reason in (
+            ("refund", "refunded", "1"),
+            ("revoke", "revoked", "0"),
+        ):
+            with self.subTest(adjustment=adjustment):
+                guest = self.create_guest()
+                user_id = self.create_user(f"creator-{adjustment}")
+                purchase_at = datetime.now(timezone.utc)
+                attribution_id = self.create_creator_attribution(
+                    user_id,
+                    purchase_at - timedelta(minutes=1),
+                )
+                transaction = replace(
+                    self.transaction(
+                        guest,
+                        transaction_id=f"guest-{adjustment}-transaction",
+                        original_transaction_id=f"guest-{adjustment}-original",
+                        signed_date=purchase_at,
+                    ),
+                    purchase_date=purchase_at,
+                    environment="Production",
+                    ownership_type="PURCHASED",
+                    transaction_reason="PURCHASE",
+                    price_milliunits=4990,
+                    currency="EUR",
+                    economic_transaction_signed_at=purchase_at,
+                )
+                apple_purchase_processor.process_apple_transaction(transaction)
+                adjustment_at = purchase_at + timedelta(minutes=1)
+                apple_purchase_processor.process_apple_transaction(
+                    replace(
+                        transaction,
+                        signed_date=adjustment_at,
+                        revocation_date=adjustment_at,
+                        revocation_reason=reason,
+                        economic_adjustment=adjustment,
+                        economic_notification_signed_at=adjustment_at,
+                    ),
+                    notification_type=adjustment.upper(),
+                )
+
+                guest_subscriptions.claim_guest_subscription(
+                    user_id,
+                    guest.access_token,
+                )
+
+                self.assertEqual(
+                    self.creator_event(transaction.transaction_id),
+                    (
+                        purchase_at,
+                        expected_status,
+                        Decimal("4.990000"),
+                        "EUR",
+                    ),
+                )
+                self.assertIsNone(self.paid_milestone(attribution_id))
 
     def test_14_claim_rejects_original_transaction_owned_elsewhere(self):
         guest = self.create_guest()

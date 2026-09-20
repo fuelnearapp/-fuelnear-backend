@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 import shutil
 import socket
@@ -15,10 +16,12 @@ import psycopg2
 
 from app.apple_subscriptions import (
     AppleBaseEconomicStatus,
+    AppleCreatorEconomicStatus,
     AppleOriginalTransactionOwnershipConflict,
     AppleTransaction,
     AppleTransactionValidationError,
     derive_apple_base_economic_status,
+    derive_apple_creator_economic_state,
     ensure_apple_economic_ledger_schema,
     reduce_apple_economic_adjustment,
     save_apple_transaction,
@@ -154,6 +157,100 @@ class AppleEconomicAdjustmentReducerTestCase(unittest.TestCase):
         self.assertEqual(
             derive_apple_base_economic_status({**base, "price_milliunits": None}),
             AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE,
+        )
+
+    def test_creator_economic_state_uses_base_and_persisted_adjustment(self):
+        base = {
+            "environment": "Production",
+            "ownership_type": "PURCHASED",
+            "transaction_reason": "PURCHASE",
+            "price_milliunits": 4990,
+            "currency": "EUR",
+            "economic_adjustment": None,
+        }
+        cases = (
+            (None, AppleCreatorEconomicStatus.CONFIRMED, Decimal("4.990"), "EUR"),
+            ("refund", AppleCreatorEconomicStatus.REFUNDED, Decimal("4.990"), "EUR"),
+            ("revoke", AppleCreatorEconomicStatus.REVOKED, Decimal("4.990"), "EUR"),
+            (
+                "refund_reversed",
+                AppleCreatorEconomicStatus.CONFIRMED,
+                Decimal("4.990"),
+                "EUR",
+            ),
+            (
+                "revocation_unknown",
+                AppleCreatorEconomicStatus.VERIFIED_UNKNOWN_VALUE,
+                None,
+                None,
+            ),
+        )
+        for adjustment, status, amount, currency in cases:
+            with self.subTest(adjustment=adjustment):
+                state = derive_apple_creator_economic_state(
+                    {**base, "economic_adjustment": adjustment}
+                )
+                self.assertEqual(state.status, status)
+                self.assertEqual(state.amount, amount)
+                self.assertEqual(state.currency, currency)
+
+    def test_creator_non_economic_and_unknown_states_have_no_value(self):
+        base = {
+            "environment": "Production",
+            "ownership_type": "PURCHASED",
+            "transaction_reason": "PURCHASE",
+            "price_milliunits": 4990,
+            "currency": "EUR",
+        }
+        cases = (
+            ({**base, "price_milliunits": 0}, AppleCreatorEconomicStatus.NON_ECONOMIC),
+            ({**base, "environment": "Sandbox"}, AppleCreatorEconomicStatus.NON_ECONOMIC),
+            (
+                {**base, "ownership_type": "FAMILY_SHARED"},
+                AppleCreatorEconomicStatus.NON_ECONOMIC,
+            ),
+            (
+                {**base, "price_milliunits": None, "currency": None},
+                AppleCreatorEconomicStatus.VERIFIED_UNKNOWN_VALUE,
+            ),
+        )
+        for transaction, status in cases:
+            with self.subTest(status=status):
+                state = derive_apple_creator_economic_state(transaction)
+                self.assertEqual(state.status, status)
+                self.assertIsNone(state.amount)
+                self.assertIsNone(state.currency)
+
+    def test_reversal_returns_to_unknown_or_non_economic_base(self):
+        common = {
+            "transaction_reason": "PURCHASE",
+            "economic_adjustment": "refund_reversed",
+        }
+        unknown = derive_apple_creator_economic_state(
+            {
+                **common,
+                "environment": "Production",
+                "ownership_type": "PURCHASED",
+                "price_milliunits": None,
+                "currency": None,
+            }
+        )
+        non_economic = derive_apple_creator_economic_state(
+            {
+                **common,
+                "environment": "Sandbox",
+                "ownership_type": "PURCHASED",
+                "price_milliunits": 4990,
+                "currency": "EUR",
+            }
+        )
+        self.assertEqual(
+            unknown.status,
+            AppleCreatorEconomicStatus.VERIFIED_UNKNOWN_VALUE,
+        )
+        self.assertEqual(
+            non_economic.status,
+            AppleCreatorEconomicStatus.NON_ECONOMIC,
         )
 
 
