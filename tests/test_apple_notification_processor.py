@@ -129,6 +129,8 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         apple_transaction = process_mock.call_args.args[0]
         self.assertIsNone(apple_transaction.price_milliunits)
         self.assertIsNone(apple_transaction.currency)
+        self.assertIsNone(apple_transaction.economic_adjustment)
+        self.assertIsNone(apple_transaction.economic_notification_signed_at)
 
     def test_did_renew_is_processed(self):
         result, _ = self.process_with_owner(self.notification("DID_RENEW"))
@@ -278,10 +280,57 @@ class AppleNotificationProcessorTestCase(unittest.TestCase):
         self.assertEqual(apple_transaction.revocation_date, self.now)
         self.assertEqual(apple_transaction.revocation_reason, "1")
         self.assertEqual(apple_transaction.signed_date, notification.signed_date)
+        self.assertEqual(apple_transaction.economic_adjustment, "refund")
+        self.assertEqual(
+            apple_transaction.economic_notification_signed_at,
+            notification.signed_date,
+        )
+
+    def test_prorated_refund_uses_refund_adjustment_and_preserves_evidence(self):
+        notification = self.notification("REFUND")
+        notification = replace(
+            notification,
+            transaction=replace(
+                notification.transaction,
+                revocation_date=self.now,
+                revocation_reason=1,
+                revocation_type="REFUND_PRORATED",
+                revocation_percentage=40,
+                economic_evidence=AppleEconomicEvidence(
+                    AppleEconomicEvidenceStatus.VALID,
+                    price_milliunits=4990,
+                    currency="EUR",
+                ),
+            ),
+        )
+
+        _, process_mock = self.process_with_owner(notification)
+
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertEqual(apple_transaction.economic_adjustment, "refund")
+        self.assertEqual(apple_transaction.price_milliunits, 4990)
+        self.assertEqual(apple_transaction.currency, "EUR")
 
     def test_revoke_is_processed(self):
-        result, _ = self.process_with_owner(self.notification("REVOKE"))
+        result, process_mock = self.process_with_owner(self.notification("REVOKE"))
         self.assertTrue(result.handled)
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertEqual(apple_transaction.economic_adjustment, "revoke")
+        self.assertEqual(
+            apple_transaction.economic_notification_signed_at,
+            self.now,
+        )
+
+    def test_refund_reversed_is_mapped_to_reversal_candidate(self):
+        _, process_mock = self.process_with_owner(
+            self.notification("REFUND_REVERSED")
+        )
+        apple_transaction = process_mock.call_args.args[0]
+        self.assertEqual(apple_transaction.economic_adjustment, "refund_reversed")
+        self.assertEqual(
+            apple_transaction.economic_notification_signed_at,
+            self.now,
+        )
 
     def test_duplicate_transaction_is_reconciled(self):
         result, process_mock = self.process_with_owner(

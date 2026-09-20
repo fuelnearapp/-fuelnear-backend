@@ -703,6 +703,87 @@ class GuestSubscriptionsTestCase(unittest.TestCase):
         self.assertEqual(row[6], transaction.transaction_id)
         self.assertEqual(row[7], transaction.original_transaction_id)
 
+    def test_claim_preserves_refund_adjustment_and_watermarks(self):
+        guest = self.create_guest()
+        user_id = self.create_user()
+        transaction_signed_at = datetime.now(timezone.utc)
+        transaction = replace(
+            self.transaction(guest, signed_date=transaction_signed_at),
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=transaction_signed_at,
+        )
+        apple_purchase_processor.process_apple_transaction(transaction)
+        refund_at = transaction_signed_at + timedelta(minutes=1)
+        notification = self.notification(
+            guest,
+            notification_type="REFUND",
+            transaction_id=transaction.transaction_id,
+            revocation_date=refund_at,
+        )
+        notification = replace(
+            notification,
+            signed_date=refund_at,
+            transaction=replace(
+                notification.transaction,
+                purchase_date=transaction.purchase_date,
+            ),
+        )
+        apple_notification_processor.process_app_store_notification(notification)
+
+        guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, guest_id, transaction_id,
+                           original_transaction_id, purchase_date,
+                           price_milliunits, currency,
+                           economic_transaction_signed_at,
+                           economic_adjustment,
+                           economic_notification_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row[0:4], (user_id, None, transaction.transaction_id, transaction.original_transaction_id))
+        self.assertEqual(row[4], transaction.purchase_date)
+        self.assertEqual(row[5:10], (4990, "EUR", transaction_signed_at, "refund", refund_at))
+
+    def test_claim_preserves_revoke_adjustment_and_watermark(self):
+        guest = self.create_guest()
+        user_id = self.create_user()
+        transaction = self.transaction(guest)
+        apple_purchase_processor.process_apple_transaction(transaction)
+        revoke_at = transaction.signed_date + timedelta(minutes=1)
+        notification = self.notification(
+            guest,
+            notification_type="REVOKE",
+            transaction_id=transaction.transaction_id,
+            revocation_date=revoke_at,
+        )
+        notification = replace(notification, signed_date=revoke_at)
+        apple_notification_processor.process_app_store_notification(notification)
+
+        guest_subscriptions.claim_guest_subscription(user_id, guest.access_token)
+
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, guest_id, economic_adjustment,
+                           economic_notification_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction.transaction_id,),
+                )
+                row = cur.fetchone()
+        self.assertEqual(row, (user_id, None, "revoke", revoke_at))
+
     def test_14_claim_rejects_original_transaction_owned_elsewhere(self):
         guest = self.create_guest()
         user_id = self.create_user("claiming")

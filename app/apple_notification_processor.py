@@ -46,6 +46,12 @@ IGNORED_NOTIFICATION_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
+ECONOMIC_NOTIFICATION_ADJUSTMENTS: Final[dict[str, str]] = {
+    "REFUND": "refund",
+    "REVOKE": "revoke",
+    "REFUND_REVERSED": "refund_reversed",
+}
+
 
 class AppleNotificationProcessorError(RuntimeError):
     pass
@@ -181,6 +187,9 @@ def _to_apple_transaction(
         )
 
     try:
+        economic_adjustment = ECONOMIC_NOTIFICATION_ADJUSTMENTS.get(
+            notification.notification_type.strip().upper()
+        )
         normalized = apple_subscriptions.AppleTransaction(
             user_id=owner.user_id,
             guest_id=owner.guest_id,
@@ -223,6 +232,12 @@ def _to_apple_transaction(
                 transaction.signed_date
                 if transaction.economic_evidence.status
                 is apple_subscriptions.AppleEconomicEvidenceStatus.VALID
+                else None
+            ),
+            economic_adjustment=economic_adjustment,
+            economic_notification_signed_at=(
+                notification.signed_date
+                if economic_adjustment is not None
                 else None
             ),
         )

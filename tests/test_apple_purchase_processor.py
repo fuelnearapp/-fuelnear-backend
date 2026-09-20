@@ -304,6 +304,162 @@ class ApplePurchaseProcessorTestCase(unittest.TestCase):
         self.assertEqual(self.count_rows("apple_transactions"), 1)
         self.assertEqual(self.count_rows("user_subscriptions"), 1)
 
+    def test_stale_refund_reversal_has_no_creator_or_entitlement_side_effect(self):
+        user_id = self.create_user()
+        base = self.transaction(user_id)
+        processor.process_apple_transaction(base)
+        refund_at = base.signed_date + timedelta(minutes=2)
+        refund = replace(
+            base,
+            signed_date=refund_at,
+            revocation_date=refund_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=refund_at,
+        )
+        processor.process_apple_transaction(refund, notification_type="REFUND")
+
+        with patch.object(
+            processor.creator_attribution,
+            "record_creator_apple_conversion",
+        ) as creator_mock:
+            result = processor.process_apple_transaction(
+                replace(
+                    base,
+                    signed_date=refund_at - timedelta(minutes=1),
+                    economic_adjustment="refund_reversed",
+                    economic_notification_signed_at=refund_at - timedelta(minutes=1),
+                ),
+                notification_type="REFUND_REVERSED",
+            )
+
+        creator_mock.assert_not_called()
+        self.assertFalse(result.is_plus)
+
+    def test_newer_reversal_cannot_degrade_revoke_creator_state(self):
+        user_id = self.create_user()
+        base = self.transaction(user_id)
+        processor.process_apple_transaction(base)
+        revoke_at = base.signed_date + timedelta(minutes=1)
+        processor.process_apple_transaction(
+            replace(
+                base,
+                signed_date=revoke_at,
+                revocation_date=revoke_at,
+                revocation_reason="0",
+                economic_adjustment="revoke",
+                economic_notification_signed_at=revoke_at,
+            ),
+            notification_type="REVOKE",
+        )
+
+        with patch.object(
+            processor.creator_attribution,
+            "record_creator_apple_conversion",
+        ) as creator_mock:
+            result = processor.process_apple_transaction(
+                replace(
+                    base,
+                    signed_date=revoke_at + timedelta(minutes=1),
+                    revocation_date=None,
+                    revocation_reason=None,
+                    economic_adjustment="refund_reversed",
+                    economic_notification_signed_at=revoke_at
+                    + timedelta(minutes=1),
+                ),
+                notification_type="REFUND_REVERSED",
+            )
+
+        self.assertFalse(result.is_plus)
+        self.assertEqual(
+            creator_mock.call_args.kwargs["notification_type"],
+            "REVOKE",
+        )
+
+    def test_accepted_refund_reversal_reaches_creator_and_restores_entitlement(self):
+        user_id = self.create_user()
+        base = self.transaction(user_id)
+        processor.process_apple_transaction(base)
+        refund_at = base.signed_date + timedelta(minutes=1)
+        processor.process_apple_transaction(
+            replace(
+                base,
+                signed_date=refund_at,
+                revocation_date=refund_at,
+                revocation_reason="1",
+                economic_adjustment="refund",
+                economic_notification_signed_at=refund_at,
+            ),
+            notification_type="REFUND",
+        )
+
+        reversed_at = refund_at + timedelta(minutes=1)
+        with patch.object(
+            processor.creator_attribution,
+            "record_creator_apple_conversion",
+        ) as creator_mock:
+            result = processor.process_apple_transaction(
+                replace(
+                    base,
+                    signed_date=reversed_at,
+                    revocation_date=None,
+                    revocation_reason=None,
+                    economic_adjustment="refund_reversed",
+                    economic_notification_signed_at=reversed_at,
+                ),
+                notification_type="REFUND_REVERSED",
+            )
+
+        self.assertTrue(result.is_plus)
+        self.assertEqual(
+            creator_mock.call_args.kwargs["notification_type"],
+            "REFUND_REVERSED",
+        )
+
+    def test_stale_refund_after_reversal_does_not_revoke_entitlement(self):
+        user_id = self.create_user()
+        base = self.transaction(user_id)
+        processor.process_apple_transaction(base)
+        refund_at = base.signed_date + timedelta(minutes=1)
+        refund = replace(
+            base,
+            signed_date=refund_at,
+            revocation_date=refund_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=refund_at,
+        )
+        processor.process_apple_transaction(refund, notification_type="REFUND")
+        reversed_at = refund_at + timedelta(minutes=2)
+        processor.process_apple_transaction(
+            replace(
+                base,
+                signed_date=reversed_at,
+                revocation_date=None,
+                revocation_reason=None,
+                economic_adjustment="refund_reversed",
+                economic_notification_signed_at=reversed_at,
+            ),
+            notification_type="REFUND_REVERSED",
+        )
+
+        with patch.object(
+            processor.creator_attribution,
+            "record_creator_apple_conversion",
+        ) as creator_mock:
+            result = processor.process_apple_transaction(
+                replace(
+                    refund,
+                    signed_date=refund_at + timedelta(minutes=1),
+                    economic_notification_signed_at=refund_at
+                    + timedelta(minutes=1),
+                ),
+                notification_type="REFUND",
+            )
+
+        creator_mock.assert_not_called()
+        self.assertTrue(result.is_plus)
+
 
 if __name__ == "__main__":
     unittest.main()

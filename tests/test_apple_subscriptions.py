@@ -14,10 +14,13 @@ from uuid import uuid4
 import psycopg2
 
 from app.apple_subscriptions import (
+    AppleBaseEconomicStatus,
     AppleOriginalTransactionOwnershipConflict,
     AppleTransaction,
     AppleTransactionValidationError,
+    derive_apple_base_economic_status,
     ensure_apple_economic_ledger_schema,
+    reduce_apple_economic_adjustment,
     save_apple_transaction,
     validate_apple_transaction,
 )
@@ -27,6 +30,131 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class AppleEconomicAdjustmentReducerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.t2 = self.t1 + timedelta(minutes=1)
+
+    def reduce(self, current, incoming, *, current_at=None, incoming_at=None):
+        return reduce_apple_economic_adjustment(
+            current,
+            current_at,
+            incoming,
+            incoming_at,
+        )
+
+    def test_new_refund_and_revoke(self):
+        refund = self.reduce(None, "refund", incoming_at=self.t1)
+        revoke = self.reduce(None, "revoke", incoming_at=self.t1)
+        self.assertEqual(refund.economic_adjustment, "refund")
+        self.assertEqual(revoke.economic_adjustment, "revoke")
+
+    def test_refund_transitions_to_revoke_or_reversed(self):
+        revoke = self.reduce("refund", "revoke", current_at=self.t1, incoming_at=self.t2)
+        reversed_result = self.reduce(
+            "refund", "refund_reversed", current_at=self.t1, incoming_at=self.t2
+        )
+        self.assertEqual(revoke.economic_adjustment, "revoke")
+        self.assertEqual(reversed_result.economic_adjustment, "refund_reversed")
+
+    def test_revoke_is_terminal(self):
+        for incoming in ("refund", "refund_reversed", "revocation_unknown"):
+            with self.subTest(incoming=incoming):
+                result = self.reduce(
+                    "revoke", incoming, current_at=self.t1, incoming_at=self.t2
+                )
+                self.assertEqual(result.economic_adjustment, "revoke")
+                self.assertEqual(result.economic_notification_signed_at, self.t2)
+
+    def test_orphan_reversal_is_unknown(self):
+        result = self.reduce(None, "refund_reversed", incoming_at=self.t1)
+        self.assertEqual(result.economic_adjustment, "revocation_unknown")
+
+    def test_new_refund_after_reversal_is_refund(self):
+        result = self.reduce(
+            "refund_reversed", "refund", current_at=self.t1, incoming_at=self.t2
+        )
+        self.assertEqual(result.economic_adjustment, "refund")
+
+    def test_duplicate_refund_is_idempotent(self):
+        result = self.reduce(
+            "refund", "refund", current_at=self.t1, incoming_at=self.t1
+        )
+        self.assertTrue(result.incoming_accepted)
+        self.assertFalse(result.changed)
+
+    def test_older_refund_and_reversal_are_ignored(self):
+        for incoming in ("refund", "refund_reversed"):
+            with self.subTest(incoming=incoming):
+                result = self.reduce(
+                    "refund_reversed",
+                    incoming,
+                    current_at=self.t2,
+                    incoming_at=self.t1,
+                )
+                self.assertFalse(result.incoming_accepted)
+                self.assertEqual(result.economic_adjustment, "refund_reversed")
+                self.assertEqual(result.economic_notification_signed_at, self.t2)
+
+    def test_older_revoke_strengthens_without_reducing_watermark(self):
+        result = self.reduce(
+            "refund", "revoke", current_at=self.t2, incoming_at=self.t1
+        )
+        self.assertTrue(result.incoming_accepted)
+        self.assertEqual(result.economic_adjustment, "revoke")
+        self.assertEqual(result.economic_notification_signed_at, self.t2)
+
+    def test_same_timestamp_priority_is_deterministic(self):
+        cases = (
+            ("refund", "revoke", "revoke"),
+            ("refund_reversed", "refund", "refund"),
+            ("refund_reversed", "revocation_unknown", "revocation_unknown"),
+        )
+        for current, incoming, expected in cases:
+            with self.subTest(current=current, incoming=incoming):
+                result = self.reduce(
+                    current, incoming, current_at=self.t1, incoming_at=self.t1
+                )
+                self.assertEqual(result.economic_adjustment, expected)
+
+    def test_non_economic_input_is_noop(self):
+        result = self.reduce("refund", None, current_at=self.t1)
+        self.assertFalse(result.incoming_accepted)
+        self.assertFalse(result.changed)
+        self.assertEqual(result.economic_notification_signed_at, self.t1)
+
+    def test_base_economic_state_uses_only_persisted_evidence(self):
+        base = {
+            "environment": "Production",
+            "ownership_type": "PURCHASED",
+            "transaction_reason": "PURCHASE",
+            "price_milliunits": 4990,
+            "currency": "EUR",
+        }
+        self.assertEqual(
+            derive_apple_base_economic_status(base),
+            AppleBaseEconomicStatus.CONFIRMED_CANDIDATE,
+        )
+        self.assertEqual(
+            derive_apple_base_economic_status({**base, "price_milliunits": 0}),
+            AppleBaseEconomicStatus.NON_ECONOMIC,
+        )
+        self.assertEqual(
+            derive_apple_base_economic_status({**base, "environment": "Sandbox"}),
+            AppleBaseEconomicStatus.NON_ECONOMIC,
+        )
+        self.assertEqual(
+            derive_apple_base_economic_status(
+                {**base, "ownership_type": "FAMILY_SHARED"}
+            ),
+            AppleBaseEconomicStatus.NON_ECONOMIC,
+        )
+        self.assertEqual(
+            derive_apple_base_economic_status({**base, "price_milliunits": None}),
+            AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE,
+        )
 
 
 class AppleSubscriptionsTestCase(unittest.TestCase):
@@ -174,6 +302,24 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
                 cur.execute(
                     """
                     SELECT price_milliunits, currency,
+                           economic_transaction_signed_at
+                    FROM apple_transactions
+                    WHERE transaction_id = %s;
+                    """,
+                    (transaction_id,),
+                )
+                return cur.fetchone()
+
+    def adjustment_row(self, transaction_id: str) -> tuple:
+        with self.connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT economic_adjustment,
+                           economic_notification_signed_at,
+                           revocation_date,
+                           price_milliunits,
+                           currency,
                            economic_transaction_signed_at
                     FROM apple_transactions
                     WHERE transaction_id = %s;
@@ -512,6 +658,234 @@ class AppleSubscriptionsTestCase(unittest.TestCase):
         self.assertEqual(
             self.economic_row(transaction.transaction_id),
             (4990, "EUR", newer_signed_date),
+        )
+
+    def test_refund_revoke_and_reversal_preserve_economic_evidence(self):
+        user_id = self.create_user()
+        transaction_signed_at = datetime.now(timezone.utc)
+        base = self.transaction(
+            user_id,
+            environment="Production",
+            ownership_type="PURCHASED",
+            transaction_reason="PURCHASE",
+            signed_date=transaction_signed_at,
+            price_milliunits=4990,
+            currency="EUR",
+            economic_transaction_signed_at=transaction_signed_at,
+        )
+        self.save(base)
+
+        refund_at = transaction_signed_at + timedelta(minutes=1)
+        refund = self.save(
+            replace(
+                base,
+                signed_date=refund_at,
+                revocation_date=refund_at,
+                revocation_reason="1",
+                economic_adjustment="refund",
+                economic_notification_signed_at=refund_at,
+            )
+        )
+        self.assertTrue(refund.economic_adjustment_accepted)
+        self.assertEqual(
+            self.adjustment_row(base.transaction_id),
+            ("refund", refund_at, refund_at, 4990, "EUR", transaction_signed_at),
+        )
+
+        reversed_at = refund_at + timedelta(minutes=1)
+        reversed_result = self.save(
+            replace(
+                base,
+                signed_date=reversed_at,
+                revocation_date=None,
+                revocation_reason=None,
+                economic_adjustment="refund_reversed",
+                economic_notification_signed_at=reversed_at,
+            )
+        )
+        self.assertTrue(reversed_result.economic_adjustment_accepted)
+        self.assertEqual(
+            self.adjustment_row(base.transaction_id),
+            (
+                "refund_reversed",
+                reversed_at,
+                None,
+                4990,
+                "EUR",
+                transaction_signed_at,
+            ),
+        )
+
+        revoke_at = reversed_at + timedelta(minutes=1)
+        self.save(
+            replace(
+                base,
+                signed_date=revoke_at,
+                revocation_date=revoke_at,
+                revocation_reason="0",
+                economic_adjustment="revoke",
+                economic_notification_signed_at=revoke_at,
+            )
+        )
+        self.assertEqual(
+            self.adjustment_row(base.transaction_id),
+            ("revoke", revoke_at, revoke_at, 4990, "EUR", transaction_signed_at),
+        )
+
+    def test_stale_reversal_does_not_clear_refund_or_entitlement_state(self):
+        user_id = self.create_user()
+        refund_at = datetime.now(timezone.utc)
+        refunded = self.transaction(
+            user_id,
+            signed_date=refund_at,
+            revocation_date=refund_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=refund_at,
+        )
+        self.save(refunded)
+
+        stale = self.save(
+            replace(
+                refunded,
+                signed_date=refund_at - timedelta(minutes=1),
+                revocation_date=None,
+                revocation_reason=None,
+                economic_adjustment="refund_reversed",
+                economic_notification_signed_at=refund_at - timedelta(minutes=1),
+            )
+        )
+
+        self.assertFalse(stale.economic_adjustment_accepted)
+        self.assertFalse(stale.changed)
+        self.assertEqual(
+            self.adjustment_row(refunded.transaction_id)[:3],
+            ("refund", refund_at, refund_at),
+        )
+
+    def test_direct_restore_enriches_evidence_without_clearing_refund(self):
+        user_id = self.create_user()
+        refund_at = datetime.now(timezone.utc)
+        refunded = self.transaction(
+            user_id,
+            signed_date=refund_at,
+            revocation_date=refund_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=refund_at,
+        )
+        self.save(refunded)
+        transaction_signed_at = refund_at + timedelta(minutes=1)
+
+        result = self.save(
+            replace(
+                refunded,
+                signed_date=transaction_signed_at,
+                revocation_date=None,
+                revocation_reason=None,
+                price_milliunits=4990,
+                currency="EUR",
+                economic_transaction_signed_at=transaction_signed_at,
+                economic_adjustment=None,
+                economic_notification_signed_at=None,
+            )
+        )
+
+        self.assertTrue(result.changed)
+        self.assertEqual(
+            self.adjustment_row(refunded.transaction_id),
+            ("refund", refund_at, refund_at, 4990, "EUR", transaction_signed_at),
+        )
+
+    def test_direct_restore_does_not_clear_revoke(self):
+        user_id = self.create_user()
+        revoke_at = datetime.now(timezone.utc)
+        revoked = self.transaction(
+            user_id,
+            signed_date=revoke_at,
+            revocation_date=revoke_at,
+            revocation_reason="0",
+            economic_adjustment="revoke",
+            economic_notification_signed_at=revoke_at,
+        )
+        self.save(revoked)
+
+        self.save(
+            replace(
+                revoked,
+                signed_date=revoke_at + timedelta(minutes=1),
+                revocation_date=None,
+                revocation_reason=None,
+                economic_adjustment=None,
+                economic_notification_signed_at=None,
+            )
+        )
+
+        self.assertEqual(
+            self.adjustment_row(revoked.transaction_id)[:3],
+            ("revoke", revoke_at, revoke_at),
+        )
+
+    def test_older_revoke_strengthens_refund_without_reducing_watermark(self):
+        user_id = self.create_user()
+        refund_at = datetime.now(timezone.utc)
+        refunded = self.transaction(
+            user_id,
+            signed_date=refund_at,
+            revocation_date=refund_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=refund_at,
+        )
+        self.save(refunded)
+        older_revoke_at = refund_at - timedelta(minutes=1)
+
+        result = self.save(
+            replace(
+                refunded,
+                signed_date=older_revoke_at,
+                revocation_date=older_revoke_at,
+                revocation_reason="0",
+                economic_adjustment="revoke",
+                economic_notification_signed_at=older_revoke_at,
+            )
+        )
+
+        self.assertTrue(result.economic_adjustment_accepted)
+        self.assertEqual(
+            self.adjustment_row(refunded.transaction_id)[:3],
+            ("revoke", refund_at, older_revoke_at),
+        )
+
+    def test_concurrent_refund_and_revoke_converge_to_revoke(self):
+        user_id = self.create_user()
+        base_at = datetime.now(timezone.utc)
+        base = self.transaction(user_id, signed_date=base_at)
+        self.save(base)
+        event_at = base_at + timedelta(minutes=1)
+        refund = replace(
+            base,
+            signed_date=event_at,
+            revocation_date=event_at,
+            revocation_reason="1",
+            economic_adjustment="refund",
+            economic_notification_signed_at=event_at,
+        )
+        revoke = replace(
+            base,
+            signed_date=event_at,
+            revocation_date=event_at,
+            revocation_reason="0",
+            economic_adjustment="revoke",
+            economic_notification_signed_at=event_at,
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(self.save, (refund, revoke)))
+
+        self.assertEqual(
+            self.adjustment_row(base.transaction_id)[:2],
+            ("revoke", event_at),
         )
 
     def test_required_fields_are_validated(self):

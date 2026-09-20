@@ -23,6 +23,7 @@ from appstoreserverlibrary.models.NotificationTypeV2 import NotificationTypeV2
 from appstoreserverlibrary.models.ResponseBodyV2DecodedPayload import (
     ResponseBodyV2DecodedPayload,
 )
+from appstoreserverlibrary.models.RevocationType import RevocationType
 from appstoreserverlibrary.models.Subtype import Subtype
 from appstoreserverlibrary.signed_data_verifier import (
     VerificationException,
@@ -139,6 +140,8 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
         *,
         app_account_token=None,
         environment=Environment.SANDBOX,
+        revocation_type=None,
+        revocation_percentage=None,
     ):
         return JWSTransactionDecodedPayload(
             productId="MB.FuelNear.plus.monthly",
@@ -148,6 +151,8 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             expiresDate=1_700_086_400_000,
             revocationDate=None,
             revocationReason=None,
+            revocationType=revocation_type,
+            revocationPercentage=revocation_percentage,
             appAccountToken=str(app_account_token or uuid4()),
             environment=environment,
             bundleId="MB.FuelNear",
@@ -224,6 +229,17 @@ class AppleNotificationVerifierTestCase(unittest.TestCase):
             result.transaction.signed_date,
             datetime.fromtimestamp(1_700_000_001, tz=timezone.utc),
         )
+
+    def test_prorated_refund_metadata_is_normalized(self):
+        result, _ = self.verify(
+            transaction=self.transaction(
+                revocation_type=RevocationType.REFUND_PRORATED,
+                revocation_percentage=40,
+            )
+        )
+
+        self.assertEqual(result.transaction.revocation_type, "REFUND_PRORATED")
+        self.assertEqual(result.transaction.revocation_percentage, 40)
 
     def test_grace_period_expiration_is_normalized(self):
         result, _ = self.verify(

@@ -94,6 +94,8 @@ class NormalizedAppleNotificationTransaction:
     storefront: str | None = None
     offer_type: int | None = None
     signed_date: datetime | None = None
+    revocation_type: str | None = None
+    revocation_percentage: int | None = None
     economic_evidence: AppleEconomicEvidence = AppleEconomicEvidence(
         AppleEconomicEvidenceStatus.ABSENT
     )
@@ -461,6 +463,22 @@ def _normalize_transaction(
             "Apple notification transaction offerType is invalid"
         )
 
+    revocation_type = _optional_transaction_text(
+        payload.revocationType,
+        getattr(payload, "rawRevocationType", None),
+        "revocationType",
+    )
+    revocation_percentage = payload.revocationPercentage
+    if revocation_percentage is not None and (
+        isinstance(revocation_percentage, bool)
+        or not isinstance(revocation_percentage, int)
+        or revocation_percentage < 0
+        or revocation_percentage > 100
+    ):
+        raise AppleNotificationTransactionDataError(
+            "Apple notification transaction revocationPercentage is invalid"
+        )
+
     return NormalizedAppleNotificationTransaction(
         product_id=product_id,
         transaction_id=transaction_id,
@@ -507,6 +525,8 @@ def _normalize_transaction(
             required=False,
             error_type=AppleNotificationTransactionDataError,
         ),
+        revocation_type=revocation_type,
+        revocation_percentage=revocation_percentage,
         economic_evidence=economic_evidence,
     )
 

@@ -303,6 +303,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
         expires_at: datetime,
         purchase_date: datetime | None = None,
         revoked_at: datetime | None = None,
+        economic_adjustment: str | None = None,
+        economic_notification_signed_at: datetime | None = None,
     ) -> repository.AppleTransaction:
         return repository.AppleTransaction(
             user_id=user_id,
@@ -314,6 +316,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             environment="Sandbox",
             revocation_date=revoked_at,
             signed_date=signed_date,
+            economic_adjustment=economic_adjustment,
+            economic_notification_signed_at=economic_notification_signed_at,
         )
 
     def save_and_reconcile(
@@ -1356,6 +1360,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             signed_date=reference + timedelta(seconds=2),
             expires_at=reference + timedelta(days=30),
             revoked_at=reference + timedelta(seconds=2),
+            economic_adjustment="refund",
+            economic_notification_signed_at=reference + timedelta(seconds=2),
         )
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1389,6 +1395,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             signed_date=reference + timedelta(seconds=1),
             expires_at=reference + timedelta(days=30),
             revoked_at=reference + timedelta(seconds=1),
+            economic_adjustment="refund",
+            economic_notification_signed_at=reference + timedelta(seconds=1),
         )
         refund_reversed = self.make_apple_transaction(
             user_id,
@@ -1396,6 +1404,8 @@ class AppleSubscriptionReconcilerTestCase(unittest.TestCase):
             original_transaction_id=original_id,
             signed_date=reference + timedelta(seconds=2),
             expires_at=reference + timedelta(days=30),
+            economic_adjustment="refund_reversed",
+            economic_notification_signed_at=reference + timedelta(seconds=2),
         )
 
         with ThreadPoolExecutor(max_workers=2) as executor:

@@ -7,7 +7,7 @@ from decimal import Decimal
 from enum import Enum
 import hashlib
 import logging
-from typing import Any, Final
+from typing import Any, Final, Mapping
 from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
@@ -30,6 +30,13 @@ MAX_APPLE_PRICE_MILLIUNITS: Final[int] = 999_999_999_999_999
 APPLE_ECONOMIC_ADJUSTMENTS: Final[frozenset[str]] = frozenset(
     {"refund", "revoke", "refund_reversed", "revocation_unknown"}
 )
+APPLE_ECONOMIC_ADJUSTMENT_PRIORITY: Final[dict[str | None, int]] = {
+    None: 0,
+    "refund_reversed": 1,
+    "revocation_unknown": 2,
+    "refund": 3,
+    "revoke": 4,
+}
 
 # ISO 4217 alphabetic codes accepted for Apple transaction prices. This local
 # set keeps validation deterministic without adding a runtime dependency.
@@ -70,6 +77,12 @@ class AppleEconomicEvidenceStatus(str, Enum):
     ABSENT = "absent"
     VALID = "valid"
     INVALID = "invalid"
+
+
+class AppleBaseEconomicStatus(str, Enum):
+    CONFIRMED_CANDIDATE = "confirmed_candidate"
+    NON_ECONOMIC = "non_economic"
+    VERIFIED_UNKNOWN_VALUE = "verified_unknown_value"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +132,164 @@ class AppleTransactionSaveResult:
     created: bool
     changed: bool
     row: dict[str, Any]
+    economic_adjustment_accepted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AppleEconomicAdjustmentReduction:
+    economic_adjustment: str | None
+    economic_notification_signed_at: datetime | None
+    incoming_accepted: bool
+    changed: bool
+
+
+def derive_apple_base_economic_status(
+    transaction: Mapping[str, Any],
+) -> AppleBaseEconomicStatus:
+    environment = str(transaction.get("environment") or "").strip().upper()
+    ownership_type = str(transaction.get("ownership_type") or "").strip().upper()
+    transaction_reason = str(
+        transaction.get("transaction_reason") or ""
+    ).strip().upper()
+
+    if environment == "SANDBOX":
+        return AppleBaseEconomicStatus.NON_ECONOMIC
+    if environment != "PRODUCTION":
+        return AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE
+    if ownership_type == "FAMILY_SHARED":
+        return AppleBaseEconomicStatus.NON_ECONOMIC
+
+    evidence = normalize_apple_economic_evidence(
+        transaction.get("price_milliunits"),
+        transaction.get("currency"),
+    )
+    if evidence.status is not AppleEconomicEvidenceStatus.VALID:
+        return AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE
+    if evidence.price_milliunits == 0:
+        return AppleBaseEconomicStatus.NON_ECONOMIC
+    if ownership_type != "PURCHASED":
+        return AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE
+    if transaction_reason not in {"PURCHASE", "RENEWAL"}:
+        return AppleBaseEconomicStatus.VERIFIED_UNKNOWN_VALUE
+    return AppleBaseEconomicStatus.CONFIRMED_CANDIDATE
+
+
+def _next_apple_economic_adjustment(
+    current_adjustment: str | None,
+    incoming_adjustment: str,
+) -> str:
+    if current_adjustment == "revoke" or incoming_adjustment == "revoke":
+        return "revoke"
+    if incoming_adjustment == "refund":
+        return "refund"
+    if incoming_adjustment == "refund_reversed":
+        return (
+            "refund_reversed"
+            if current_adjustment == "refund"
+            else "revocation_unknown"
+        )
+    if current_adjustment == "refund":
+        return "refund"
+    return "revocation_unknown"
+
+
+def reduce_apple_economic_adjustment(
+    current_adjustment: str | None,
+    current_notification_signed_at: datetime | None,
+    incoming_adjustment: str | None,
+    incoming_notification_signed_at: datetime | None,
+) -> AppleEconomicAdjustmentReduction:
+    if current_adjustment not in APPLE_ECONOMIC_ADJUSTMENT_PRIORITY:
+        raise AppleTransactionValidationError(
+            "current economic_adjustment is invalid"
+        )
+    if current_notification_signed_at is not None and not isinstance(
+        current_notification_signed_at, datetime
+    ):
+        raise AppleTransactionValidationError(
+            "current economic_notification_signed_at must be a datetime"
+        )
+    if incoming_adjustment is None:
+        if incoming_notification_signed_at is not None:
+            raise AppleTransactionValidationError(
+                "economic_notification_signed_at requires economic_adjustment"
+            )
+        return AppleEconomicAdjustmentReduction(
+            current_adjustment,
+            current_notification_signed_at,
+            False,
+            False,
+        )
+    if incoming_adjustment not in APPLE_ECONOMIC_ADJUSTMENTS:
+        raise AppleTransactionValidationError("economic_adjustment is invalid")
+    if not isinstance(incoming_notification_signed_at, datetime):
+        raise AppleTransactionValidationError(
+            "economic_notification_signed_at is required for economic_adjustment"
+        )
+
+    if (
+        current_notification_signed_at is not None
+        and incoming_notification_signed_at < current_notification_signed_at
+    ):
+        if incoming_adjustment == "revoke" and current_adjustment != "revoke":
+            return AppleEconomicAdjustmentReduction(
+                "revoke",
+                current_notification_signed_at,
+                True,
+                True,
+            )
+        return AppleEconomicAdjustmentReduction(
+            current_adjustment,
+            current_notification_signed_at,
+            False,
+            False,
+        )
+
+    if (
+        current_notification_signed_at is not None
+        and incoming_notification_signed_at == current_notification_signed_at
+    ):
+        if incoming_adjustment == current_adjustment:
+            return AppleEconomicAdjustmentReduction(
+                current_adjustment,
+                current_notification_signed_at,
+                True,
+                False,
+            )
+        candidate = _next_apple_economic_adjustment(
+            current_adjustment,
+            incoming_adjustment,
+        )
+        if (
+            APPLE_ECONOMIC_ADJUSTMENT_PRIORITY[candidate]
+            > APPLE_ECONOMIC_ADJUSTMENT_PRIORITY[current_adjustment]
+        ):
+            return AppleEconomicAdjustmentReduction(
+                candidate,
+                current_notification_signed_at,
+                True,
+                True,
+            )
+        return AppleEconomicAdjustmentReduction(
+            current_adjustment,
+            current_notification_signed_at,
+            False,
+            False,
+        )
+
+    next_adjustment = _next_apple_economic_adjustment(
+        current_adjustment,
+        incoming_adjustment,
+    )
+    return AppleEconomicAdjustmentReduction(
+        next_adjustment,
+        incoming_notification_signed_at,
+        True,
+        (
+            next_adjustment != current_adjustment
+            or incoming_notification_signed_at != current_notification_signed_at
+        ),
+    )
 
 
 def normalize_apple_economic_evidence(
@@ -293,6 +464,27 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
         transaction.economic_transaction_signed_at,
         "economic_transaction_signed_at",
     )
+    _validate_optional_datetime(
+        transaction.economic_notification_signed_at,
+        "economic_notification_signed_at",
+    )
+
+    economic_adjustment = _normalize_optional_text(
+        transaction.economic_adjustment,
+        "economic_adjustment",
+    )
+    if economic_adjustment is not None:
+        economic_adjustment = economic_adjustment.lower()
+        if economic_adjustment not in APPLE_ECONOMIC_ADJUSTMENTS:
+            raise AppleTransactionValidationError("economic_adjustment is invalid")
+        if transaction.economic_notification_signed_at is None:
+            raise AppleTransactionValidationError(
+                "economic_notification_signed_at is required for economic_adjustment"
+            )
+    elif transaction.economic_notification_signed_at is not None:
+        raise AppleTransactionValidationError(
+            "economic_notification_signed_at requires economic_adjustment"
+        )
 
     if transaction.app_account_token is not None and not isinstance(transaction.app_account_token, UUID):
         raise AppleTransactionValidationError("app_account_token must be a UUID")
@@ -328,6 +520,7 @@ def validate_apple_transaction(transaction: AppleTransaction) -> AppleTransactio
             if economic_evidence_is_valid
             else None
         ),
+        economic_adjustment=economic_adjustment,
     )
 
 
@@ -389,10 +582,63 @@ def _save_apple_transaction(
 
                 current_transaction = dict(existing_transaction)
                 changed = False
+                current_adjustment = current_transaction.get("economic_adjustment")
+                adjustment_reduction = reduce_apple_economic_adjustment(
+                    current_adjustment,
+                    current_transaction.get("economic_notification_signed_at"),
+                    normalized.economic_adjustment,
+                    normalized.economic_notification_signed_at,
+                )
+                incoming_adjustment = normalized.economic_adjustment
+                apply_incoming_revocation = (
+                    adjustment_reduction.incoming_accepted
+                    and (
+                        (
+                            incoming_adjustment == "refund"
+                            and adjustment_reduction.economic_adjustment == "refund"
+                        )
+                        or (
+                            incoming_adjustment == "revoke"
+                            and adjustment_reduction.economic_adjustment == "revoke"
+                        )
+                        or (
+                            incoming_adjustment == "refund_reversed"
+                            and current_adjustment == "refund"
+                            and adjustment_reduction.economic_adjustment
+                            == "refund_reversed"
+                        )
+                    )
+                )
+                preserve_persisted_revocation = (
+                    not apply_incoming_revocation
+                    and (
+                        incoming_adjustment is not None
+                        or current_adjustment
+                        in {"refund", "revoke", "revocation_unknown"}
+                    )
+                )
+                effective_revocation_date = (
+                    current_transaction.get("revocation_date")
+                    if preserve_persisted_revocation
+                    else normalized.revocation_date
+                )
+                effective_revocation_reason = (
+                    current_transaction.get("revocation_reason")
+                    if preserve_persisted_revocation
+                    else normalized.revocation_reason
+                )
                 existing_signed_date = current_transaction["signed_date"]
-                if normalized.signed_date is not None and (
-                    existing_signed_date is None
-                    or normalized.signed_date > existing_signed_date
+                general_context_accepted = (
+                    incoming_adjustment is None
+                    or adjustment_reduction.incoming_accepted
+                )
+                if (
+                    general_context_accepted
+                    and normalized.signed_date is not None
+                    and (
+                        existing_signed_date is None
+                        or normalized.signed_date > existing_signed_date
+                    )
                 ):
                     cur.execute(
                         """
@@ -422,8 +668,8 @@ def _save_apple_transaction(
                             normalized.environment,
                             normalized.ownership_type,
                             normalized.transaction_reason,
-                            normalized.revocation_date,
-                            normalized.revocation_reason,
+                            effective_revocation_date,
+                            effective_revocation_reason,
                             (
                                 str(normalized.app_account_token)
                                 if normalized.app_account_token is not None
@@ -505,12 +751,52 @@ def _save_apple_transaction(
                             transaction_reference,
                         )
 
+                if adjustment_reduction.changed:
+                    cur.execute(
+                        """
+                        UPDATE apple_transactions
+                        SET economic_adjustment = %s,
+                            economic_notification_signed_at = %s,
+                            revocation_date = CASE
+                                WHEN %s THEN %s
+                                ELSE revocation_date
+                            END,
+                            revocation_reason = CASE
+                                WHEN %s THEN %s
+                                ELSE revocation_reason
+                            END,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING *;
+                        """,
+                        (
+                            adjustment_reduction.economic_adjustment,
+                            adjustment_reduction.economic_notification_signed_at,
+                            apply_incoming_revocation,
+                            normalized.revocation_date,
+                            apply_incoming_revocation,
+                            normalized.revocation_reason,
+                            current_transaction["id"],
+                        ),
+                    )
+                    current_transaction = dict(cur.fetchone())
+                    changed = True
+
                 return AppleTransactionSaveResult(
                     created=False,
                     changed=changed,
                     row=current_transaction,
+                    economic_adjustment_accepted=(
+                        adjustment_reduction.incoming_accepted
+                    ),
                 )
 
+            adjustment_reduction = reduce_apple_economic_adjustment(
+                None,
+                None,
+                normalized.economic_adjustment,
+                normalized.economic_notification_signed_at,
+            )
             cur.execute(
                 """
                 SELECT user_id, guest_id
@@ -557,9 +843,11 @@ def _save_apple_transaction(
                     offer_type,
                     price_milliunits,
                     currency,
-                    economic_transaction_signed_at
+                    economic_transaction_signed_at,
+                    economic_adjustment,
+                    economic_notification_signed_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *;
                 """,
                 (
@@ -587,6 +875,8 @@ def _save_apple_transaction(
                     normalized.price_milliunits,
                     normalized.currency,
                     normalized.economic_transaction_signed_at,
+                    adjustment_reduction.economic_adjustment,
+                    adjustment_reduction.economic_notification_signed_at,
                 ),
             )
             inserted_transaction = cur.fetchone()
@@ -598,6 +888,7 @@ def _save_apple_transaction(
         created=True,
         changed=True,
         row=dict(inserted_transaction),
+        economic_adjustment_accepted=adjustment_reduction.incoming_accepted,
     )
 
 

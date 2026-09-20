@@ -1199,6 +1199,66 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
             "pending",
         )
 
+    def test_64_apple_adjustments_preserve_existing_creator_semantics(self):
+        user = self.create_user("apple-adjustment@example.com")
+        occurred_at = datetime.now(timezone.utc)
+        paid_milestone = occurred_at + timedelta(minutes=1)
+        attribution_id = self.create_creator_attribution(
+            user["id"],
+            attributed_at=occurred_at - timedelta(days=1),
+            paid_plus_converted_at=paid_milestone,
+        )
+        common = {
+            "user_id": user["id"],
+            "transaction_id": "creator-adjustment-transaction",
+            "original_transaction_id": "creator-adjustment-original",
+            "purchase_date": occurred_at,
+            "product_id": "MB.FuelNear.plus.monthly",
+            "transaction_reason": "PURCHASE",
+            "ownership_type": "PURCHASED",
+        }
+
+        with main.get_connection() as conn:
+            initial = main.creator_attribution.record_creator_apple_conversion(
+                conn,
+                **common,
+            )
+            refunded = main.creator_attribution.record_creator_apple_conversion(
+                conn,
+                **common,
+                notification_type="REFUND",
+            )
+            reversed_result = main.creator_attribution.record_creator_apple_conversion(
+                conn,
+                **common,
+                notification_type="REFUND_REVERSED",
+            )
+            revoked = main.creator_attribution.record_creator_apple_conversion(
+                conn,
+                **common,
+                notification_type="REVOKE",
+            )
+            reversal_after_revoke = (
+                main.creator_attribution.record_creator_apple_conversion(
+                    conn,
+                    **common,
+                    notification_type="REFUND_REVERSED",
+                )
+            )
+
+        self.assertEqual(initial.economic_status, "verified_unknown_value")
+        self.assertEqual(refunded.economic_status, "refunded")
+        self.assertEqual(reversed_result.economic_status, "verified_unknown_value")
+        self.assertEqual(revoked.economic_status, "revoked")
+        self.assertEqual(reversal_after_revoke.economic_status, "revoked")
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT paid_plus_converted_at FROM creator_attributions WHERE id = %s;",
+                (attribution_id,),
+            ),
+            paid_milestone,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

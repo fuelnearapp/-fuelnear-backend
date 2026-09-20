@@ -11,6 +11,16 @@ from app import (
 )
 
 
+_ECONOMIC_NOTIFICATION_TYPES = frozenset(
+    {"REFUND", "REVOKE", "REFUND_REVERSED"}
+)
+_EFFECTIVE_ADJUSTMENT_NOTIFICATION_TYPES = {
+    "refund": "REFUND",
+    "revoke": "REVOKE",
+    "refund_reversed": "REFUND_REVERSED",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ApplePurchaseProcessingResult:
     created: bool
@@ -48,31 +58,56 @@ def process_apple_transaction(
             )
 
             if normalized_transaction.user_id is not None:
-                persisted_signed_date = saved_transaction.row.get("signed_date")
-                incoming_signed_date = normalized_transaction.signed_date
-                context_is_current = not (
-                    notification_type is not None
-                    and incoming_signed_date is not None
-                    and persisted_signed_date is not None
-                    and incoming_signed_date < persisted_signed_date
+                normalized_notification_type = (
+                    notification_type.strip().upper()
+                    if isinstance(notification_type, str)
+                    else None
                 )
-                creator_attribution.record_creator_apple_conversion(
-                    conn,
-                    user_id=normalized_transaction.user_id,
-                    transaction_id=str(saved_transaction.row["transaction_id"]),
-                    original_transaction_id=str(
-                        saved_transaction.row["original_transaction_id"]
-                    ),
-                    purchase_date=saved_transaction.row["purchase_date"],
-                    product_id=str(saved_transaction.row["product_id"]),
-                    transaction_reason=saved_transaction.row.get("transaction_reason"),
-                    ownership_type=saved_transaction.row.get("ownership_type"),
-                    revocation_date=saved_transaction.row.get("revocation_date"),
-                    notification_type=notification_type if context_is_current else None,
-                    notification_subtype=(
-                        notification_subtype if context_is_current else None
-                    ),
-                )
+                creator_notification_type = notification_type
+                creator_notification_subtype = notification_subtype
+                should_record_creator = True
+                if normalized_notification_type in _ECONOMIC_NOTIFICATION_TYPES:
+                    if not saved_transaction.economic_adjustment_accepted:
+                        should_record_creator = False
+                    else:
+                        creator_notification_type = (
+                            _EFFECTIVE_ADJUSTMENT_NOTIFICATION_TYPES.get(
+                                saved_transaction.row.get("economic_adjustment")
+                            )
+                        )
+                        creator_notification_subtype = (
+                            notification_subtype
+                            if creator_notification_type is not None
+                            else None
+                        )
+                        should_record_creator = creator_notification_type is not None
+                elif notification_type is not None:
+                    persisted_signed_date = saved_transaction.row.get("signed_date")
+                    incoming_signed_date = normalized_transaction.signed_date
+                    if (
+                        incoming_signed_date is not None
+                        and persisted_signed_date is not None
+                        and incoming_signed_date < persisted_signed_date
+                    ):
+                        creator_notification_type = None
+                        creator_notification_subtype = None
+
+                if should_record_creator:
+                    creator_attribution.record_creator_apple_conversion(
+                        conn,
+                        user_id=normalized_transaction.user_id,
+                        transaction_id=str(saved_transaction.row["transaction_id"]),
+                        original_transaction_id=str(
+                            saved_transaction.row["original_transaction_id"]
+                        ),
+                        purchase_date=saved_transaction.row["purchase_date"],
+                        product_id=str(saved_transaction.row["product_id"]),
+                        transaction_reason=saved_transaction.row.get("transaction_reason"),
+                        ownership_type=saved_transaction.row.get("ownership_type"),
+                        revocation_date=saved_transaction.row.get("revocation_date"),
+                        notification_type=creator_notification_type,
+                        notification_subtype=creator_notification_subtype,
+                    )
                 entitlement = apple_subscription_reconciler.reconcile_apple_entitlement(
                     normalized_transaction.user_id,
                     connection=conn,
