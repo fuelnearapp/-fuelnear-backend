@@ -154,6 +154,7 @@ def setUpModule() -> None:
         main.ensure_auth_schema(conn)
         main.ensure_auth_provider_schema(conn)
         main.ensure_user_device_tokens_schema(conn)
+        main.creator_attribution.ensure_creator_attribution_schema(conn)
 
 
 def tearDownModule() -> None:
@@ -199,6 +200,10 @@ class AuthTestCase(unittest.TestCase):
                 cur.execute(
                     """
                     TRUNCATE
+                        creator_conversion_events,
+                        creator_attributions,
+                        creator_campaigns,
+                        creators,
                         apple_token_revocations,
                         auth_rate_limits,
                         user_device_tokens,
@@ -670,6 +675,133 @@ class AuthTestCase(unittest.TestCase):
                 cur.execute("SELECT COUNT(*) FROM user_device_tokens;")
                 self.assertEqual(cur.fetchone()[0], 0)
 
+    def test_29a_delete_account_anonymizes_creator_attribution(self):
+        self.register()
+        self.verify_user_directly()
+        session = self.login()["session"]
+        user_id = self.get_user()["id"]
+
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO creators (name, slug)
+                    VALUES ('Delete Test Creator', 'delete-test-creator')
+                    RETURNING id;
+                    """
+                )
+                creator_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (
+                        creator_id, name, code, status,
+                        compensation_type, compensation_value
+                    )
+                    VALUES (%s, 'Delete Test Campaign', 'DELETECODE1', 'active',
+                            'per_qualified_user', 0.5000)
+                    RETURNING id;
+                    """,
+                    (creator_id,),
+                )
+                campaign_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO creator_attributions (
+                        campaign_id, user_id, code_used, source,
+                        attributed_at, verified_at, qualified_at,
+                        plus_converted_at, paid_plus_converted_at
+                    )
+                    VALUES (
+                        %s, %s, 'DELETECODE1', 'email_registration',
+                        NOW() - INTERVAL '10 days',
+                        NOW() - INTERVAL '9 days',
+                        NOW() - INTERVAL '8 days',
+                        NOW() - INTERVAL '7 days',
+                        NOW() - INTERVAL '6 days'
+                    )
+                    RETURNING id;
+                    """,
+                    (campaign_id, user_id),
+                )
+                attribution_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO creator_conversion_events (
+                        attribution_id, conversion_type, provider,
+                        external_event_key, occurred_at, product_id,
+                        economic_status, amount, currency
+                    )
+                    VALUES (
+                        %s, 'purchase', 'apple',
+                        'delete-account-event', NOW() - INTERVAL '7 days',
+                        'fuelnear.plus.monthly', 'confirmed', 4.990000, 'EUR'
+                    )
+                    RETURNING id;
+                    """,
+                    (attribution_id,),
+                )
+                event_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    SELECT campaign_id, code_used, source, attributed_at,
+                           verified_at, qualified_at, plus_converted_at,
+                           paid_plus_converted_at
+                    FROM creator_attributions
+                    WHERE id = %s;
+                    """,
+                    (attribution_id,),
+                )
+                attribution_snapshot = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT attribution_id, conversion_type, provider,
+                           external_event_key, occurred_at, product_id,
+                           economic_status, amount, currency
+                    FROM creator_conversion_events
+                    WHERE id = %s;
+                    """,
+                    (event_id,),
+                )
+                event_snapshot = cur.fetchone()
+
+        response = main.delete_account(f"Bearer {session['access_token']}")
+        self.assertEqual(response["status"], "ok")
+
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users WHERE id = %s;", (user_id,))
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute(
+                    """
+                    SELECT user_id, status, user_deleted, anonymized_at,
+                           campaign_id, code_used, source, attributed_at,
+                           verified_at, qualified_at, plus_converted_at,
+                           paid_plus_converted_at
+                    FROM creator_attributions
+                    WHERE id = %s;
+                    """,
+                    (attribution_id,),
+                )
+                attribution = cur.fetchone()
+                self.assertIsNotNone(attribution)
+                self.assertIsNone(attribution[0])
+                self.assertEqual(attribution[1], "anonymized")
+                self.assertTrue(attribution[2])
+                self.assertIsNotNone(attribution[3])
+                self.assertEqual(attribution[4:], attribution_snapshot)
+
+                cur.execute(
+                    """
+                    SELECT attribution_id, conversion_type, provider,
+                           external_event_key, occurred_at, product_id,
+                           economic_status, amount, currency
+                    FROM creator_conversion_events
+                    WHERE id = %s;
+                    """,
+                    (event_id,),
+                )
+                self.assertEqual(cur.fetchone(), event_snapshot)
+
     def test_30_after_delete_refresh_and_auth_me_fail(self):
         self.register()
         self.verify_user_directly()
@@ -999,6 +1131,34 @@ class AuthTestCase(unittest.TestCase):
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    INSERT INTO creators (name, slug)
+                    VALUES ('Rollback Test Creator', 'rollback-test-creator')
+                    RETURNING id;
+                    """
+                )
+                creator_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (creator_id, name, code, status)
+                    VALUES (%s, 'Rollback Test Campaign', 'ROLLBACK01', 'active')
+                    RETURNING id;
+                    """,
+                    (creator_id,),
+                )
+                campaign_id = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    INSERT INTO creator_attributions (
+                        campaign_id, user_id, code_used, source
+                    )
+                    VALUES (%s, %s, 'ROLLBACK01', 'apple_registration')
+                    RETURNING id;
+                    """,
+                    (campaign_id, user_id),
+                )
+                attribution_id = cur.fetchone()[0]
+                cur.execute(
+                    """
                     CREATE OR REPLACE FUNCTION reject_test_user_delete()
                     RETURNS TRIGGER AS $$
                     BEGIN
@@ -1035,6 +1195,18 @@ class AuthTestCase(unittest.TestCase):
                     self.assertEqual(cur.fetchone()[0], 1)
                     cur.execute("SELECT COUNT(*) FROM user_sessions WHERE user_id = %s;", (user_id,))
                     self.assertEqual(cur.fetchone()[0], 1)
+                    cur.execute(
+                        """
+                        SELECT user_id, status, user_deleted, anonymized_at
+                        FROM creator_attributions
+                        WHERE id = %s;
+                        """,
+                        (attribution_id,),
+                    )
+                    self.assertEqual(
+                        cur.fetchone(),
+                        (user_id, "active", False, None),
+                    )
         finally:
             with main.get_connection() as conn:
                 with conn.cursor() as cur:

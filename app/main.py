@@ -2887,6 +2887,18 @@ def delete_current_account(authorization: str | None) -> dict[str, str]:
                 cur.execute("DELETE FROM user_sessions WHERE user_id = %s;", (user_id,))
                 cur.execute(
                     """
+                    UPDATE creator_attributions
+                    SET user_id = NULL,
+                        status = 'anonymized',
+                        user_deleted = TRUE,
+                        anonymized_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s;
+                    """,
+                    (user_id,),
+                )
+                cur.execute(
+                    """
                     DELETE FROM users
                     WHERE id = %s
                     RETURNING id;
