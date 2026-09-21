@@ -1626,6 +1626,67 @@ def grant_plus_days_reward(conn, user_id: int, referral_id: int, days: int) -> d
     }
 
 
+def grant_creator_plus_days_reward(
+    conn: Any,
+    attribution: creator_attribution.CreatorAttributionResult,
+    days: int = 7,
+) -> dict[str, Any]:
+    if days <= 0:
+        raise ValueError("Reward days must be greater than zero")
+
+    event = creator_attribution.acquire_creator_promo_reward_event(
+        conn,
+        attribution_id=attribution.attribution_id,
+        user_id=attribution.user_id,
+    )
+    if not event.created:
+        return {
+            "already_granted": True,
+            "event_id": event.event_id,
+        }
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO rewards (
+                user_id,
+                referral_id,
+                reward_type,
+                reward_value,
+                status,
+                granted_at,
+                created_at,
+                updated_at
+            )
+            VALUES (%s, NULL, 'plus_days', %s, 'granted', %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                attribution.user_id,
+                str(days),
+                event.occurred_at,
+                event.occurred_at,
+                event.occurred_at,
+            ),
+        )
+        reward = cur.fetchone()
+
+    components = plus_entitlements.reconcile_user_plus_entitlement(
+        conn,
+        attribution.user_id,
+        reference_date=event.occurred_at,
+        user_locked=True,
+    )
+    if components.subscription is None:
+        raise RuntimeError("Creator reward did not produce a Plus entitlement")
+
+    return {
+        "already_granted": False,
+        "event_id": event.event_id,
+        "reward_id": int(reward["id"]),
+    }
+
+
 def process_pending_referral(conn, referral: dict[str, Any], reward_days: int) -> dict[str, Any]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -1658,6 +1719,7 @@ def process_pending_referral(conn, referral: dict[str, Any], reward_days: int) -
             WHERE user_id = %s
               AND reward_type = 'plus_days'
               AND status = 'granted'
+              AND referral_id IS NOT NULL
               AND granted_at >= (
                   DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Rome')
                   AT TIME ZONE 'Europe/Rome'
@@ -2596,6 +2658,8 @@ def apply_registration_creator_attribution(
                 """,
                 (result.attribution_id,),
             )
+
+    grant_creator_plus_days_reward(conn, result)
 
     return result
 

@@ -114,6 +114,11 @@ class CreatorReferralConversionConflictError(CreatorAttributionError):
     default_message = "Referral creator conversion identity conflicts with existing data"
 
 
+class CreatorPromoRewardConflictError(CreatorAttributionError):
+    error_code = "CREATOR_PROMO_REWARD_CONFLICT"
+    default_message = "Creator promo reward identity conflicts with existing data"
+
+
 class CreatorAdminValidationError(CreatorAttributionError):
     error_code = "CREATOR_ADMIN_VALIDATION_ERROR"
     default_message = "Creator admin payload is invalid"
@@ -193,6 +198,17 @@ class CreatorReferralConversionResult:
     created: bool
     changed: bool
     plus_milestone_set: bool
+
+
+@dataclass(frozen=True)
+class CreatorPromoRewardEventResult:
+    event_id: int
+    attribution_id: int
+    user_id: int
+    occurred_at: datetime
+    created: bool
+    changed: bool
+    plus_milestone_changed: bool
 
 
 def ensure_creator_attribution_schema(conn: Any) -> None:
@@ -1134,6 +1150,125 @@ def apply_creator_attribution(
         if concurrent_attribution is None:
             raise CreatorAttributionConcurrencyError
         return _resolve_existing_attribution(concurrent_attribution, campaign.id)
+
+
+def acquire_creator_promo_reward_event(
+    conn: Any,
+    *,
+    attribution_id: int,
+    user_id: int,
+) -> CreatorPromoRewardEventResult:
+    """Acquire the one-time Creator promo grant inside the caller's transaction."""
+    if (
+        isinstance(attribution_id, bool)
+        or not isinstance(attribution_id, int)
+        or attribution_id <= 0
+        or isinstance(user_id, bool)
+        or not isinstance(user_id, int)
+        or user_id <= 0
+    ):
+        raise ValueError("attribution_id and user_id must be positive integers")
+
+    external_event_key = f"creator_reward:{attribution_id}"
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id, user_id, status, user_deleted
+            FROM creator_attributions
+            WHERE id = %s
+            FOR UPDATE;
+            """,
+            (attribution_id,),
+        )
+        attribution = cur.fetchone()
+        if (
+            attribution is None
+            or attribution["user_id"] != user_id
+            or attribution["status"] != "active"
+            or attribution["user_deleted"]
+        ):
+            raise CreatorPromoRewardConflictError
+
+        cur.execute(
+            """
+            INSERT INTO creator_conversion_events (
+                attribution_id,
+                conversion_type,
+                provider,
+                external_event_key,
+                occurred_at,
+                product_id,
+                economic_status,
+                amount,
+                currency
+            )
+            VALUES (%s, 'plus_granted', 'internal_promo', %s,
+                    CURRENT_TIMESTAMP, NULL, 'non_economic', NULL, NULL)
+            ON CONFLICT (provider, external_event_key) DO NOTHING
+            RETURNING id, occurred_at;
+            """,
+            (attribution_id, external_event_key),
+        )
+        event = cur.fetchone()
+        created = event is not None
+
+        if event is None:
+            cur.execute(
+                """
+                SELECT id, attribution_id, conversion_type, occurred_at,
+                       product_id, economic_status, amount, currency
+                FROM creator_conversion_events
+                WHERE provider = 'internal_promo'
+                  AND external_event_key = %s
+                LIMIT 1
+                FOR UPDATE;
+                """,
+                (external_event_key,),
+            )
+            event = cur.fetchone()
+            if (
+                event is None
+                or int(event["attribution_id"]) != attribution_id
+                or event["conversion_type"] != "plus_granted"
+                or event["product_id"] is not None
+                or event["economic_status"] != "non_economic"
+                or event["amount"] is not None
+                or event["currency"] is not None
+            ):
+                raise CreatorPromoRewardConflictError
+
+        occurred_at = _normalize_reference_date(event["occurred_at"], "occurred_at")
+        cur.execute(
+            """
+            UPDATE creator_attributions
+            SET plus_converted_at = CASE
+                    WHEN plus_converted_at IS NULL THEN %s
+                    ELSE LEAST(plus_converted_at, %s)
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+              AND status = 'active'
+              AND user_deleted = FALSE
+              AND user_id = %s
+              AND (
+                  plus_converted_at IS NULL
+                  OR %s < plus_converted_at
+              )
+            RETURNING id;
+            """,
+            (occurred_at, occurred_at, attribution_id, user_id, occurred_at),
+        )
+        plus_milestone_changed = cur.fetchone() is not None
+
+    return CreatorPromoRewardEventResult(
+        event_id=int(event["id"]),
+        attribution_id=attribution_id,
+        user_id=user_id,
+        occurred_at=occurred_at,
+        created=created,
+        changed=created or plus_milestone_changed,
+        plus_milestone_changed=plus_milestone_changed,
+    )
 
 
 def record_creator_referral_conversion(

@@ -296,6 +296,29 @@ class AuthTestCase(unittest.TestCase):
         if status_code is not None:
             self.assertEqual(exc.status_code, status_code)
 
+    def create_active_creator_campaign(self, code: str = "AUTHCREATOR1") -> str:
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO creators (name, slug, status)
+                    VALUES ('Auth Creator', 'auth-creator', 'active')
+                    RETURNING id;
+                    """
+                )
+                creator_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (
+                        creator_id, name, code, status,
+                        compensation_type, compensation_value
+                    )
+                    VALUES (%s, 'Auth Campaign', %s, 'active', 'none', NULL);
+                    """,
+                    (creator_id, code),
+                )
+        return code
+
     def test_01_register_valid_creates_unverified_user_and_no_session(self):
         response = self.register()
         self.assertEqual(response["status"], "email_verification_required")
@@ -1720,6 +1743,110 @@ class AuthTestCase(unittest.TestCase):
         self.assertEqual(cm.exception.status_code, 500)
         self.assertNotIn("database unavailable", str(cm.exception.detail))
         self.assertEqual(len(self.apple_revocation_rows()), 1)
+
+    def test_62_creator_reward_covers_email_google_apple_and_post_registration(self):
+        code = self.create_active_creator_campaign()
+
+        email_response = main.register_user(
+            main.RegisterRequest(
+                email="creator-email@example.com",
+                password=self.password,
+                invite_code=code,
+            ),
+            FakeRequest(ip="10.20.0.1", path="/auth/register"),
+        )
+
+        google_claims = {
+            "provider": "google",
+            "provider_user_id": "creator-google-subject",
+            "email": "creator-google@example.com",
+            "email_verified": True,
+            "display_name": "Creator Google",
+        }
+        with patch.object(main, "verify_google_id_token", return_value=google_claims):
+            google_response = main.google_login(
+                main.GoogleAuthRequest(id_token="google-token", invite_code=code)
+            )
+
+        apple_claims = {
+            "provider": "apple",
+            "provider_user_id": "creator-apple-subject",
+            "email": "creator-apple@example.com",
+            "email_verified": True,
+            "display_name": "Creator Apple",
+        }
+        with patch.object(main, "verify_apple_identity_token", return_value=apple_claims):
+            apple_response = main.apple_login(
+                main.AppleAuthRequest(
+                    identity_token="apple-token",
+                    raw_nonce="creator-raw-nonce",
+                    invite_code=code,
+                )
+            )
+
+        self.register(email="creator-post@example.com")
+        self.verify_user_directly(email="creator-post@example.com")
+        post_session = self.login(email="creator-post@example.com")["session"]
+        post_response = main.apply_current_user_creator_attribution_code(
+            main.ApplyCreatorAttributionCodeRequest(code=code),
+            f"Bearer {post_session['access_token']}",
+        )
+
+        self.assertTrue(email_response["user"]["is_plus"])
+        self.assertTrue(google_response["user"]["is_plus"])
+        self.assertTrue(apple_response["user"]["is_plus"])
+        self.assertTrue(post_response["created"])
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source, COUNT(*)
+                    FROM creator_attributions
+                    GROUP BY source
+                    ORDER BY source;
+                    """
+                )
+                self.assertEqual(
+                    dict(cur.fetchall()),
+                    {
+                        "apple_registration": 1,
+                        "email_registration": 1,
+                        "google_registration": 1,
+                        "post_registration": 1,
+                    },
+                )
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM rewards
+                    WHERE referral_id IS NULL
+                      AND reward_type = 'plus_days'
+                      AND reward_value = '7'
+                      AND status = 'granted';
+                    """
+                )
+                self.assertEqual(cur.fetchone()[0], 4)
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM creator_conversion_events
+                    WHERE provider = 'internal_promo'
+                      AND conversion_type = 'plus_granted'
+                      AND economic_status = 'non_economic'
+                      AND amount IS NULL
+                      AND currency IS NULL;
+                    """
+                )
+                self.assertEqual(cur.fetchone()[0], 4)
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM creator_attributions
+                    WHERE plus_converted_at IS NOT NULL
+                      AND paid_plus_converted_at IS NULL;
+                    """
+                )
+                self.assertEqual(cur.fetchone()[0], 4)
 
 
 if __name__ == "__main__":

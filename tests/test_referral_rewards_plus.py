@@ -418,6 +418,44 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
                 )
                 return int(cur.fetchone()[0])
 
+    def create_creator_campaign(self, code: str = "CREATORPROMO1") -> str:
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO creators (name, slug, status)
+                    VALUES ('Promo Creator', %s, 'active')
+                    RETURNING id;
+                    """,
+                    (f"promo-creator-{code.lower()}",),
+                )
+                creator_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    INSERT INTO creator_campaigns (
+                        creator_id, name, code, status,
+                        compensation_type, compensation_value
+                    )
+                    VALUES (%s, 'Promo Campaign', %s, 'active', 'none', NULL);
+                    """,
+                    (creator_id, code),
+                )
+        return code
+
+    def apply_creator_code(self, user_id: int, code: str):
+        conn = main.get_connection()
+        try:
+            with conn:
+                return main.apply_registration_creator_attribution(
+                    conn,
+                    user_id,
+                    code,
+                    "post_registration",
+                    mark_verified=True,
+                )
+        finally:
+            conn.close()
+
     def create_reward_row(
         self,
         user_id: int,
@@ -1297,6 +1335,246 @@ class ReferralRewardsPlusTestCase(unittest.TestCase):
             ),
             paid_milestone,
         )
+
+    def test_65_creator_promo_grants_seven_days_and_non_economic_event(self):
+        user = self.create_user("creator-promo@example.com")
+        code = self.create_creator_campaign()
+
+        result = self.apply_creator_code(user["id"], code)
+
+        reward = self.fetch_one(
+            """
+            SELECT user_id, referral_id, reward_type, reward_value, status, granted_at
+            FROM rewards
+            WHERE user_id = %s;
+            """,
+            (user["id"],),
+        )
+        event = self.fetch_one(
+            """
+            SELECT attribution_id, conversion_type, provider, external_event_key,
+                   occurred_at, product_id, economic_status, amount, currency
+            FROM creator_conversion_events;
+            """
+        )
+        attribution = self.fetch_one(
+            """
+            SELECT plus_converted_at, paid_plus_converted_at
+            FROM creator_attributions
+            WHERE id = %s;
+            """,
+            (result.attribution_id,),
+        )
+        subscription = self.fetch_one(
+            """
+            SELECT source, starts_at, expires_at, referral_expires_at
+            FROM user_subscriptions
+            WHERE user_id = %s AND status = 'active';
+            """,
+            (user["id"],),
+        )
+
+        self.assertEqual(reward["user_id"], user["id"])
+        self.assertIsNone(reward["referral_id"])
+        self.assertEqual(reward["reward_type"], "plus_days")
+        self.assertEqual(reward["reward_value"], "7")
+        self.assertEqual(reward["status"], "granted")
+        self.assertEqual(event["attribution_id"], result.attribution_id)
+        self.assertEqual(event["conversion_type"], "plus_granted")
+        self.assertEqual(event["provider"], "internal_promo")
+        self.assertEqual(
+            event["external_event_key"],
+            f"creator_reward:{result.attribution_id}",
+        )
+        self.assertEqual(event["economic_status"], "non_economic")
+        self.assertIsNone(event["product_id"])
+        self.assertIsNone(event["amount"])
+        self.assertIsNone(event["currency"])
+        self.assertEqual(event["occurred_at"], reward["granted_at"])
+        self.assertEqual(attribution["plus_converted_at"], reward["granted_at"])
+        self.assertIsNone(attribution["paid_plus_converted_at"])
+        self.assertEqual(subscription["source"], "referral_reward")
+        self.assertEqual(subscription["expires_at"], subscription["referral_expires_at"])
+        self.assertAlmostEqual(
+            (subscription["expires_at"] - subscription["starts_at"]).total_seconds(),
+            7 * 24 * 3600,
+            delta=1,
+        )
+
+    def test_66_creator_promo_is_idempotent_under_retry_and_concurrency(self):
+        user = self.create_user("creator-concurrent@example.com")
+        code = self.create_creator_campaign()
+
+        def apply_once(_index: int):
+            return self.apply_creator_code(user["id"], code)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(apply_once, range(4)))
+
+        self.assertEqual(sum(result.created for result in results), 1)
+        self.assertEqual(sum(result.idempotent for result in results), 3)
+        self.assertEqual(
+            self.fetch_value("SELECT COUNT(*) FROM rewards WHERE user_id = %s;", (user["id"],)),
+            1,
+        )
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT COUNT(*) FROM creator_conversion_events WHERE provider = 'internal_promo';"
+            ),
+            1,
+        )
+        subscription = self.fetch_one(
+            "SELECT starts_at, expires_at FROM user_subscriptions WHERE user_id = %s;",
+            (user["id"],),
+        )
+        self.assertAlmostEqual(
+            (subscription["expires_at"] - subscription["starts_at"]).total_seconds(),
+            7 * 24 * 3600,
+            delta=1,
+        )
+
+    def test_67_creator_promo_extends_existing_reward_and_preserves_paid_milestone(self):
+        user = self.create_user("creator-existing-plus@example.com")
+        code = self.create_creator_campaign()
+        existing_grant = datetime.now(timezone.utc) - timedelta(days=1)
+        paid_milestone = existing_grant - timedelta(days=1)
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO rewards (
+                        user_id, referral_id, reward_type, reward_value,
+                        status, granted_at, created_at, updated_at
+                    )
+                    VALUES (%s, NULL, 'plus_days', '7', 'granted', %s, %s, %s);
+                    """,
+                    (user["id"], existing_grant, existing_grant, existing_grant),
+                )
+                attribution = main.creator_attribution.apply_creator_attribution(
+                    conn,
+                    user["id"],
+                    code,
+                    "post_registration",
+                )
+                cur.execute(
+                    """
+                    UPDATE creator_attributions
+                    SET plus_converted_at = %s,
+                        paid_plus_converted_at = %s
+                    WHERE id = %s;
+                    """,
+                    (paid_milestone, paid_milestone, attribution.attribution_id),
+                )
+                main.grant_creator_plus_days_reward(conn, attribution)
+
+        subscription = self.fetch_one(
+            "SELECT starts_at, expires_at FROM user_subscriptions WHERE user_id = %s;",
+            (user["id"],),
+        )
+        milestones = self.fetch_one(
+            """
+            SELECT plus_converted_at, paid_plus_converted_at
+            FROM creator_attributions
+            WHERE id = %s;
+            """,
+            (attribution.attribution_id,),
+        )
+        self.assertEqual(
+            self.fetch_value("SELECT COUNT(*) FROM rewards WHERE user_id = %s;", (user["id"],)),
+            2,
+        )
+        self.assertAlmostEqual(
+            (subscription["expires_at"] - subscription["starts_at"]).total_seconds(),
+            14 * 24 * 3600,
+            delta=1,
+        )
+        self.assertEqual(milestones["plus_converted_at"], paid_milestone)
+        self.assertEqual(milestones["paid_plus_converted_at"], paid_milestone)
+
+    def test_68_creator_promo_is_preserved_after_active_apple_coverage(self):
+        user = self.create_user("creator-apple-plus@example.com")
+        code = self.create_creator_campaign()
+        now = datetime.now(timezone.utc)
+        apple_expiry = now + timedelta(days=30)
+        with main.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO apple_transactions (
+                        user_id, product_id, transaction_id,
+                        original_transaction_id, purchase_date, expires_date,
+                        environment, ownership_type, transaction_reason
+                    )
+                    VALUES (
+                        %s, 'MB.FuelNear.plus.monthly', 'creator-apple-tx',
+                        'creator-apple-original', %s, %s,
+                        'Production', 'PURCHASED', 'PURCHASE'
+                    );
+                    """,
+                    (user["id"], now - timedelta(days=1), apple_expiry),
+                )
+
+        self.apply_creator_code(user["id"], code)
+
+        subscription = self.fetch_one(
+            """
+            SELECT source, expires_at, apple_expires_at, referral_expires_at
+            FROM user_subscriptions
+            WHERE user_id = %s AND status = 'active';
+            """,
+            (user["id"],),
+        )
+        self.assertEqual(subscription["source"], "combined")
+        self.assertEqual(subscription["apple_expires_at"], apple_expiry)
+        self.assertEqual(subscription["expires_at"], subscription["referral_expires_at"])
+        self.assertAlmostEqual(
+            (subscription["referral_expires_at"] - apple_expiry).total_seconds(),
+            7 * 24 * 3600,
+            delta=1,
+        )
+
+    def test_69_creator_promo_does_not_consume_personal_referral_monthly_limit(self):
+        main.REFERRAL_MONTHLY_REWARD_LIMIT = 1
+        referrer = self.create_user("creator-referrer@example.com")
+        code = self.create_creator_campaign()
+        self.apply_creator_code(referrer["id"], code)
+        self.create_mature_referral_pair(referrer, "after-promo")
+
+        result = self.process()
+
+        self.assertEqual(result["rewarded_count"], 1)
+        self.assertEqual(result["skipped_monthly_limit"], 0)
+        self.assertEqual(
+            self.fetch_value("SELECT COUNT(*) FROM rewards WHERE user_id = %s;", (referrer["id"],)),
+            2,
+        )
+        self.assertEqual(
+            self.fetch_value(
+                "SELECT COUNT(*) FROM rewards WHERE user_id = %s AND referral_id IS NULL;",
+                (referrer["id"],),
+            ),
+            1,
+        )
+
+    def test_70_creator_promo_failure_rolls_back_attribution_event_and_reward(self):
+        user = self.create_user("creator-rollback@example.com")
+        code = self.create_creator_campaign()
+        original = main.plus_entitlements.reconcile_user_plus_entitlement
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("simulated creator reward reconciliation failure")
+
+        main.plus_entitlements.reconcile_user_plus_entitlement = fail
+        try:
+            with self.assertRaises(RuntimeError):
+                self.apply_creator_code(user["id"], code)
+        finally:
+            main.plus_entitlements.reconcile_user_plus_entitlement = original
+
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_attributions;"), 0)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM creator_conversion_events;"), 0)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM rewards;"), 0)
+        self.assertEqual(self.fetch_value("SELECT COUNT(*) FROM user_subscriptions;"), 0)
 
 
 if __name__ == "__main__":
