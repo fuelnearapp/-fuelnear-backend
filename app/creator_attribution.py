@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import re
 from typing import Any, Final, Mapping
 
@@ -11,6 +12,7 @@ from app import apple_subscriptions
 
 
 CREATOR_CODE_PATTERN: Final[str] = r"^[A-Z0-9]{9,32}$"
+CREATOR_SLUG_PATTERN: Final[str] = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 CREATOR_ATTRIBUTION_SOURCES: Final[frozenset[str]] = frozenset(
     {
         "email_registration",
@@ -20,6 +22,19 @@ CREATOR_ATTRIBUTION_SOURCES: Final[frozenset[str]] = frozenset(
     }
 )
 _CREATOR_CODE_RE: Final[re.Pattern[str]] = re.compile(CREATOR_CODE_PATTERN)
+_CREATOR_SLUG_RE: Final[re.Pattern[str]] = re.compile(CREATOR_SLUG_PATTERN)
+_CREATOR_CAMPAIGN_STATUSES: Final[frozenset[str]] = frozenset(
+    {"draft", "active", "paused", "ended"}
+)
+_CREATOR_CAMPAIGN_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
+    "draft": frozenset({"active", "ended"}),
+    "active": frozenset({"paused", "ended"}),
+    "paused": frozenset({"active", "ended"}),
+    "ended": frozenset(),
+}
+_COMPENSATION_TYPES: Final[frozenset[str]] = frozenset(
+    {"none", "per_qualified_user"}
+)
 _APPLE_OWNERSHIP_FAMILY_SHARED: Final[str] = "FAMILY_SHARED"
 _APPLE_OWNERSHIP_PURCHASED: Final[str] = "PURCHASED"
 _APPLE_REASON_PURCHASE: Final[str] = "PURCHASE"
@@ -97,6 +112,41 @@ class CreatorAppleConversionConflictError(CreatorAttributionError):
 class CreatorReferralConversionConflictError(CreatorAttributionError):
     error_code = "CREATOR_REFERRAL_CONVERSION_CONFLICT"
     default_message = "Referral creator conversion identity conflicts with existing data"
+
+
+class CreatorAdminValidationError(CreatorAttributionError):
+    error_code = "CREATOR_ADMIN_VALIDATION_ERROR"
+    default_message = "Creator admin payload is invalid"
+
+
+class CreatorSlugAlreadyExistsError(CreatorAttributionError):
+    error_code = "CREATOR_SLUG_ALREADY_EXISTS"
+    default_message = "Creator slug already exists"
+
+
+class CreatorAdminCreatorNotFoundError(CreatorAttributionError):
+    error_code = "CREATOR_NOT_FOUND"
+    default_message = "Creator was not found"
+
+
+class CreatorCampaignCodeAlreadyExistsError(CreatorAttributionError):
+    error_code = "CREATOR_CAMPAIGN_CODE_ALREADY_EXISTS"
+    default_message = "Creator campaign code already exists"
+
+
+class CreatorAdminCampaignNotFoundError(CreatorAttributionError):
+    error_code = "CREATOR_CAMPAIGN_NOT_FOUND"
+    default_message = "Creator campaign was not found"
+
+
+class CreatorAdminCampaignTransitionError(CreatorAttributionError):
+    error_code = "CREATOR_CAMPAIGN_STATUS_INVALID"
+    default_message = "Creator campaign status transition is invalid"
+
+
+class CreatorAdminCreatorInactiveError(CreatorAttributionError):
+    error_code = "CREATOR_NOT_ACTIVE"
+    default_message = "Creator must be active before activating a campaign"
 
 
 @dataclass(frozen=True)
@@ -470,6 +520,386 @@ def _normalize_reference_date(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def _normalize_admin_text(value: str, field_name: str, *, max_length: int) -> str:
+    if not isinstance(value, str):
+        raise CreatorAdminValidationError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > max_length:
+        raise CreatorAdminValidationError(f"{field_name} is invalid")
+    return normalized
+
+
+def normalize_creator_slug(slug: str) -> str:
+    normalized = _normalize_admin_text(slug, "slug", max_length=100).lower()
+    if _CREATOR_SLUG_RE.fullmatch(normalized) is None:
+        raise CreatorAdminValidationError("slug is invalid")
+    return normalized
+
+
+def _normalize_compensation(
+    compensation_type: str,
+    compensation_value: Decimal | None,
+    compensation_currency: str,
+) -> tuple[str, Decimal | None, str]:
+    normalized_type = _normalize_admin_text(
+        compensation_type,
+        "compensation_type",
+        max_length=32,
+    ).lower()
+    if normalized_type not in _COMPENSATION_TYPES:
+        raise CreatorAdminValidationError("compensation_type is invalid")
+
+    normalized_currency = _normalize_admin_text(
+        compensation_currency,
+        "compensation_currency",
+        max_length=3,
+    ).upper()
+    if re.fullmatch(r"[A-Z]{3}", normalized_currency) is None:
+        raise CreatorAdminValidationError("compensation_currency is invalid")
+
+    if normalized_type == "none":
+        if compensation_value is not None:
+            raise CreatorAdminValidationError(
+                "compensation_value must be absent when compensation_type is none"
+            )
+        return normalized_type, None, normalized_currency
+
+    if (
+        not isinstance(compensation_value, Decimal)
+        or not compensation_value.is_finite()
+        or compensation_value <= 0
+    ):
+        raise CreatorAdminValidationError(
+            "compensation_value must be positive for per_qualified_user"
+        )
+    if compensation_value.as_tuple().exponent < -4:
+        raise CreatorAdminValidationError(
+            "compensation_value must have at most four decimal places"
+        )
+    if compensation_value >= Decimal("100000000"):
+        raise CreatorAdminValidationError("compensation_value is out of range")
+    return normalized_type, compensation_value, normalized_currency
+
+
+def create_creator(conn: Any, *, name: str, slug: str) -> dict[str, Any]:
+    normalized_name = _normalize_admin_text(name, "name", max_length=200)
+    normalized_slug = normalize_creator_slug(slug)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO creators (name, slug, status)
+            VALUES (%s, %s, 'active')
+            ON CONFLICT (slug) DO NOTHING
+            RETURNING id, name, slug, status, created_at, updated_at;
+            """,
+            (normalized_name, normalized_slug),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise CreatorSlugAlreadyExistsError
+    return dict(row)
+
+
+def create_creator_campaign(
+    conn: Any,
+    *,
+    creator_id: int,
+    name: str,
+    code: str,
+    starts_at: datetime | None,
+    ends_at: datetime | None,
+    post_registration_window_hours: int,
+    compensation_type: str,
+    compensation_value: Decimal | None,
+    compensation_currency: str,
+) -> dict[str, Any]:
+    if isinstance(creator_id, bool) or not isinstance(creator_id, int) or creator_id <= 0:
+        raise CreatorAdminValidationError("creator_id is invalid")
+    normalized_name = _normalize_admin_text(name, "name", max_length=200)
+    normalized_code = normalize_creator_code(code)
+    if (
+        isinstance(post_registration_window_hours, bool)
+        or not isinstance(post_registration_window_hours, int)
+        or post_registration_window_hours <= 0
+    ):
+        raise CreatorAdminValidationError(
+            "post_registration_window_hours must be positive"
+        )
+
+    try:
+        normalized_starts_at = (
+            _normalize_reference_date(starts_at, "starts_at")
+            if starts_at is not None
+            else None
+        )
+        normalized_ends_at = (
+            _normalize_reference_date(ends_at, "ends_at")
+            if ends_at is not None
+            else None
+        )
+    except ValueError as exc:
+        raise CreatorAdminValidationError(str(exc)) from exc
+    if (
+        normalized_starts_at is not None
+        and normalized_ends_at is not None
+        and normalized_ends_at <= normalized_starts_at
+    ):
+        raise CreatorAdminValidationError("ends_at must be after starts_at")
+
+    normalized_compensation = _normalize_compensation(
+        compensation_type,
+        compensation_value,
+        compensation_currency,
+    )
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id FROM creators WHERE id = %s;",
+            (creator_id,),
+        )
+        if cur.fetchone() is None:
+            raise CreatorAdminCreatorNotFoundError
+
+        cur.execute(
+            """
+            INSERT INTO creator_campaigns (
+                creator_id,
+                name,
+                code,
+                status,
+                starts_at,
+                ends_at,
+                post_registration_window_hours,
+                compensation_type,
+                compensation_value,
+                compensation_currency
+            )
+            VALUES (%s, %s, %s, 'draft', %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (code) DO NOTHING
+            RETURNING
+                id, creator_id, name, code, status, starts_at, ends_at,
+                post_registration_window_hours, compensation_type,
+                compensation_value, compensation_currency, created_at, updated_at;
+            """,
+            (
+                creator_id,
+                normalized_name,
+                normalized_code,
+                normalized_starts_at,
+                normalized_ends_at,
+                post_registration_window_hours,
+                normalized_compensation[0],
+                normalized_compensation[1],
+                normalized_compensation[2],
+            ),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise CreatorCampaignCodeAlreadyExistsError
+    return dict(row)
+
+
+def update_creator_campaign_status(
+    conn: Any,
+    campaign_id: int,
+    status: str,
+) -> dict[str, Any]:
+    if isinstance(campaign_id, bool) or not isinstance(campaign_id, int) or campaign_id <= 0:
+        raise CreatorAdminValidationError("campaign_id is invalid")
+    normalized_status = _normalize_admin_text(status, "status", max_length=16).lower()
+    if normalized_status not in _CREATOR_CAMPAIGN_STATUSES:
+        raise CreatorAdminValidationError("status is invalid")
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                campaign.id,
+                campaign.creator_id,
+                campaign.name,
+                campaign.code,
+                campaign.status,
+                campaign.starts_at,
+                campaign.ends_at,
+                campaign.post_registration_window_hours,
+                campaign.compensation_type,
+                campaign.compensation_value,
+                campaign.compensation_currency,
+                campaign.created_at,
+                campaign.updated_at,
+                creator.status AS creator_status
+            FROM creator_campaigns AS campaign
+            INNER JOIN creators AS creator ON creator.id = campaign.creator_id
+            WHERE campaign.id = %s
+            FOR UPDATE OF campaign, creator;
+            """,
+            (campaign_id,),
+        )
+        campaign = cur.fetchone()
+        if campaign is None:
+            raise CreatorAdminCampaignNotFoundError
+
+        current_status = campaign["status"]
+        if normalized_status == current_status:
+            result = dict(campaign)
+            result.pop("creator_status", None)
+            result["changed"] = False
+            return result
+
+        if normalized_status not in _CREATOR_CAMPAIGN_TRANSITIONS[current_status]:
+            raise CreatorAdminCampaignTransitionError
+        if normalized_status == "active" and campaign["creator_status"] != "active":
+            raise CreatorAdminCreatorInactiveError
+
+        cur.execute(
+            """
+            UPDATE creator_campaigns
+            SET status = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING
+                id, creator_id, name, code, status, starts_at, ends_at,
+                post_registration_window_hours, compensation_type,
+                compensation_value, compensation_currency, created_at, updated_at;
+            """,
+            (normalized_status, campaign_id),
+        )
+        updated = dict(cur.fetchone())
+        updated["changed"] = True
+        return updated
+
+
+def get_creator_campaign_summary(conn: Any, campaign_id: int) -> dict[str, Any]:
+    if isinstance(campaign_id, bool) or not isinstance(campaign_id, int) or campaign_id <= 0:
+        raise CreatorAdminValidationError("campaign_id is invalid")
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                campaign.id AS campaign_id,
+                campaign.name AS campaign_name,
+                campaign.code,
+                campaign.status AS campaign_status,
+                campaign.starts_at,
+                campaign.ends_at,
+                campaign.post_registration_window_hours,
+                creator.id AS creator_id,
+                creator.name AS creator_name,
+                creator.slug AS creator_slug,
+                creator.status AS creator_status
+            FROM creator_campaigns AS campaign
+            INNER JOIN creators AS creator ON creator.id = campaign.creator_id
+            WHERE campaign.id = %s;
+            """,
+            (campaign_id,),
+        )
+        metadata = cur.fetchone()
+        if metadata is None:
+            raise CreatorAdminCampaignNotFoundError
+
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND user_deleted = FALSE
+                      AND user_id IS NOT NULL
+                ) AS current_attributed,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND user_deleted = FALSE
+                      AND user_id IS NOT NULL
+                      AND verified_at IS NOT NULL
+                ) AS current_verified,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND user_deleted = FALSE
+                      AND user_id IS NOT NULL
+                      AND qualified_at IS NOT NULL
+                ) AS current_qualified,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND user_deleted = FALSE
+                      AND user_id IS NOT NULL
+                      AND plus_converted_at IS NOT NULL
+                ) AS current_plus_converted,
+                COUNT(*) FILTER (
+                    WHERE status = 'active'
+                      AND user_deleted = FALSE
+                      AND user_id IS NOT NULL
+                      AND paid_plus_converted_at IS NOT NULL
+                ) AS current_paid_plus_converted,
+                COUNT(*) FILTER (
+                    WHERE status IN ('active', 'anonymized')
+                ) AS historical_attributed,
+                COUNT(*) FILTER (
+                    WHERE status IN ('active', 'anonymized')
+                      AND verified_at IS NOT NULL
+                ) AS historical_verified,
+                COUNT(*) FILTER (
+                    WHERE status IN ('active', 'anonymized')
+                      AND qualified_at IS NOT NULL
+                ) AS historical_qualified,
+                COUNT(*) FILTER (
+                    WHERE status IN ('active', 'anonymized')
+                      AND plus_converted_at IS NOT NULL
+                ) AS historical_plus_converted,
+                COUNT(*) FILTER (
+                    WHERE status IN ('active', 'anonymized')
+                      AND paid_plus_converted_at IS NOT NULL
+                ) AS historical_paid_plus_converted,
+                COUNT(*) FILTER (WHERE status = 'active') AS active_count,
+                COUNT(*) FILTER (WHERE status = 'anonymized') AS anonymized_count,
+                COUNT(*) FILTER (WHERE status = 'invalid') AS invalid_count
+            FROM creator_attributions
+            WHERE campaign_id = %s;
+            """,
+            (campaign_id,),
+        )
+        counts = dict(cur.fetchone())
+
+    return {
+        "creator": {
+            "id": int(metadata["creator_id"]),
+            "name": metadata["creator_name"],
+            "slug": metadata["creator_slug"],
+            "status": metadata["creator_status"],
+        },
+        "campaign": {
+            "id": int(metadata["campaign_id"]),
+            "name": metadata["campaign_name"],
+            "code": metadata["code"],
+            "status": metadata["campaign_status"],
+            "starts_at": metadata["starts_at"],
+            "ends_at": metadata["ends_at"],
+            "post_registration_window_hours": int(
+                metadata["post_registration_window_hours"]
+            ),
+        },
+        "current_funnel": {
+            "attributed": int(counts["current_attributed"]),
+            "verified": int(counts["current_verified"]),
+            "qualified": int(counts["current_qualified"]),
+            "plus_converted": int(counts["current_plus_converted"]),
+            "paid_plus_converted": int(counts["current_paid_plus_converted"]),
+        },
+        "historical_funnel": {
+            "attributed": int(counts["historical_attributed"]),
+            "verified": int(counts["historical_verified"]),
+            "qualified": int(counts["historical_qualified"]),
+            "plus_converted": int(counts["historical_plus_converted"]),
+            "paid_plus_converted": int(counts["historical_paid_plus_converted"]),
+        },
+        "status_counts": {
+            "active_count": int(counts["active_count"]),
+            "anonymized_count": int(counts["anonymized_count"]),
+            "invalid_count": int(counts["invalid_count"]),
+        },
+    }
 
 
 def _fetch_creator_campaign(

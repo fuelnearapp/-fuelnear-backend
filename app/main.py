@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import re
 from uuid import UUID
 
@@ -650,6 +651,33 @@ class ApplyReferralCodeRequest(BaseModel):
 
 class ApplyCreatorAttributionCodeRequest(BaseModel):
     code: str = Field(min_length=1, max_length=MAX_REFERRAL_CODE_INPUT_LENGTH)
+
+
+class AdminCreateCreatorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: StrictStr = Field(min_length=1, max_length=200)
+    slug: StrictStr = Field(min_length=1, max_length=100)
+
+
+class AdminCreateCreatorCampaignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    creator_id: StrictInt = Field(gt=0)
+    name: StrictStr = Field(min_length=1, max_length=200)
+    code: StrictStr = Field(min_length=1, max_length=32)
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    post_registration_window_hours: StrictInt = Field(default=24, gt=0)
+    compensation_type: Literal["none", "per_qualified_user"] = "none"
+    compensation_value: Decimal | None = None
+    compensation_currency: StrictStr = Field(default="EUR", min_length=3, max_length=3)
+
+
+class AdminUpdateCreatorCampaignStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    status: Literal["draft", "active", "paused", "ended"]
 
 
 class DeviceTokenRequest(BaseModel):
@@ -5512,6 +5540,155 @@ def admin_recent_admob_telemetry_sessions(
         )
     finally:
         conn.close()
+
+
+# === CREATOR ADMIN ENDPOINTS ===
+
+@app.post("/admin/creators", status_code=201)
+def admin_create_creator(
+    payload: AdminCreateCreatorRequest,
+    _: None = Depends(require_referral_admin_token),
+) -> dict[str, Any]:
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            creator = creator_attribution.create_creator(
+                conn,
+                name=payload.name,
+                slug=payload.slug,
+            )
+        return {"status": "ok", "creator": creator}
+    except creator_attribution.CreatorSlugAlreadyExistsError:
+        raise APIError(409, "CREATOR_SLUG_ALREADY_EXISTS", "Creator slug already exists")
+    except creator_attribution.CreatorAdminValidationError:
+        raise APIError(400, "CREATOR_INVALID", "Invalid creator")
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error("creator_admin_create", exc, "Creator creation failed")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.post("/admin/creator-campaigns", status_code=201)
+def admin_create_creator_campaign(
+    payload: AdminCreateCreatorCampaignRequest,
+    _: None = Depends(require_referral_admin_token),
+) -> dict[str, Any]:
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            campaign = creator_attribution.create_creator_campaign(
+                conn,
+                creator_id=payload.creator_id,
+                name=payload.name,
+                code=payload.code,
+                starts_at=payload.starts_at,
+                ends_at=payload.ends_at,
+                post_registration_window_hours=payload.post_registration_window_hours,
+                compensation_type=payload.compensation_type,
+                compensation_value=payload.compensation_value,
+                compensation_currency=payload.compensation_currency,
+            )
+        return {"status": "ok", "campaign": campaign}
+    except creator_attribution.CreatorCodeFormatInvalidError:
+        raise APIError(400, "CREATOR_CAMPAIGN_CODE_INVALID", "Invalid creator campaign code")
+    except creator_attribution.CreatorAdminValidationError:
+        raise APIError(400, "CREATOR_CAMPAIGN_INVALID", "Invalid creator campaign")
+    except creator_attribution.CreatorAdminCreatorNotFoundError:
+        raise APIError(404, "CREATOR_NOT_FOUND", "Creator not found")
+    except creator_attribution.CreatorCampaignCodeAlreadyExistsError:
+        raise APIError(
+            409,
+            "CREATOR_CAMPAIGN_CODE_ALREADY_EXISTS",
+            "Creator campaign code already exists",
+        )
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error(
+            "creator_campaign_admin_create",
+            exc,
+            "Creator campaign creation failed",
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.patch("/admin/creator-campaigns/{campaign_id}/status")
+def admin_update_creator_campaign_status(
+    campaign_id: int,
+    payload: AdminUpdateCreatorCampaignStatusRequest,
+    _: None = Depends(require_referral_admin_token),
+) -> dict[str, Any]:
+    conn = None
+    try:
+        conn = get_connection()
+        with conn:
+            campaign = creator_attribution.update_creator_campaign_status(
+                conn,
+                campaign_id,
+                payload.status,
+            )
+        return {"status": "ok", "campaign": campaign}
+    except creator_attribution.CreatorAdminValidationError:
+        raise APIError(400, "CREATOR_CAMPAIGN_INVALID", "Invalid creator campaign")
+    except creator_attribution.CreatorAdminCampaignNotFoundError:
+        raise APIError(404, "CREATOR_CAMPAIGN_NOT_FOUND", "Creator campaign not found")
+    except creator_attribution.CreatorAdminCreatorInactiveError:
+        raise APIError(
+            409,
+            "CREATOR_NOT_ACTIVE",
+            "Creator must be active before activating a campaign",
+        )
+    except creator_attribution.CreatorAdminCampaignTransitionError:
+        raise APIError(
+            409,
+            "CREATOR_CAMPAIGN_STATUS_INVALID",
+            "Creator campaign status transition is invalid",
+        )
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error(
+            "creator_campaign_admin_status",
+            exc,
+            "Creator campaign status update failed",
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.get("/admin/creator-campaigns/{campaign_id}/summary")
+def admin_get_creator_campaign_summary(
+    campaign_id: int,
+    _: None = Depends(require_referral_admin_token),
+) -> dict[str, Any]:
+    conn = None
+    try:
+        conn = get_connection()
+        summary = creator_attribution.get_creator_campaign_summary(conn, campaign_id)
+        return {"status": "ok", "summary": summary}
+    except creator_attribution.CreatorAdminValidationError:
+        raise APIError(400, "CREATOR_CAMPAIGN_INVALID", "Invalid creator campaign")
+    except creator_attribution.CreatorAdminCampaignNotFoundError:
+        raise APIError(404, "CREATOR_CAMPAIGN_NOT_FOUND", "Creator campaign not found")
+    except DatabasePoolExhausted:
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error(
+            "creator_campaign_admin_summary",
+            exc,
+            "Creator campaign summary failed",
+        )
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # === ADMIN CRON PROCESSING ENDPOINTS ===
