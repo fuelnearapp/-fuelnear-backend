@@ -21,6 +21,7 @@ import jwt
 from jwt import PyJWKClient, PyJWTError
 from psycopg2.extras import RealDictCursor
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Header, Depends, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -45,6 +46,7 @@ from app import (
     apple_subscriptions,
     creator_attribution,
     guest_subscriptions,
+    mimit_national_averages,
     plus_entitlements,
 )
 from app.import_mimit import ensure_core_schema, ensure_station_geodata_schema, update_mimit_data
@@ -4055,6 +4057,7 @@ def ensure_auth_schema(conn) -> None:
         ensure_user_locations_schema(conn)
         ensure_price_notification_preferences_schema(conn)
         ensure_mimit_import_schema(conn)
+        mimit_national_averages.ensure_mimit_national_averages_schema(conn)
         ensure_station_geodata_schema(conn)
         ensure_sent_price_notifications_schema(conn)
         ensure_community_price_schema(conn)
@@ -4955,8 +4958,15 @@ def run_mimit_update_background(conn, run_id: int) -> None:
                 f"type={persist_error.__class__.__name__}"
             )
     finally:
-        release_mimit_update_lock(conn)
-        conn.close()
+        # Independent fetch/transaction, also attempted after a station-import failure.
+        # Keep the existing job lock until both acquisitions have finished.
+        try:
+            mimit_national_averages.refresh_snapshot()
+        except Exception as exc:
+            log_internal_exception("mimit_national_average_refresh", exc)
+        finally:
+            release_mimit_update_lock(conn)
+            conn.close()
 
 
 @app.get("/admin/update-mimit")
@@ -5039,6 +5049,23 @@ def admin_update_mimit(
             if lock_acquired:
                 release_mimit_update_lock(conn)
             conn.close()
+
+
+@app.get("/mimit/national-average-prices")
+def get_mimit_national_average_prices() -> dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn:
+            snapshot = mimit_national_averages.read_snapshot(conn)
+        if snapshot is None:
+            raise APIError(503, "MIMIT_NATIONAL_AVERAGES_UNAVAILABLE", "Official averages unavailable")
+        return jsonable_encoder(snapshot)
+    except (APIError, HTTPException):
+        raise
+    except Exception as exc:
+        raise safe_internal_http_error("mimit_national_averages", exc, "Official averages unavailable")
+    finally:
+        conn.close()
 
 
 @app.get("/mimit/status")

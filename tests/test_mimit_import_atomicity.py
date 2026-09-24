@@ -84,6 +84,9 @@ class MimitImportAtomicityTests(unittest.TestCase):
         return psycopg2.connect(**cls.connection_kwargs)
 
     def setUp(self) -> None:
+        national_refresh = patch.object(main.mimit_national_averages, "refresh_snapshot")
+        national_refresh.start()
+        self.addCleanup(national_refresh.stop)
         with self.connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
